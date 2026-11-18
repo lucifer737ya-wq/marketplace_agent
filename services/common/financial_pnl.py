@@ -92,15 +92,15 @@ def _resolve_ozon_commission_rate(
             weighted = c_fbs
         else:
             weighted = c_fbo
-        if 0.0 < weighted < high_comm:
+        if 0.22 <= weighted <= 0.23:
             return weighted
 
     if prod_db is not None:
         db_comm = _safe_nonneg(prod_db.commission_rate)
-        if 0.0 < db_comm < high_comm:
+        if 0.22 <= db_comm <= 0.23:
             return db_comm
 
-    if report_comm_rate is not None and 0.0 < report_comm_rate < high_comm:
+    if report_comm_rate is not None and 0.22 <= report_comm_rate <= 0.23:
         return report_comm_rate
 
     return DEFAULT_OZON_UNDER300_COMM_RATE
@@ -261,8 +261,8 @@ async def generate_weekly_top_and_unprofitable_report(
             if oz_ads_total > 0.0:
                 oz_ad_rate = oz_ads_total / oz_sales
 
-            raw_oz_acq = _safe_nonneg(oz_fin.get("acquiring"))
-            if raw_oz_acq > 0.0:
+            raw_oz_acq = _safe_float(oz_fin.get("acquiring"))
+            if raw_oz_acq != 0.0 or oz_fin.get("acquiring_reported"):
                 oz_acq_rate = raw_oz_acq / oz_sales
 
             raw_oz_comm = _safe_nonneg(oz_fin.get("commission"))
@@ -302,10 +302,9 @@ async def generate_weekly_top_and_unprofitable_report(
     # --- Фактические удельные параметры WB (эквайринг 1.5% + распределение накладных без деления на ноль) ---
     wb_acq_rate = acq_rate
     wb_overhead_per_order = 0.0
+    wb_unassigned_delivery = 0.0
     if isinstance(wb_fin, dict):
         wb_units_from_orders = sum(max(_safe_int(o.get("quantity"), 1), 1) for o in active_wb_orders)
-        raw_wb_cnt = max(_safe_int(wb_fin.get("orders_count"), 0), 0)
-        wb_orders_cnt = raw_wb_cnt if raw_wb_cnt > 0 else wb_units_from_orders
 
         wb_rev_s = _safe_float(wb_fin.get("revenue_seller"))
         wb_rev_b = (
@@ -314,11 +313,16 @@ async def generate_weekly_top_and_unprofitable_report(
             else wb_rev_s
         )
         wb_acq_base_total = max(wb_rev_b, wb_rev_s, 0.0)
-        raw_wb_acq = _safe_nonneg(wb_fin.get("acquiring"))
-        if raw_wb_acq > 0.0 and wb_acq_base_total > 0.0:
+        raw_wb_acq = _safe_float(wb_fin.get("acquiring"))
+        if wb_fin.get("acquiring") is not None and wb_acq_base_total > 0.0:
             wb_acq_rate = raw_wb_acq / wb_acq_base_total
 
-        if wb_orders_cnt > 0:
+        if wb_units_from_orders:
+            assigned = sum(_safe_nonneg(o.get('logistics')) * max(_safe_int(o.get('quantity'), 1), 1) for o in active_wb_orders)
+            missing = sum(max(_safe_int(o.get('quantity'), 1), 1) for o in active_wb_orders if not o.get('logistics'))
+            if missing:
+                wb_unassigned_delivery = _div_rub(max(0.0, _safe_nonneg(wb_fin.get('logistics_direct')) - assigned), missing)
+        if wb_units_from_orders > 0:
             wb_other_total = (
                 _safe_nonneg(wb_fin.get("storage"))
                 + _safe_nonneg(wb_fin.get("acceptance"))
@@ -327,7 +331,7 @@ async def generate_weekly_top_and_unprofitable_report(
                 + _safe_nonneg(wb_fin.get("logistics_return"))
             )
             if wb_other_total > 0.0:
-                wb_overhead_per_order = _div_rub(wb_other_total, wb_orders_cnt)
+                wb_overhead_per_order = _div_rub(wb_other_total, wb_units_from_orders)
 
     sku_stats: Dict[Tuple[str, str], Dict[str, Any]] = {}
     oz_delivery_missing_flag = False
@@ -337,7 +341,11 @@ async def generate_weekly_top_and_unprofitable_report(
         *[("wb", o) for o in active_wb_orders],
     ]
 
+    unpriced = 0
     for default_mp, order in combined_orders:
+        if order.get("price") is None:
+            unpriced += 1
+            continue  # mixed posting: no defensible per-SKU revenue
         mp = str(order.get("marketplace") or default_mp).strip().lower()
         if mp not in {"ozon", "wb"}:
             mp = default_mp
@@ -368,24 +376,26 @@ async def generate_weekly_top_and_unprofitable_report(
         t_live = live_tariffs.get((mp, art)) or live_tariffs.get((mp, raw_sku)) or {}
 
         if mp == "ozon":
-            ord_comm = _safe_nonneg(order.get("commission"))
-            if ord_comm > 0.0:
+            posting_units = max(_safe_int(order.get("posting_units"), 1), 1)
+            ord_comm = _safe_float(order.get("commission"))
+            if order.get("commission") is not None:
                 unit_comm = _round_rub(ord_comm)
             else:
                 c_rate = _resolve_ozon_commission_rate(unit_price, t_live, p_db, oz_report_comm_rate)
                 unit_comm = _mul_rub(unit_price, c_rate)
 
-            ord_acq = _safe_nonneg(order.get("acquiring"))
-            unit_acq = _round_rub(ord_acq) if ord_acq > 0.0 else _mul_rub(unit_price, oz_acq_rate)
+            ord_acq = _safe_float(order.get("acquiring"))
+            unit_acq = _round_rub(ord_acq) if order.get("acquiring") is not None else _mul_rub(unit_price, oz_acq_rate)
 
             ord_log = _safe_nonneg(order.get("logistics"))
             if ord_log > 0.0:
                 unit_log = _round_rub(ord_log)
             elif oz_deliv_per_order is not None:
-                unit_log = oz_deliv_per_order
+                unit_log = _div_rub(oz_deliv_per_order, posting_units)
             else:
                 unit_log = 0.0
                 oz_delivery_missing_flag = True
+                unit_cogs_known = False  # exclude incomplete economics from the profit ranking
 
             ord_ad = order.get("ad_spend")
             unit_ad = (
@@ -398,19 +408,19 @@ async def generate_weekly_top_and_unprofitable_report(
                 _to_dec(unit_comm)
                 + _to_dec(unit_acq)
                 + _to_dec(unit_log)
-                + _to_dec(oz_dropoff_per_order)
-                + _to_dec(oz_other_overhead_per_order)
+                + _to_dec(oz_dropoff_per_order) / posting_units
+                + _to_dec(oz_other_overhead_per_order) / posting_units
                 + _to_dec(unit_ad)
             )
             # На Ozon база УСН 6% — цена реализации продавца.
             unit_tax = _mul_rub(unit_price, tax_rate)
         else:
-            unit_comm = _round_rub(_safe_nonneg(order.get("commission")))
-            unit_log = _round_rub(_safe_nonneg(order.get("logistics")))
-            ord_acq = _safe_nonneg(order.get("acquiring"))
+            unit_comm = _round_rub(_safe_float(order.get("commission")))
+            unit_log = _round_rub(_safe_nonneg(order.get("logistics")) or wb_unassigned_delivery)
+            ord_acq = _safe_float(order.get("acquiring"))
             unit_acq = (
                 _round_rub(ord_acq)
-                if ord_acq > 0.0
+                if order.get("acquiring") is not None
                 else _mul_rub(max(unit_buyer_price, unit_price, 0.0), wb_acq_rate)
             )
             unit_mp_fee = _round_rub(
@@ -463,6 +473,8 @@ async def generate_weekly_top_and_unprofitable_report(
             st["cogs_complete"] = False
             st["missing_cogs_qty"] += qty
 
+    if unpriced:
+        api_warnings.append(f"⚠️ Без разбивки цены по SKU: {unpriced} строк, исключены из рейтинга.")
     if not sku_stats:
         empty_msg = (
             f"📈 <b>Еженедельная сводка ТОП-5 товаров:</b> "
@@ -503,7 +515,7 @@ async def generate_weekly_top_and_unprofitable_report(
                 f"({unit_prof:+.1f} ₽/шт. | ROS {ros:.1f}%)"
             )
         else:
-            profit_line = "   • Чистая прибыль: <i>н/д (не задана себестоимость в /costs)</i>"
+            profit_line = "   • Чистая прибыль: <i>н/д (нет себестоимости или факта доставки)</i>"
         lines.append(
             f"{idx}. <b>[{it['mp']}] Арт. <code>{safe_sku}</code></b> — {safe_title}\n"
             f"   • Продано: <b>{it['qty']} шт.</b> на <b>{_fmt_money(it['revenue'])} ₽</b>\n"
@@ -542,7 +554,7 @@ async def generate_weekly_top_and_unprofitable_report(
         if len(unverified_items) > 8:
             missing_labels += f" (+{len(unverified_items) - 8})"
         lines.append(
-            f"\n⚠️ <i>Без подтвержденной себестоимости (исключены из расчета прибыли): "
+            f"\n⚠️ <i>Без подтвержденной себестоимости или доставки (исключены из расчета прибыли): "
             f"<code>{missing_labels}</code>.</i>"
         )
 

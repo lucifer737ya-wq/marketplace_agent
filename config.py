@@ -1,21 +1,24 @@
+import os
 from pathlib import Path
 from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 BASE_DIR = Path(__file__).resolve().parent
-LOGS_DIR = BASE_DIR / "logs"
-BACKUPS_DIR = BASE_DIR / "backups"
+LOGS_DIR = Path(os.environ.get("MARKETPLACE_LOG_DIR", BASE_DIR / "logs"))
+BACKUPS_DIR = Path(os.environ.get("MARKETPLACE_BACKUP_DIR", BASE_DIR / "backups"))
 DB_DIR = BASE_DIR / "database"
 
-for directory in (LOGS_DIR, BACKUPS_DIR, DB_DIR):
-    directory.mkdir(parents=True, exist_ok=True)
+def prepare_runtime_dirs() -> None:
+    for directory in (LOGS_DIR, BACKUPS_DIR, DB_DIR):
+        directory.mkdir(parents=True, exist_ok=True)
 
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=str(BASE_DIR / ".env"),
+        env_file=os.environ.get("MARKETPLACE_ENV_FILE", str(BASE_DIR / ".env")) or None,
         env_file_encoding="utf-8",
         extra="ignore",
+        hide_input_in_errors=True,
         populate_by_name=True,
     )
 
@@ -47,6 +50,8 @@ class Settings(BaseSettings):
         default="http://127.0.0.1:3066",
         description="Локальный HTTP-прокси для Telegram и Gemini API",
     )
+    LOCAL_PROXY_FALLBACK_URL: str = ""
+    OZON_REPLY_DRY_RUN: bool = False
     TIMEZONE: str = Field(default="Europe/Moscow", description="Часовой пояс планировщика")
 
     # Системные настройки, БД и защита от дублей процессов (Single-Instance Lock)

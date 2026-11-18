@@ -1,29 +1,14 @@
 """Контрактные и регрессионные тесты этапа 4 без внешних сетевых запросов."""
 import ast
-import atexit
-import json
-import os
-import tempfile
 import unittest
-from datetime import datetime
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from aiohttp import web
 
-_tmp = tempfile.TemporaryDirectory()
-atexit.register(_tmp.cleanup)
-os.environ.update(
-    TG_BOT_TOKEN="123456:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi",
-    TG_ADMIN_ID="123",
-    OZON_CLIENT_ID="test",
-    OZON_API_KEY="test",
-    WB_API_TOKEN="test",
-    GEMINI_API_KEY="test-gemini-key",
-    LOCAL_PROXY_URL="http://127.0.0.1:3066",
-    DB_URL="sqlite+aiosqlite:///" + str(Path(_tmp.name) / "test_stage4.db"),
-)
+from tests import offline
+
+offline.require_isolation()  # before importing application settings
 
 from aiogram.fsm.storage.base import StorageKey
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -36,7 +21,7 @@ import bot.handlers.patch_fsm as patch_fsm_mod
 import bot.handlers.questions_fsm as questions_fsm_mod
 import bot.handlers.reviews_fsm as reviews_fsm_mod
 import maintenance.api_inspector as api_inspector_mod
-import maintenance.self_healer as self_healer_mod
+import services.common.gemini as gemini
 import maintenance.supervisor as supervisor_mod
 import services.common.ai_advisory_board as advisory_mod
 import services.common.buyer_questions as buyer_questions_mod
@@ -95,10 +80,14 @@ class TestStage4BrowserReviews(unittest.IsolatedAsyncioTestCase):
         old_row = MagicMock()
         old_row.inner_text = AsyncMock(return_value="12.11.2026\nТовар хороший\n5")
         old_row.click = AsyncMock()
+        old_row.count = AsyncMock(return_value=1)
+        old_row.get_attribute = AsyncMock(return_value="old")
+        old_row.evaluate = AsyncMock(return_value="12.11.2026")
 
         page = MagicMock()
         page.url = "https://seller.ozon.ru/app/reviews"
         page.goto = AsyncMock()
+        page.get_by_role.return_value.first.is_visible = AsyncMock(return_value=False)
         page.wait_for_timeout = AsyncMock()
         page.locator = MagicMock()
 
@@ -106,6 +95,7 @@ class TestStage4BrowserReviews(unittest.IsolatedAsyncioTestCase):
         unanswered_tab.count = AsyncMock(return_value=0)
         rows_loc = MagicMock()
         rows_loc.count = AsyncMock(return_value=1)
+        rows_loc.all_inner_texts = AsyncMock(return_value=["old"])
         rows_loc.nth = MagicMock(return_value=old_row)
 
         def locator_side_effect(selector: str):
@@ -129,6 +119,8 @@ class TestStage4BrowserReviews(unittest.IsolatedAsyncioTestCase):
         pw_cm.__aexit__ = AsyncMock(return_value=False)
 
         with patch("services.ozon.browser_reviews.BROWSER_DATA_DIR") as mock_dir, \
+             patch.object(browser_reviews_mod, "_review_tab", AsyncMock(return_value=True)), \
+             patch.object(browser_reviews_mod, "_scroll_main_table_down", AsyncMock(return_value=False)), \
              patch("playwright.async_api.async_playwright", return_value=pw_cm):
             mock_dir.exists.return_value = True
             mock_dir.mkdir = MagicMock()
@@ -144,12 +136,12 @@ class TestStage4BrowserReviews(unittest.IsolatedAsyncioTestCase):
 
 class TestStage4GeminiAndAdvisory(unittest.IsolatedAsyncioTestCase):
     def test_model_filtering_excludes_non_text_and_invalid_fallbacks(self) -> None:
-        self.assertNotIn("gemini-3.8-flash", advisory_mod.FALLBACK_MODELS)
-        self.assertTrue(advisory_mod._is_supported_text_model("gemini-2.5-flash"))
-        self.assertFalse(advisory_mod._is_supported_text_model("gemini-2.5-flash-tts"))
-        self.assertFalse(advisory_mod._is_supported_text_model("imagen-3.0-generate-002"))
-        self.assertFalse(advisory_mod._is_supported_text_model("text-embedding-004"))
-        self.assertFalse(advisory_mod._is_supported_text_model(""))
+        self.assertNotIn("gemini-3.8-flash", gemini.FALLBACK_MODELS)
+        self.assertTrue(gemini._is_supported_text_model("gemini-2.5-flash"))
+        self.assertFalse(gemini._is_supported_text_model("gemini-2.5-flash-tts"))
+        self.assertFalse(gemini._is_supported_text_model("imagen-3.0-generate-002"))
+        self.assertFalse(gemini._is_supported_text_model("text-embedding-004"))
+        self.assertFalse(gemini._is_supported_text_model(""))
 
     async def test_health_check_and_fast_gemini_against_local_mock_server(self) -> None:
         captured_payloads = []
@@ -171,6 +163,7 @@ class TestStage4GeminiAndAdvisory(unittest.IsolatedAsyncioTestCase):
                 {
                     "candidates": [
                         {
+                            "finishReason": "STOP",
                             "content": {
                                 "parts": [
                                     {"text": "internal thought", "thought": True},
@@ -191,35 +184,24 @@ class TestStage4GeminiAndAdvisory(unittest.IsolatedAsyncioTestCase):
         await site.start()
         port = site._server.sockets[0].getsockname()[1]
 
-        orig_base = "https://generativelanguage.googleapis.com"
-        local_base = f"http://127.0.0.1:{port}"
-        orig_candidates = list(advisory_mod.PROXY_CANDIDATES)
-        try:
-            advisory_mod.PROXY_CANDIDATES = [("Local Test", None, False)]
-            buyer_questions_mod.PROXY_CANDIDATES = [("Local Test", None, False)]
-
-            with patch("aiohttp.ClientSession.get", wraps=None), \
-                 patch.object(advisory_mod, "_get_available_models", AsyncMock(return_value=["gemini-2.5-flash"])):
-                # Verify real ClientSession parsing against local URL via monkeypatched URL builder is avoided;
-                # instead test generate_review_reply fallback & raise_on_error directly.
-                pass
-        finally:
-            advisory_mod.PROXY_CANDIDATES = orig_candidates
-            buyer_questions_mod.PROXY_CANDIDATES = orig_candidates
-            await runner.cleanup()
-
-        # Verify raise_on_error=True raises and False returns fallback
-        with patch.object(buyer_questions_mod, "PROXY_CANDIDATES", []):
+        # This HTTP server is a loopback forward-proxy fixture: no request reaches Google.
+        with patch.object(gemini, 'BASE_URL', 'http://model.invalid/v1beta/models'), \
+             patch.object(gemini.settings, 'LOCAL_PROXY_URL', f'http://127.0.0.1:{port}'):
+            try:
+                self.assertTrue((await advisory_mod.check_gemini_api_health())['ok'])
+                self.assertEqual(await buyer_questions_mod.call_fast_gemini('вопрос', True), 'OK')
+                self.assertEqual(len(captured_payloads), 2)
+            finally:
+                await runner.cleanup()
+        with patch.object(gemini.settings, 'LOCAL_PROXY_URL', ''):
             with self.assertRaises(RuntimeError):
-                await buyer_questions_mod.call_fast_gemini("test", raise_on_error=True)
-            fallback = await buyer_questions_mod.call_fast_gemini("test", raise_on_error=False)
-            self.assertIn("товар скоро поступит", fallback.lower())
-
-        # Verify generate_review_reply never returns the "out of stock" question fallback
-        with patch.object(buyer_questions_mod, "call_fast_gemini", AsyncMock(side_effect=RuntimeError("down"))):
-            rev_reply = await buyer_questions_mod.generate_review_reply("Супер", 5, sku="1001")
-            self.assertNotIn("поступит в продажу", rev_reply.lower())
-            self.assertIn("благодарим", rev_reply.lower())
+                await buyer_questions_mod.call_fast_gemini('test', raise_on_error=True)
+            self.assertIn('товар скоро поступит', (await buyer_questions_mod.call_fast_gemini('test')).lower())
+        with patch.object(buyer_questions_mod, 'call_fast_gemini', AsyncMock(side_effect=RuntimeError('down'))) as call, \
+             patch.object(buyer_questions_mod.asyncio, 'sleep', AsyncMock()):
+            with self.assertRaises(RuntimeError):
+                await buyer_questions_mod.generate_review_reply('Супер', 5, sku='1001')
+            self.assertEqual(call.await_count, 3)
 
     async def test_generate_monday_ai_board_report_escapes_html_and_no_fake_cogs(self) -> None:
         await init_db()
@@ -270,19 +252,10 @@ class TestStage4MaintenanceModules(unittest.IsolatedAsyncioTestCase):
         source_text = (BASE_DIR / "maintenance" / "self_healer.py").read_text(encoding="utf-8")
         self.assertNotIn("](http", source_text)
 
-        ok, msg = self_healer_mod._verify_code_syntax_and_import(
-            BASE_DIR / "bot" / "keyboards.py",
-            "def valid_func():\n    return 1\n",
-        )
-        self.assertTrue(ok, msg)
-        self.assertFalse(list((BASE_DIR / "bot").glob("__test_heal_*")))
-
-        bad_ok, bad_msg = self_healer_mod._verify_code_syntax_and_import(
-            BASE_DIR / "bot" / "keyboards.py",
-            "def broken(:\n",
-        )
-        self.assertFalse(bad_ok)
-        self.assertIn("Синтаксическая ошибка", bad_msg)
+        target = BASE_DIR / 'bot' / 'keyboards.py'
+        supervisor_mod._compile(target, 'def valid_func():\n    return 1\n')
+        with self.assertRaises(SyntaxError):
+            supervisor_mod._compile(target, 'def broken(:\n')
 
     async def test_api_inspector_reports_fast_gemini_failure_and_escapes_html(self) -> None:
         with patch("maintenance.api_inspector.OzonSellerAPI") as oz_cls, \
@@ -291,7 +264,7 @@ class TestStage4MaintenanceModules(unittest.IsolatedAsyncioTestCase):
              patch("maintenance.api_inspector.call_fast_gemini", AsyncMock(side_effect=RuntimeError("<boom&err>"))):
             oz_cls.return_value.fetch_stocks_and_prices = AsyncMock(side_effect=RuntimeError("<oz&err>"))
             wb_cls.return_value.fetch_stocks_and_prices = AsyncMock(return_value=[])
-            wb_cls.return_value.fetch_wb_tariffs = AsyncMock(return_value={"commission_rate": 0.25, "logistics_rub": 50.0})
+            wb_cls.return_value.fetch_wb_tariffs = AsyncMock(return_value={"subjects": {}, "warehouses": {}})
 
             report = await api_inspector_mod.run_monthly_api_audit()
 

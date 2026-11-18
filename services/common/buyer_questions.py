@@ -1,16 +1,8 @@
-import json
-from typing import List, Optional
+import asyncio
+from typing import Optional
 
-import aiohttp
-
-from config import settings
 from products_catalog import get_catalog_product
-from services.common.ai_advisory_board import (
-    PROXY_CANDIDATES,
-    _extract_model_name,
-    _get_available_models,
-    _is_supported_text_model,
-)
+from services.common.gemini import generate
 
 BRAND_MATRIX_RULES = """
 БАЗА ЗНАНИЙ И КЛАССИФИКАЦИЯ СЕРИЙ БРЕНДА YASOKO (банки 15 г):
@@ -54,77 +46,13 @@ _DEFAULT_QUESTION_FALLBACK = (
 
 
 async def call_fast_gemini(prompt: str, raise_on_error: bool = False) -> str:
-    """Вызывает легковесную рабочую модель через динамический перебор моделей Google AI Studio."""
-    api_key = str(getattr(settings, "GEMINI_API_KEY", "") or "").strip()
-    if not api_key:
+    try:
+        text, _ = await generate(prompt, max_tokens=800, fast=True, timeout=30)
+        return text
+    except RuntimeError:
         if raise_on_error:
-            raise RuntimeError("GEMINI_API_KEY не задан в .env")
+            raise
         return _DEFAULT_QUESTION_FALLBACK
-
-    payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 800},
-    }
-    timeout = aiohttp.ClientTimeout(total=30, connect=10, sock_connect=10, sock_read=20)
-    last_error = "Нет ответа от доступных моделей Gemini"
-
-    for route_label, proxy_url, trust_env in PROXY_CANDIDATES:
-        connector = aiohttp.TCPConnector(limit=4, ssl=True, enable_cleanup_closed=True)
-        try:
-            async with aiohttp.ClientSession(
-                connector=connector,
-                connector_owner=True,
-                trust_env=trust_env,
-                timeout=timeout,
-            ) as session:
-                models = await _get_available_models(session, api_key, proxy_url)
-                cleaned_models = [
-                    _extract_model_name(m)
-                    for m in models
-                    if _is_supported_text_model(_extract_model_name(m))
-                ]
-                fast_candidates: List[str] = list(
-                    dict.fromkeys(
-                        [m for m in cleaned_models if "flash" in m.lower() or "lite" in m.lower()]
-                        + cleaned_models
-                    )
-                )
-
-                for model_name in fast_candidates:
-                    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
-                    try:
-                        async with session.post(url, json=payload, proxy=proxy_url) as resp:
-                            body_text = await resp.text(encoding="utf-8", errors="replace")
-                            if resp.status == 200:
-                                data = json.loads(body_text)
-                                candidates = data.get("candidates") or []
-                                if candidates:
-                                    parts = (candidates[0].get("content") or {}).get("parts") or []
-                                    txt = "".join(
-                                        str(p.get("text") or "")
-                                        for p in parts
-                                        if isinstance(p, dict) and not p.get("thought", False)
-                                    ).strip()
-                                    if txt:
-                                        return txt
-                            else:
-                                last_error = f"[{route_label} | {model_name}] HTTP {resp.status}: {body_text[:120]}"
-                                if resp.status in (401, 403):
-                                    break
-                    except Exception as exc:
-                        last_error = f"[{route_label} | {model_name}] {type(exc).__name__}: {exc}"
-                        continue
-        except Exception as exc:
-            last_error = f"[{route_label}] {type(exc).__name__}: {exc}"
-            continue
-        finally:
-            if not connector.closed:
-                await connector.close()
-
-    if raise_on_error:
-        raise RuntimeError(last_error)
-
-    return _DEFAULT_QUESTION_FALLBACK
 
 
 def _build_sku_context(sku: Optional[str], label: str) -> str:
@@ -166,12 +94,12 @@ async def generate_buyer_question_answer(question_text: str, sku: Optional[str] 
     return await call_fast_gemini(prompt)
 
 
-async def generate_review_reply(review_text: str, rating: int, sku: Optional[str] = None) -> str:
+async def generate_review_reply(review_text: str, rating: Optional[int], sku: Optional[str] = None) -> str:
     sku_context = _build_sku_context(sku, "Товар из отзыва")
 
     prompt = f"""
 Ты — специалист контроля качества бренда YaSoKo.
-Напиши официальный ответ на отзыв покупателя на Ozon с оценкой {rating} из 5 звезд.
+Напиши официальный ответ на отзыв покупателя на Ozon (оценка: {rating if rating is not None else "не указана, не придумывай"}).
 
 {BRAND_MATRIX_RULES}
 {sku_context}
@@ -186,20 +114,13 @@ async def generate_review_reply(review_text: str, rating: int, sku: Optional[str
 4. Заверши теплым пожеланием: «Желаем красивого маникюра и отличного настроения! Будем рады видеть вас снова.».
 5. Объем: 3–4 предложения.
 """
-    try:
-        return await call_fast_gemini(prompt, raise_on_error=True)
-    except Exception:
-        art_note = f" (арт. {str(sku).strip()})" if sku and str(sku).strip() else ""
-        if rating <= 3:
-            return (
-                f"Здравствуйте! Благодарим за обратную связь и выбор бренда YaSoKo{art_note}. "
-                "Для максимальной стойкости покрытия рекомендуем наносить тонкую подложку из эластичной базы "
-                "на подготовленный ноготь и полимеризовать в лампе мощностью от 48W. "
-                "Желаем красивого маникюра и отличного настроения! Будем рады видеть вас снова."
-            )
-        return (
-            f"Здравствуйте! Благодарим за высокую оценку и выбор бренда YaSoKo{art_note}! "
-            "Мы рады, что материал порадовал вас в работе, а для безупречной стойкости скоро порадуем вас "
-            "фирменной базой и топом YaSoKo. "
-            "Желаем красивого маникюра и отличного настроения! Будем рады видеть вас снова."
-        )
+    for attempt in range(3):
+        try:
+            reply = await call_fast_gemini(prompt, raise_on_error=True)
+            if not reply.strip():
+                raise RuntimeError('Gemini вернул пустой ответ')
+            return reply
+        except RuntimeError:
+            if attempt == 2:
+                raise
+            await asyncio.sleep(2 ** attempt)

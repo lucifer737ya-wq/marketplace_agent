@@ -5,35 +5,21 @@ import logging
 import math
 import re
 import statistics
-import urllib.error
 import urllib.parse
-import urllib.request
 from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
 
 from config import settings
 from services.common.orders_report import _mul_rub, _round_pct, _round_rub, _to_dec
-from services.common.ad_recommendations import (
-    _discover_models_via_proxy,
-    sanitize_telegram_html,
-)
+from services.common.ad_recommendations import sanitize_telegram_html
+from services.common.gemini import generate
 
 logger = logging.getLogger(__name__)
 
 WB_HTTP_TIMEOUT = aiohttp.ClientTimeout(total=15, connect=6, sock_connect=6, sock_read=10)
 OZON_HTTP_TIMEOUT = aiohttp.ClientTimeout(total=15, connect=6, sock_connect=6, sock_read=10)
-GEMINI_HTTP_TIMEOUT = aiohttp.ClientTimeout(total=90, connect=15, sock_connect=15, sock_read=70)
-NATIVE_SOCKET_TIMEOUT_SEC = 10
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024  # 2 МБ — защита памяти хоста (4 ГБ RAM)
-
-DEFAULT_COMPETITOR_COGS_RUB = 75.0  # Оценочная себестоимость сырья + баночка 15 г + этикетка
-DEFAULT_OZON_ACTUAL_LOGISTICS_RUB = 39.0  # Фактическая эталонная логистика Ozon (~39 ₽/заказ)
-DEFAULT_OZON_UNDER300_COMM_RATE = 0.23  # Льготная комиссия Ozon до 300 ₽ (22–23%)
-DEFAULT_OZON_COINVEST_FACTOR = 0.90  # Оценочный коэффициент витрины Ozon к цене ЛК
-DEFAULT_WB_LOGISTICS_RUB = 55.0  # Базовый тариф логистики WB для баночки 15 г
-DEFAULT_WB_COMM_RATE = 0.25  # Базовая комиссия категории ногтевого сервиса WB
-DEFAULT_WB_SPP_FACTOR = 0.82  # Оценочный коэффициент СПП WB (buyer_price / seller_price)
 
 _USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -103,14 +89,12 @@ async def _fetch_json_direct(
             headers=headers,
         ) as opened_session:
             session = opened_session
-            async with session.get(url, allow_redirects=True, max_redirects=3) as resp:
-                raw_bytes = await resp.content.read(MAX_RESPONSE_BYTES + 1)
-                if len(raw_bytes) > MAX_RESPONSE_BYTES:
-                    return (
-                        None,
-                        f"HTTP {resp.status}: превышен лимит ответа ({MAX_RESPONSE_BYTES // 1024} КБ)",
-                        False,
-                    )
+            async with session.get(url, allow_redirects=False) as resp:
+                raw_bytes = bytearray()
+                async for chunk in resp.content.iter_chunked(32768):
+                    if len(raw_bytes) + len(chunk) > MAX_RESPONSE_BYTES:
+                        return None, f"HTTP {resp.status}: превышен лимит ответа", False
+                    raw_bytes.extend(chunk)
                 if resp.status == 429:
                     return None, "HTTP 429 (превышен лимит запросов)", False
                 if resp.status == 403:
@@ -136,51 +120,6 @@ async def _fetch_json_direct(
             await session.close()
         if not connector.closed:
             await connector.close()
-
-
-def _fetch_wb_native_sync(url: str) -> Tuple[List[Dict[str, Any]], Optional[str]]:
-    """
-    Резервный прямой запрос к WB через стандартную библиотеку без системного прокси,
-    с явным таймаутом сокета, ограничением размера ответа и корректной обработкой ошибок.
-    """
-    if not url.startswith("https://"):
-        return [], "Недопустимая схема URL"
-
-    headers = {
-        "User-Agent": _USER_AGENT,
-        "Accept": "application/json",
-        "Accept-Language": "ru-RU,ru;q=0.9",
-        "Origin": "https://www.wildberries.ru",
-        "Referer": "https://www.wildberries.ru/",
-    }
-    req = urllib.request.Request(url, headers=headers, method="GET")
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    try:
-        with opener.open(req, timeout=NATIVE_SOCKET_TIMEOUT_SEC) as response:
-            status = getattr(response, "status", 200)
-            raw_bytes = response.read(MAX_RESPONSE_BYTES + 1)
-            if len(raw_bytes) > MAX_RESPONSE_BYTES:
-                return [], f"HTTP {status}: превышен лимит ответа"
-            if status != 200:
-                return [], f"HTTP {status}"
-            data = json.loads(raw_bytes.decode("utf-8", errors="replace"))
-            if not isinstance(data, dict):
-                return [], "Некорректная структура ответа WB"
-            data_block = data.get("data")
-            products = data_block.get("products") if isinstance(data_block, dict) else None
-            if isinstance(products, list):
-                return [p for p in products if isinstance(p, dict)], None
-            return [], None
-    except urllib.error.HTTPError as exc:
-        return [], f"HTTP {exc.code}"
-    except urllib.error.URLError as exc:
-        return [], f"URLError: {exc.reason}"
-    except TimeoutError:
-        return [], f"Таймаут резервного сокета ({NATIVE_SOCKET_TIMEOUT_SEC} сек.)"
-    except json.JSONDecodeError as exc:
-        return [], f"Некорректный JSON резервного ответа ({exc.msg})"
-    except (OSError, ValueError) as exc:
-        return [], f"{type(exc).__name__}: {exc}"
 
 
 def _extract_wb_product_price(product: Dict[str, Any]) -> float:
@@ -228,22 +167,17 @@ async def _parse_wb_competitors_with_status(
     raw_products: List[Dict[str, Any]] = []
     data, err_msg, is_transport_err = await _fetch_json_direct(url, headers, WB_HTTP_TIMEOUT)
 
-    if err_msg is None and isinstance(data, dict):
-        data_block = data.get("data")
-        prods = data_block.get("products") if isinstance(data_block, dict) else None
-        if isinstance(prods, list):
-            raw_products = [p for p in prods if isinstance(p, dict)]
-    elif is_transport_err:
-        logger.warning("[Competitors WB] aiohttp error (%s), trying direct urllib fallback", err_msg)
-        fallback_prods, fallback_err = await asyncio.to_thread(_fetch_wb_native_sync, url)
-        if fallback_err is None:
-            raw_products = fallback_prods
-            err_msg = None
+    if is_transport_err:
+        logger.warning('WB: повтор прямого запроса после транспортной ошибки')
+        data, err_msg, _ = await _fetch_json_direct(url, headers, WB_HTTP_TIMEOUT)
+    if isinstance(data, dict) and not err_msg:
+        products = (data.get('data') or data).get('products')
+        if isinstance(products, list):
+            raw_products = [p for p in products if isinstance(p, dict)]
         else:
-            err_msg = f"{err_msg}; fallback: {fallback_err}"
-            logger.warning("[Competitors WB] fallback failed: %s", fallback_err)
-    elif err_msg:
-        logger.warning("[Competitors WB] request failed: %s", err_msg)
+            err_msg = 'WB: неизвестный формат выдачи'
+    if err_msg:
+        logger.warning('[Competitors WB] %s', err_msg)
 
     items: List[Dict[str, Any]] = []
     seen_skus: set[str] = set()
@@ -418,159 +352,31 @@ async def parse_ozon_competitors(query: str, count: int = 15) -> List[Dict[str, 
     return items
 
 
-def calculate_competitor_unit_economy(
-    buyer_price: float,
-    mp: str,
-    *,
-    cogs: float = DEFAULT_COMPETITOR_COGS_RUB,
-    ozon_logistics_rub: float = DEFAULT_OZON_ACTUAL_LOGISTICS_RUB,
-    wb_logistics_rub: float = DEFAULT_WB_LOGISTICS_RUB,
-) -> Dict[str, float]:
-    """
-    Оценочный расчет юнит-экономики конкурента на основе эталонных констант config.py:
-    - Эквайринг: settings.ACQUIRING_RATE (1.5%)
-    - Налог УСН: settings.TAX_RATE (6%)
-    - Ozon: льготная комиссия 23% до 300 ₽ включительно, 52% свыше 300 ₽; логистика ~39 ₽/заказ
-    - WB: комиссия категории 25%, базовая логистика 55 ₽, УСН 6% с цены покупателя (СПП)
-    - Безопасная обработка нулевой/некорректной цены без деления на ноль.
-    """
-    clean_bp = round(max(_safe_float(buyer_price, 0.0), 0.0), 2)
-    if clean_bp <= 0.0:
-        return {
-            "seller_price": 0.0,
-            "buyer_price": 0.0,
-            "commission": 0.0,
-            "commission_rate": 0.0,
-            "acquiring": 0.0,
-            "logistics": 0.0,
-            "mp_expenses": 0.0,
-            "tax": 0.0,
-            "cogs": 0.0,
-            "profit": 0.0,
-            "ros": 0.0,
-        }
-
-    acq_rate = max(_safe_float(getattr(settings, "ACQUIRING_RATE", 0.015), 0.015), 0.0)
-    tax_rate = max(_safe_float(getattr(settings, "TAX_RATE", 0.06), 0.06), 0.0)
-    oz_low_limit = max(_safe_float(getattr(settings, "OZON_LOW_PRICE_LIMIT", 300.0), 300.0), 0.0)
-    oz_high_comm = max(_safe_float(getattr(settings, "OZON_HIGH_COMMISSION_RATE", 0.52), 0.52), 0.0)
-    clean_cogs = round(max(_safe_float(cogs, DEFAULT_COMPETITOR_COGS_RUB), 0.0), 2)
-
-    mp_norm = str(mp or "").strip().upper()
-    if mp_norm == "WB":
-        raw_seller = clean_bp / DEFAULT_WB_SPP_FACTOR
-        seller_price = float(round(raw_seller)) if raw_seller >= 1.0 else _round_rub(raw_seller)
-        comm_rate = DEFAULT_WB_COMM_RATE
-        comm = _mul_rub(seller_price, comm_rate)
-        logistics = _round_rub(max(_safe_float(wb_logistics_rub, DEFAULT_WB_LOGISTICS_RUB), 0.0))
-        acq = _mul_rub(max(clean_bp, seller_price), acq_rate)
-        tax_usn = _mul_rub(clean_bp, tax_rate)
-    else:
-        raw_seller = clean_bp / DEFAULT_OZON_COINVEST_FACTOR
-        seller_price = float(round(raw_seller)) if raw_seller >= 1.0 else _round_rub(raw_seller)
-        comm_rate = (
-            DEFAULT_OZON_UNDER300_COMM_RATE if seller_price <= oz_low_limit else oz_high_comm
-        )
-        comm = _mul_rub(seller_price, comm_rate)
-        logistics = _round_rub(
-            max(_safe_float(ozon_logistics_rub, DEFAULT_OZON_ACTUAL_LOGISTICS_RUB), 0.0)
-        )
-        acq = _mul_rub(seller_price, acq_rate)
-        tax_usn = _mul_rub(seller_price, tax_rate)
-
-    mp_expenses = _round_rub(_to_dec(comm) + _to_dec(logistics) + _to_dec(acq))
-    net_profit = _round_rub(
-        _to_dec(seller_price) - _to_dec(clean_cogs) - _to_dec(mp_expenses) - _to_dec(tax_usn)
-    )
-    ros = _round_pct(net_profit, seller_price) if seller_price > 0.0 else 0.0
-
-    return {
-        "seller_price": seller_price,
-        "buyer_price": clean_bp,
-        "commission": comm,
-        "commission_rate": comm_rate,
-        "acquiring": acq,
-        "logistics": logistics,
-        "mp_expenses": mp_expenses,
-        "tax": tax_usn,
-        "cogs": clean_cogs,
-        "profit": net_profit,
-        "ros": ros,
-    }
+def calculate_competitor_unit_economy(buyer_price: float, mp: str, *, seller_price: float,
+                                      cogs: float, logistics_rub: float, commission_rate: float) -> dict:
+    """Explicit what-if scenario, never infer a competitor's costs or seller price from the shelf."""
+    mp = mp.upper()
+    if (mp not in ('OZON', 'WB') or not all(math.isfinite(x) and x >= 0 for x in
+            (buyer_price, seller_price, cogs, logistics_rub, commission_rate)) or
+            min(buyer_price, seller_price) <= 0 or commission_rate >= 1):
+        raise ValueError('Для сценария нужны цены, себестоимость, логистика и допустимые ставки')
+    rate = settings.OZON_HIGH_COMMISSION_RATE if mp == 'OZON' and seller_price > settings.OZON_LOW_PRICE_LIMIT else commission_rate
+    commission = _mul_rub(seller_price, rate)
+    tax = _mul_rub(buyer_price if mp == 'WB' else seller_price, settings.TAX_RATE)
+    acquiring = _mul_rub(seller_price, settings.ACQUIRING_RATE)
+    expenses = _round_rub(_to_dec(commission) + _to_dec(logistics_rub) + _to_dec(acquiring))
+    profit = _round_rub(_to_dec(seller_price) - _to_dec(cogs) - _to_dec(tax) - _to_dec(expenses))
+    return dict(seller_price=seller_price, buyer_price=buyer_price, commission_rate=rate,
+                commission=commission, logistics=logistics_rub, cogs=cogs, acquiring=acquiring,
+                mp_expenses=expenses, tax=tax, profit=profit, ros=_round_pct(profit, seller_price))
 
 
 async def _call_gemini_competitor_verdict(prompt: str) -> str:
-    """
-    Запрашивает аналитический вердикт Gemini строго через локальный прокси (settings.LOCAL_PROXY_URL)
-    с явными таймаутами и гарантированным закрытием aiohttp-сессии и коннектора.
-    """
-    api_key = str(getattr(settings, "GEMINI_API_KEY", "") or "").strip()
-    if not api_key:
-        return "⚠️ <i>GEMINI_API_KEY не задан — показаны только проверенные данные витрины.</i>"
-
-    proxy_url = str(getattr(settings, "LOCAL_PROXY_URL", "") or "").strip()
-    if not proxy_url:
-        return "⚠️ <i>LOCAL_PROXY_URL не задан — прямой вызов Gemini отключён правилами безопасности.</i>"
-
-    last_error = "нет ответа от моделей Gemini"
-    connector = aiohttp.TCPConnector(limit=4, ssl=True, enable_cleanup_closed=True)
-    session: Optional[aiohttp.ClientSession] = None
     try:
-        async with aiohttp.ClientSession(
-            connector=connector,
-            connector_owner=True,
-            trust_env=False,
-            timeout=GEMINI_HTTP_TIMEOUT,
-        ) as opened_session:
-            session = opened_session
-            models = await _discover_models_via_proxy(session, api_key, proxy_url)
-            payload = {
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {"temperature": 0.3, "maxOutputTokens": 4096},
-            }
-            for model_name in models:
-                url = (
-                    f"https://generativelanguage.googleapis.com/v1beta/models/"
-                    f"{model_name}:generateContent?key={api_key}"
-                )
-                try:
-                    async with session.post(url, json=payload, proxy=proxy_url) as resp:
-                        raw_text = await resp.text(encoding="utf-8", errors="replace")
-                        if resp.status in (401, 403):
-                            last_error = f"{model_name}: HTTP {resp.status}"
-                            break
-                        if resp.status != 200:
-                            last_error = f"{model_name}: HTTP {resp.status}"
-                            continue
-                        data = json.loads(raw_text)
-                        candidates = data.get("candidates") or []
-                        if not candidates:
-                            continue
-                        parts = (candidates[0].get("content") or {}).get("parts") or []
-                        text_out = "".join(
-                            str(p.get("text") or "")
-                            for p in parts
-                            if isinstance(p, dict) and not p.get("thought", False)
-                        ).strip()
-                        if text_out:
-                            return sanitize_telegram_html(text_out)
-                except asyncio.TimeoutError:
-                    last_error = f"{model_name}: таймаут запроса"
-                    continue
-                except (aiohttp.ClientError, json.JSONDecodeError, OSError) as exc:
-                    last_error = f"{model_name}: {type(exc).__name__}"
-                    continue
-    except asyncio.TimeoutError:
-        last_error = "таймаут подключения к локальному прокси"
-    except (aiohttp.ClientError, OSError) as exc:
-        last_error = f"ошибка прокси ({type(exc).__name__})"
-    finally:
-        if session is not None and not session.closed:
-            await session.close()
-        if not connector.closed:
-            await connector.close()
-
-    return f"⚠️ <i>ИИ-разбор временно недоступен ({html.escape(last_error)}).</i>"
+        text, _ = await generate(prompt, max_tokens=4096, temperature=0.3)
+        return sanitize_telegram_html(text)
+    except RuntimeError as exc:
+        return f"⚠️ <i>ИИ-разбор временно недоступен ({html.escape(str(exc))}).</i>"
 
 
 async def run_full_competitor_deep_audit(category_query: str) -> Tuple[str, Dict[str, float]]:
@@ -624,7 +430,6 @@ async def run_full_competitor_deep_audit(category_query: str) -> Tuple[str, Dict
         html_rows: List[str] = []
         plain_rows: List[str] = []
         for comp in comps:
-            econ = calculate_competitor_unit_economy(float(comp["buyer_price"]), str(comp["mp"]))
             mp_lbl = html.escape(str(comp["mp"]))
             sku_lbl = html.escape(str(comp["sku"]))
             brand_lbl = html.escape(str(comp["brand"]))
@@ -634,16 +439,11 @@ async def run_full_competitor_deep_audit(category_query: str) -> Tuple[str, Dict
 
             html_rows.append(
                 f"• [{mp_lbl}] Арт. <code>{sku_lbl}</code> | <b>{brand_lbl}</b> — {name_lbl}\n"
-                f"   Витрина: <b>{econ['buyer_price']:.0f} ₽</b> (оценка ЛК ~{econ['seller_price']:.0f} ₽) | "
-                f"Расходы МП (с экв. 1.5%): -{econ['mp_expenses']:.0f} ₽ | УСН 6%: -{econ['tax']:.0f} ₽ | "
-                f"Прибыль: <code>{econ['profit']:+.0f} ₽</code> (ROS {econ['ros']:.1f}%)"
+                f"   Витрина: <b>{comp['buyer_price']:.0f} ₽</b>"
             )
             plain_rows.append(
                 f"[{comp['mp']}] SKU {comp['sku']} | {comp['brand']} — {short_name} | "
-                f"витрина {econ['buyer_price']:.0f}₽, ЛК ~{econ['seller_price']:.0f}₽, "
-                f"комиссия {econ['commission_rate']*100:.0f}% (-{econ['commission']:.0f}₽), "
-                f"логистика -{econ['logistics']:.0f}₽, эквайринг -{econ['acquiring']:.1f}₽, "
-                f"УСН -{econ['tax']:.1f}₽, прибыль {econ['profit']:+.0f}₽ (ROS {econ['ros']:.1f}%), "
+                f"витрина {comp['buyer_price']:.0f}₽, "
                 f"рейтинг {comp['rating']}, отзывов {comp['feedbacks']}"
             )
         return html_rows, plain_rows
@@ -677,8 +477,8 @@ async def run_full_competitor_deep_audit(category_query: str) -> Tuple[str, Dict
         f"- Средняя цена Wildberries: {wb_prompt_stat}\n"
         f"- Средняя цена Ozon: {oz_prompt_stat}\n"
         f"- Средняя по выборке: {avg_total:.0f} ₽ | Истинная медиана: {median_total:.0f} ₽\n\n"
-        f"РЕАЛЬНАЯ ВЫБОРКА КОНКУРЕНТОВ (оценочная себестоимость {DEFAULT_COMPETITOR_COGS_RUB:.0f} ₽, "
-        f"логистика Ozon ~{DEFAULT_OZON_ACTUAL_LOGISTICS_RUB:.0f} ₽, эквайринг 1.5%, УСН 6%):\n"
+        "Цены витрины не раскрывают цену в ЛК, СПП, тарифы и себестоимость конкурентов. "
+        "Не вычисляй по ним чужую прибыль. Отделяй гипотезы от наблюдений.\n"
         f"{sample_for_prompt}\n\n"
         "НАШИ ВВОДНЫЕ YASOKO:\n"
         "- Двойная жесткость: пластичный в тонком слое (без сколов), жесткий в толстом (держит углы квадрата без усадки).\n"
@@ -697,12 +497,11 @@ async def run_full_competitor_deep_audit(category_query: str) -> Tuple[str, Dict
     total_found = len(wb_comps) + len(oz_comps)
     report_text = (
         f"📊 <b>Анализ конкурентов ({total_found} карточек): «{safe_query}»</b>\n"
-        f"ℹ️ <i>Цены ЛК, СПП и себестоимость конкурентов ({DEFAULT_COMPETITOR_COGS_RUB:.0f} ₽) — расчётная оценка; "
-        f"эквайринг 1.5%, УСН 6%, логистика Ozon ~{DEFAULT_OZON_ACTUAL_LOGISTICS_RUB:.0f} ₽.</i>\n\n"
+        "ℹ️ <i>Это цены витрин, не цены в ЛК. Себестоимость, логистика и прибыль конкурентов неизвестны.</i>\n\n"
         f"💵 <b>Цены на витринах:</b>\n"
         f"• Wildberries: {wb_price_str}\n"
         f"• Ozon: {oz_price_str}\n"
-        f"• Средняя по выборке: <b>{avg_total:.0f} ₽</b> | Рыночная медиана: <b>{median_total:.0f} ₽</b>\n\n"
+        f"• Средняя по выборке: <b>{avg_total:.0f} ₽</b> | Медиана выборки: <b>{median_total:.0f} ₽</b>\n\n"
         f"<b>Выборка Wildberries:</b>\n{wb_section}\n\n"
         f"<b>Выборка Ozon:</b>\n{oz_section}\n\n"
         f"➖➖➖➖➖➖➖➖➖➖\n"

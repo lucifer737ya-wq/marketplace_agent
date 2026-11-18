@@ -3,12 +3,11 @@ import json
 from datetime import datetime, timedelta
 from typing import Any, Dict, Optional, Sequence, Tuple
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 
 from database.models import (
     AdSpendRecord,
-    AsyncSessionLocal,
     FirstMileSupply,
     PendingAction,
     Product,
@@ -100,7 +99,9 @@ async def record_first_mile_supply(
 ) -> FirstMileSupply:
     clean_sku = str(sku).strip()
     mp = str(marketplace).strip().lower()
-    safe_qty = max(int(quantity), 1)
+    if quantity <= 0:
+        raise ValueError("Количество поставки должно быть положительным")
+    safe_qty = int(quantity)
     unit_cost = round(float(total_transport_cost) / safe_qty, 2)
     resolved_ext, resolved_title = _resolve_ext_id_and_title(clean_sku, mp)
 
@@ -340,8 +341,8 @@ async def get_lagged_drr(
         total_ads = float((await session.execute(ad_stmt)).scalar() or 0.0)
 
         if total_sales <= 0:
-            return 0.05  # Базовый консервативный ДРР 5%, если не было продаж
-        return min(round(total_ads / total_sales, 4), 0.50)
+            raise ValueError("Нет продаж для вычисления ДРР")
+        return round(total_ads / total_sales, 4)
 
 
 async def create_pending_action(
@@ -350,18 +351,20 @@ async def create_pending_action(
     action_type: str,
     payload: dict,
 ) -> PendingAction:
+    return (await create_pending_actions(marketplace, sku, action_type, [payload]))[0]
+
+
+async def create_pending_actions(marketplace: str, sku: str, action_type: str,
+                                 payloads: list[dict]) -> list[PendingAction]:
+    """Persist all alternatives of a card in one commit before exposing any button."""
+    actions = [PendingAction(marketplace=marketplace.strip().lower(), sku=sku.strip(),
+        action_type=action_type, payload_json=json.dumps(payload, ensure_ascii=False, allow_nan=False),
+        status='pending') for payload in payloads]
     async with _db_write_lock:
         async with get_db_session() as session:
-            action = PendingAction(
-                marketplace=str(marketplace).strip().lower(),
-                sku=str(sku).strip(),
-                action_type=str(action_type).strip(),
-                payload_json=json.dumps(payload, ensure_ascii=False),
-                status="pending",
-            )
-            session.add(action)
+            session.add_all(actions)
             await session.commit()
-            return action
+    return actions
 
 
 async def get_pending_action(action_id: int) -> Optional[PendingAction]:
@@ -372,34 +375,13 @@ async def get_pending_action(action_id: int) -> Optional[PendingAction]:
         return res.scalar_one_or_none()
 
 
-async def mark_action_executed(action_id: int) -> bool:
-    """Переводит действие в статус executed."""
-    async with _db_write_lock:
-        async with get_db_session() as session:
-            stmt = select(PendingAction).where(PendingAction.id == int(action_id))
-            res = await session.execute(stmt)
-            action = res.scalar_one_or_none()
-            if action:
-                action.status = "executed"
-                action.executed_at = utcnow_naive()
-                await session.commit()
-                return True
-            return False
-
-
-async def mark_action_rejected(action_id: int) -> bool:
-    """Переводит действие в статус rejected."""
-    async with _db_write_lock:
-        async with get_db_session() as session:
-            stmt = select(PendingAction).where(PendingAction.id == int(action_id))
-            res = await session.execute(stmt)
-            action = res.scalar_one_or_none()
-            if action:
-                action.status = "rejected"
-                action.executed_at = utcnow_naive()
-                await session.commit()
-                return True
-            return False
+async def recover_interrupted_actions() -> int:
+    """Called exclusively under the worker process lock, before accepting callbacks."""
+    async with get_db_session() as session:
+        changed = await session.execute(update(PendingAction).where(
+            PendingAction.status.in_(['processing', 'blocked'])).values(status='unknown'))
+        await session.commit()
+        return changed.rowcount
 
 
 async def add_sale_record(
@@ -496,7 +478,6 @@ async def bulk_upsert_costs(records: list[dict]) -> int:
 
 async def claim_price_action(action_id: int) -> Optional[PendingAction]:
     """Атомарно резервирует действие и альтернативы его группы для одного запроса."""
-    from sqlalchemy import update
     async with _db_write_lock:
         async with get_db_session() as session:
             result = await session.execute(
@@ -520,7 +501,6 @@ async def claim_price_action(action_id: int) -> Optional[PendingAction]:
 
 async def finish_price_action(action_id: int, status: str, result: Optional[dict] = None) -> None:
     """submitted/unknown не позволяют повторить потенциально выполненный запрос."""
-    from sqlalchemy import update
     if status not in {"pending", "executed", "submitted", "unknown", "rejected"}:
         raise ValueError("Недопустимый статус")
     async with _db_write_lock:

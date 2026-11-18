@@ -21,7 +21,7 @@ def utcnow_naive() -> datetime:
 
 
 class Base(DeclarativeBase):
-    pass
+    """Declarative metadata shared by the SQLite tables."""
 
 
 class Product(Base):
@@ -36,14 +36,14 @@ class Product(Base):
     cost_price: Mapped[float] = mapped_column(Float, default=0.0)
     packaging_cost: Mapped[float] = mapped_column(Float, default=0.0)
     first_mile_unit_cost: Mapped[float] = mapped_column(Float, default=0.0)
-    fbo_logistics_cost: Mapped[float] = mapped_column(Float, default=65.0)
-    commission_rate: Mapped[float] = mapped_column(Float, default=0.23)
+    fbo_logistics_cost: Mapped[float] = mapped_column(Float, default=0.0)
+    commission_rate: Mapped[float] = mapped_column(Float, default=0.0)
     target_margin_rub: Mapped[float] = mapped_column(Float, default=100.0)
 
     current_price: Mapped[float] = mapped_column(Float, default=0.0)
     stock_fbo: Mapped[int] = mapped_column(Integer, default=0)
     stock_fbs: Mapped[int] = mapped_column(Integer, default=0)
-    avg_daily_sales: Mapped[float] = mapped_column(Float, default=1.0)
+    avg_daily_sales: Mapped[float] = mapped_column(Float, default=0.0)
 
     in_promo: Mapped[bool] = mapped_column(Boolean, default=False)
     promo_max_price: Mapped[float] = mapped_column(Float, default=0.0)
@@ -126,7 +126,7 @@ class PendingAction(Base):
         try:
             parsed = json.loads(self.payload_json)
             return parsed if isinstance(parsed, dict) else {}
-        except Exception:
+        except (ValueError, TypeError):
             return {}
 
     def __int__(self) -> int:

@@ -5,6 +5,7 @@ from typing import Any
 from aiogram import Router, F
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from config import settings
+from services.common.market_api import APIStatusError
 from database.crud import claim_price_action, finish_price_action
 from services.ozon.seller_api import OzonSellerAPI
 from services.wb.statistics_api import WBStatisticsAPI
@@ -41,14 +42,22 @@ def build_dual_ozon_approval_keyboard(act_299_id: int, profit_299: float, act_ov
 def _ozon_result(response: Any, offer_id: str, product_id: str) -> None:
     if not isinstance(response, dict) or not isinstance(response.get("result"), list):
         raise RuntimeError("Неизвестный ответ Ozon; проверьте цену в кабинете")
-    rows = [r for r in response["result"] if isinstance(r, dict) and
-            (str(r.get("offer_id") or "") == offer_id or
-             (product_id and str(r.get("product_id") or "") == product_id))]
-    if len(rows) != 1:
-        raise RuntimeError("Нет однозначного результата Ozon; проверьте цену в кабинете")
-    row = rows[0]
-    if row.get("updated") is not True or row.get("errors"):
-        raise ValueError(f"Ozon отклонил цену: {row.get('errors') or row}")
+    matching = []
+    for row in response['result']:
+        if not isinstance(row, dict):
+            continue
+        offer, pid = str(row.get('offer_id') or ''), str(row.get('product_id') or '')
+        if (offer or pid) and (not offer or offer == offer_id) and (not pid or pid == product_id):
+            matching.append(row)
+    if len(matching) != 1:
+        raise RuntimeError('Нет однозначного результата Ozon; проверьте цену в кабинете')
+    row = matching[0]
+    errors = row.get('errors') or []
+    if errors or row.get('updated') is False:
+        messages = [str(e.get('message') or e.get('code') or e) if isinstance(e, dict) else str(e) for e in errors]
+        raise ValueError('Ozon отклонил цену: ' + ('; '.join(messages) or 'updated=false'))
+    if row.get('updated') is not True:
+        raise RuntimeError('Ozon не подтвердил обновление')
 
 
 def _action_id(call: CallbackQuery) -> int:
@@ -78,16 +87,16 @@ async def cb_approve_action(call: CallbackQuery):
     if not action:
         await call.answer("Действие уже обработано или выполняется", show_alert=True)
         return
-    await call.answer("Отправляю запрос маркетплейсу")
     submitted_request = False
+    operation_result = None
     try:
+        await call.answer("Отправляю запрос маркетплейсу")
         if action.action_type != "update_price":
             raise ValueError("Неподдерживаемый тип действия")
         payload = action.payload
         price = float(payload.get("new_price") or 0)
         if not math.isfinite(price) or price <= 0:
             raise ValueError("Некорректная цена")
-        operation_result = None
         if action.marketplace == "ozon":
             offer_id = str(payload.get("offer_id") or action.sku)
             product_id = str(payload.get("product_id") or "")
@@ -109,14 +118,14 @@ async def cb_approve_action(call: CallbackQuery):
                       f"Рекомендуемый минимум акции {result['min_price_for_promotions']} ₽ не установлен API.")
         else:
             raise ValueError("Неизвестный маркетплейс")
-        await finish_price_action(action_id, status, operation_result)
     except Exception as exc:
         # После отправки сетевой сбой/неожиданный ответ может означать уже принятое действие.
-        status = "unknown" if submitted_request and not isinstance(exc, ValueError) else "pending"
-        await finish_price_action(action_id, status)
+        rejected = isinstance(exc, ValueError) or (isinstance(exc, APIStatusError) and exc.status in {400, 401, 403, 404, 422, 429})
+        status = "unknown" if submitted_request and not rejected else "pending"
         detail = (f"Ошибка: {exc}. " + ("Проверьте цену/задачу в кабинете до повторного запуска." if status == "unknown" else "Действие не подтверждено."))
+    await finish_price_action(action_id, status, operation_result)
     if call.message:
-        await call.message.reply(html.escape(detail), parse_mode="HTML")
+        await call.message.reply(html.escape(detail[:3200]), parse_mode="HTML")
 
 
 @callbacks_router.callback_query(F.data.startswith("act:rej:"))

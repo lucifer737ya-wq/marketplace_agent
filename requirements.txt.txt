@@ -1,9 +1,1 @@
-aiogram==3.13.1
-aiohttp==3.10.5
-SQLAlchemy==2.0.35
-aiosqlite==0.20.0
-APScheduler==3.10.4
-pydantic==2.9.2
-pydantic-settings==2.5.2
-aiohttp-socks==0.9.1
-playwright==1.48.0
+-r requirements.txt

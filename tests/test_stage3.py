@@ -1,29 +1,16 @@
 """Контрактные и финансовые тесты этапа 3 (финансы, реклама, конкуренты) без внешних запросов."""
 import asyncio
-import atexit
 import json
-import os
-import tempfile
 import unittest
 from datetime import datetime
-from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import aiohttp
 from aiohttp import web
 
-_tmp = tempfile.TemporaryDirectory()
-atexit.register(_tmp.cleanup)
-os.environ.update(
-    TG_BOT_TOKEN="123456:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi",
-    TG_ADMIN_ID="123",
-    OZON_CLIENT_ID="test",
-    OZON_API_KEY="test",
-    WB_API_TOKEN="test",
-    GEMINI_API_KEY="test-gemini-key",
-    LOCAL_PROXY_URL="http://127.0.0.1:3066",
-    DB_URL="sqlite+aiosqlite:///" + str(Path(_tmp.name) / "test_stage3.db"),
-)
+from tests import offline
+
+offline.require_isolation()  # before importing application settings
 
 from sqlalchemy import delete, select
 
@@ -44,7 +31,6 @@ from services.common.orders_report import sync_and_generate_orders_report
 from services.competitors.deep_parser import (
     WB_HTTP_TIMEOUT,
     _fetch_json_direct,
-    _fetch_wb_native_sync,
     calculate_competitor_unit_economy,
     parse_ozon_competitors,
     parse_wb_competitors,
@@ -509,11 +495,16 @@ class TestStage3OzonAdCampaigns(unittest.IsolatedAsyncioTestCase):
 class TestStage3CompetitorsDeepParser(unittest.IsolatedAsyncioTestCase):
     def test_competitor_unit_economy_accuracy_and_zero_safety(self) -> None:
         # Нулевая / отрицательная цена — без деления на ноль
-        self.assertEqual(calculate_competitor_unit_economy(0.0, "OZON")["profit"], 0.0)
-        self.assertEqual(calculate_competitor_unit_economy(-100.0, "WB")["ros"], 0.0)
+        example = dict(cogs=75., logistics_rub=39., commission_rate=.23)
+        for price in (0., -100.):
+            with self.assertRaises(ValueError):
+                calculate_competitor_unit_economy(price, 'OZON', seller_price=299., **example)
+        # A public shelf price alone does not disclose a seller's unit economy.
+        with self.assertRaises(TypeError):
+            calculate_competitor_unit_economy(269., 'OZON')
 
         # Ozon до 300 ₽: buyer=269 -> seller=299, ком. 23% (68.77), лог. 39.0, экв. 1.5% (4.49), УСН 6% (17.94), себес 75
-        oz_low = calculate_competitor_unit_economy(269.0, "ozon")
+        oz_low = calculate_competitor_unit_economy(269.0, "ozon", seller_price=299., **example)
         self.assertEqual(oz_low["seller_price"], 299.0)
         self.assertEqual(oz_low["commission_rate"], 0.23)
         self.assertEqual(oz_low["logistics"], 39.0)
@@ -522,7 +513,7 @@ class TestStage3CompetitorsDeepParser(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(oz_low["profit"], 93.80)
 
         # Ozon свыше 300 ₽: buyer=315 -> seller=350, ком. 52% (182.0), лог. 39.0, экв. 1.5% (5.25), УСН 6% (21.0)
-        oz_high = calculate_competitor_unit_economy(315.0, "OZON")
+        oz_high = calculate_competitor_unit_economy(315.0, "OZON", seller_price=350., **example)
         self.assertEqual(oz_high["seller_price"], 350.0)
         self.assertEqual(oz_high["commission_rate"], 0.52)
         self.assertEqual(oz_high["logistics"], 39.0)
@@ -531,7 +522,7 @@ class TestStage3CompetitorsDeepParser(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(oz_high["profit"], 27.75)
 
         # WB: buyer=287 -> seller=350, ком. 25% (87.50), лог. 55.0, экв. 1.5% от 350 (5.25), УСН 6% от 287 (17.22)
-        wb_ec = calculate_competitor_unit_economy(287.0, "wb")
+        wb_ec = calculate_competitor_unit_economy(287.0, "wb", seller_price=350., cogs=75., logistics_rub=55., commission_rate=.25)
         self.assertEqual(wb_ec["seller_price"], 350.0)
         self.assertEqual(wb_ec["acquiring"], 5.25)
         self.assertEqual(wb_ec["tax"], 17.22)
@@ -630,7 +621,7 @@ class TestStage3CompetitorsDeepParser(unittest.IsolatedAsyncioTestCase):
         data, err, _ = await _fetch_json_direct("http://example.com", {}, WB_HTTP_TIMEOUT)
         self.assertIsNone(data)
         self.assertIn("https://", err or "")
-        self.assertEqual(_fetch_wb_native_sync("file:///etc/passwd")[0], [])
+        self.assertIsNone((await _fetch_json_direct("file:///test.json", {}, WB_HTTP_TIMEOUT))[0])
 
         # 2. Проверка гарантированного закрытия реальных ClientSession и TCPConnector при TimeoutError и HTTP 429
         async def slow_handler(_request):
@@ -715,18 +706,12 @@ class TestStage3CompetitorsDeepParser(unittest.IsolatedAsyncioTestCase):
         from services.common.ad_recommendations import _call_gemini_unlimited
         from services.competitors.deep_parser import _call_gemini_competitor_verdict
 
-        # 1. При сетевой ошибке aiohttp срабатывает резервный urllib без фейковых SKU
-        with (
-            patch(
-                "services.competitors.deep_parser._fetch_json_direct",
-                new=AsyncMock(return_value=(None, "Сетевая ошибка aiohttp", True)),
-            ),
-            patch(
-                "services.competitors.deep_parser._fetch_wb_native_sync",
-                return_value=([{"id": 777, "name": "Гель", "brand": "B", "salePriceU": 29900}], None),
-            ),
-        ):
-            wb_fb = await parse_wb_competitors("гель", count=5)
+        # Разрешён один прямой GET после сетевого сбоя; нет urllib или системного прокси.
+        with patch('services.competitors.deep_parser._fetch_json_direct', AsyncMock(side_effect=[
+                (None, 'Сетевая ошибка aiohttp', True),
+                ({'products': [{'id': 777, 'name': 'Гель', 'brand': 'B', 'salePriceU': 29900}]}, None, False)])) as read:
+            wb_fb = await parse_wb_competitors('гель', count=5)
+            self.assertEqual(read.await_count, 2)
         self.assertEqual(len(wb_fb), 1)
         self.assertEqual((wb_fb[0]["sku"], wb_fb[0]["buyer_price"]), ("777", 299.0))
 
@@ -766,7 +751,6 @@ class TestStage3CompetitorsDeepParser(unittest.IsolatedAsyncioTestCase):
         def track_gemini_session(*args, **kwargs):
             self.assertFalse(kwargs.get("trust_env", True))
             sess = real_session_cls(*args, **kwargs)
-            orig_post = sess.post
 
             def fail_post(url, **pkw):
                 gemini_proxies.append(pkw.get("proxy"))
@@ -777,10 +761,8 @@ class TestStage3CompetitorsDeepParser(unittest.IsolatedAsyncioTestCase):
             return sess
 
         with (
-            patch("services.common.ad_recommendations._discover_models_via_proxy", new=AsyncMock(return_value=["gemini-2.5-flash"])),
-            patch("services.common.ad_recommendations.aiohttp.ClientSession", side_effect=track_gemini_session),
-            patch("services.competitors.deep_parser._discover_models_via_proxy", new=AsyncMock(return_value=["gemini-2.5-flash"])),
-            patch("services.competitors.deep_parser.aiohttp.ClientSession", side_effect=track_gemini_session),
+            patch("services.common.gemini._get_available_models", new=AsyncMock(return_value=["gemini-2.5-flash"])),
+            patch("services.common.gemini.aiohttp.ClientSession", side_effect=track_gemini_session),
         ):
             msg1 = await _call_gemini_unlimited("test")
             msg2 = await _call_gemini_competitor_verdict("test")

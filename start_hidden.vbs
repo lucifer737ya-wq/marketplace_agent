@@ -1,13 +1,10 @@
 Option Explicit
-
-Dim objWMIService, colProcesses, WshShell
-Set objWMIService = GetObject("winmgmts:\\.\root\cimv2")
-Set colProcesses = objWMIService.ExecQuery("SELECT ProcessId FROM Win32_Process WHERE (Name = 'python.exe' OR Name = 'pythonw.exe') AND CommandLine LIKE '%supervisor.py%'")
-
-If colProcesses.Count > 0 Then
-    WScript.Quit 0
-End If
-
-Set WshShell = CreateObject("WScript.Shell")
-WshShell.CurrentDirectory = "C:\marketplace_agent"
-WshShell.Run """C:\marketplace_agent\venv\Scripts\pythonw.exe"" ""C:\marketplace_agent\supervisor.py""", 0, False
+Dim shell, fs, root, python, supervisor
+Set shell = CreateObject("WScript.Shell")
+Set fs = CreateObject("Scripting.FileSystemObject")
+root = fs.GetParentFolderName(WScript.ScriptFullName)
+python = fs.BuildPath(root, "venv\Scripts\pythonw.exe")
+supervisor = fs.BuildPath(root, "supervisor.py")
+shell.CurrentDirectory = root
+' supervisor.py acquires the exclusive OS lock before launching a worker.
+shell.Run Chr(34) & python & Chr(34) & " " & Chr(34) & supervisor & Chr(34), 0, False
