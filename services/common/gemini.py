@@ -1,16 +1,22 @@
-"""Shared asynchronous REST client. Keys are headers, not query strings in errors."""
+"""Shared asynchronous REST client for Gemini. Direct connection preferred; local proxy is fallback only."""
 
 import asyncio
 import re
-from typing import Any
+from typing import Any, Optional
 
 import aiohttp
 
 from config import settings
-from services.common.routes import proxy_routes, remember_route
+from services.common.routes import DIRECT, proxy_routes, remember_route
 
 BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
-FALLBACK_MODELS = ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.0-flash"]
+FALLBACK_MODELS = [
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+    "gemini-2.5-pro",
+    "gemini-flash-lite-latest",
+    "gemini-1.5-flash",
+]
 
 
 def _extract_model_name(item: Any) -> str:
@@ -34,19 +40,23 @@ def _is_supported_text_model(name: str) -> bool:
     )
 
 
-async def _get_available_models(session, proxy: str) -> list[str]:
+async def _get_available_models(session: aiohttp.ClientSession, proxy: Optional[str]) -> list[str]:
     names = [_extract_model_name(settings.GEMINI_MODEL)]
-    async with session.get(BASE_URL, proxy=proxy, allow_redirects=False) as resp:
-        if resp.status in (401, 403):
-            raise RuntimeError(f"Gemini HTTP {resp.status}")
-        if resp.status == 200:
-            data = await resp.json()
-            names.extend(
-                _extract_model_name(item)
-                for item in data.get("models", [])
-                if isinstance(item, dict)
-                and "generateContent" in item.get("supportedGenerationMethods", [])
-            )
+    kwargs = {"proxy": proxy} if proxy else {}
+    try:
+        async with session.get(BASE_URL, allow_redirects=False, **kwargs) as resp:
+            if resp.status in (401, 403):
+                raise RuntimeError(f"Gemini HTTP {resp.status}")
+            if resp.status == 200:
+                data = await resp.json()
+                names.extend(
+                    _extract_model_name(item)
+                    for item in data.get("models", [])
+                    if isinstance(item, dict)
+                    and "generateContent" in item.get("supportedGenerationMethods", [])
+                )
+    except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
+        pass  # fall through to static list
     return list(
         dict.fromkeys(
             name
@@ -70,25 +80,25 @@ async def generate(
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"temperature": temperature, "maxOutputTokens": max_tokens},
     }
-    try:
-        proxies = proxy_routes("gemini")
-    except ValueError as exc:
-        raise RuntimeError(str(exc)) from exc
+    # Direct first, then any configured local proxies
+    routes = proxy_routes("gemini", allow_direct=True)
     error = "Нет доступной текстовой модели"
     async with aiohttp.ClientSession(
         trust_env=False,
-        timeout=aiohttp.ClientTimeout(total=timeout, connect=10),
+        timeout=aiohttp.ClientTimeout(total=timeout, connect=12),
         headers={"x-goog-api-key": settings.GEMINI_API_KEY},
     ) as session:
-        for proxy in proxies:
+        for route in routes:
+            proxy = route if route else None  # None = direct
             try:
                 models = await _get_available_models(session, proxy)
                 if fast:
-                    models.sort(key=lambda name: "flash" not in name)
-                for name in models[:5]:
+                    models.sort(key=lambda name: (0 if "flash" in name.lower() or "lite" in name.lower() else 1, name))
+                for name in models[:6]:
                     url = f"{BASE_URL}/{name}:generateContent"
+                    kwargs = {"proxy": proxy} if proxy else {}
                     async with session.post(
-                        url, proxy=proxy, json=payload, allow_redirects=False
+                        url, json=payload, allow_redirects=False, **kwargs
                     ) as resp:
                         if resp.status != 200:
                             error = f"{name}: HTTP {resp.status}"
@@ -98,14 +108,14 @@ async def generate(
                         data = await resp.json()
                         for c in data.get("candidates") or []:
                             if c.get("finishReason") != "STOP":
-                                continue  # in particular, never install MAX_TOKENS output
+                                continue
                             text = "".join(
                                 part.get("text", "")
                                 for part in c.get("content", {}).get("parts", [])
                                 if not part.get("thought")
                             ).strip()
                             if text:
-                                remember_route("gemini", proxy)
+                                remember_route("gemini", route)
                                 return text, name
                         error = f"{name}: пустой или незавершённый ответ"
             except (
@@ -114,5 +124,6 @@ async def generate(
                 OSError,
                 ValueError,
             ) as exc:
-                error = type(exc).__name__
-    raise RuntimeError(f"Gemini недоступен через локальный прокси: {error}")
+                error = f"{type(exc).__name__}: {exc}"
+                continue
+    raise RuntimeError(f"Gemini недоступен (прямой + прокси): {error}")
