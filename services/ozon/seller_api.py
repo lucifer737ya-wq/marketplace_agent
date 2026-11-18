@@ -2,7 +2,7 @@ import asyncio
 import math
 from collections import Counter, defaultdict
 from decimal import Decimal
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from typing import Any, Dict, List, Optional
 
 from config import settings
@@ -39,8 +39,8 @@ class OzonSellerAPI(MarketplaceClient):
 
     async def _load_inventory(self) -> List[Dict[str, Any]]:
         """
-        Собирает цены, акции, остатки FBO и FBS, комиссию (22-23% до 300₽ / 52% > 300₽)
-        и приемку на ПВЗ по FBS (first mile / drop-off).Использует кэш для защиты от 429.
+        Собирает цены, акции, остатки FBO и FBS, комиссию и приемку на ПВЗ по FBS.
+        Использует кэш для защиты от 429.
         """
         cached = self._read_disk_cache("ozon_stocks_and_prices", max_age_sec=180)
         if cached is not None:
@@ -120,7 +120,6 @@ class OzonSellerAPI(MarketplaceClient):
             fbo_map[off_id] = fbo_qty
             fbs_map[off_id] = fbs_qty
 
-        # Кэшируем аналитику продаж отдельно на 30 минут, чтобы не ловить Rate Limit 429!
         sales_7d_map = self._read_disk_cache("ordered_units", 1800)
         if sales_7d_map is None:
             end = datetime.utcnow().date()
@@ -150,9 +149,7 @@ class OzonSellerAPI(MarketplaceClient):
                     offset += len(rows)
                 self._write_disk_cache("ordered_units", sales_7d_map)
             except (RuntimeError, KeyError, ValueError):
-                sales_7d_map = (
-                    None  # optional metric: unavailable, not fabricated sales
-                )
+                sales_7d_map = None
 
         results: List[Dict[str, Any]] = []
         for item in prices_items:
@@ -183,7 +180,6 @@ class OzonSellerAPI(MarketplaceClient):
                 or raw_pct_fbo
             )
 
-            # Логистика FBO
             fbo_deliv = (
                 float(comm_block.get("fbo_deliv_to_customer_amount") or 0.0)
                 + float(
@@ -194,7 +190,6 @@ class OzonSellerAPI(MarketplaceClient):
                 + float(comm_block.get("fbo_fulfillment_amount") or 0.0)
             )
 
-            # Логистика FBS (без приемки ПВЗ, приемку выделяем отдельно!)
             fbs_deliv_pure = float(
                 comm_block.get("fbs_deliv_to_customer_amount") or 0.0
             ) + float(
@@ -203,7 +198,6 @@ class OzonSellerAPI(MarketplaceClient):
                 or 0.0
             )
 
-            # Приемка на ПВЗ по FBS (Drop-off / первая миля)
             pvz_raw = next(
                 (
                     comm_block[key]
@@ -223,7 +217,6 @@ class OzonSellerAPI(MarketplaceClient):
                 else round(cur_price * settings.ACQUIRING_RATE, 2)
             )
 
-            # Проверка участия товара в акциях Ozon
             mkt_actions = item.get("marketing_actions")
             actions_list = []
             if isinstance(mkt_actions, dict):
@@ -352,7 +345,6 @@ class OzonSellerAPI(MarketplaceClient):
             kind = str(c.get("advObjectType") or "SKU")
             rows, skus = [], []
             if kind == "SEARCH_PROMO" and cpo_count == 1:
-                # This is an account-wide read; never assign it to each of several CPO campaigns.
                 entries = await pages(
                     "/api/client/campaign/search_promo/v2/products",
                     "products",
@@ -365,7 +357,6 @@ class OzonSellerAPI(MarketplaceClient):
                         if p.get("searchPromoStatus") is True
                     }
                 )
-                # A CPO bid is not an observed DRR. The CPC statistics endpoint does not cover CPO.
             elif kind == "SKU":
                 items = await read_versions(
                     (
@@ -433,6 +424,91 @@ class OzonSellerAPI(MarketplaceClient):
         self._write_disk_cache(key, results)
         return results
 
+    async def _fetch_cash_flow(
+        self, from_date: str, to_date: str
+    ) -> tuple[list, list, str]:
+        """Primary finance source after v3/transaction/list was retired (2026)."""
+        cash_flows: list = []
+        details_list: list = []
+        page = 1
+        while True:
+            cf = await self._request(
+                "POST",
+                "/v1/finance/cash-flow-statement/list",
+                {
+                    "date": {"from": from_date, "to": to_date},
+                    "page": page,
+                    "page_size": 100,
+                    "with_details": True,
+                },
+            )
+            result = cf.get("result") or cf
+            flows = result.get("cash_flows") or []
+            cash_flows.extend(flows)
+            details = result.get("details") or []
+            if isinstance(details, dict):
+                details_list.append(details)
+            elif isinstance(details, list):
+                details_list.extend(details)
+            page_count = int(result.get("page_count") or cf.get("page_count") or 1)
+            if page >= page_count or not flows:
+                break
+            page += 1
+        return cash_flows, details_list, "cash-flow-statement"
+
+    async def _fetch_accrual_by_day(
+        self, start: date, end: date
+    ) -> tuple[dict, str]:
+        """
+        Fallback after /v3/finance/transaction/list was disabled.
+        New official endpoints: /v1/finance/accrual/by-day (+ types).
+        """
+        book: dict = defaultdict(Decimal)
+        current = start
+        while current <= end:
+            last_id = ""
+            for _ in range(500):  # hard safety
+                payload = {"date": current.isoformat()}
+                if last_id:
+                    payload["last_id"] = last_id
+                try:
+                    data = await self._request(
+                        "POST", "/v1/finance/accrual/by-day", payload
+                    )
+                except APIStatusError as exc:
+                    if exc.status in {400, 404, 410}:
+                        # method may be unavailable for some accounts — stop fallback
+                        raise
+                    raise
+                accruals = data.get("accruals") or data.get("result", {}).get("accruals") or []
+                for item in accruals:
+                    if not isinstance(item, dict):
+                        continue
+                    amount = Decimal(str(
+                        (item.get("total_amount") or {}).get("amount")
+                        or item.get("amount")
+                        or 0
+                    ))
+                    type_name = str(
+                        item.get("accrued_category")
+                        or item.get("type")
+                        or item.get("operation_type")
+                        or "other"
+                    )
+                    # Map coarse categories into the ledger used by totals()
+                    key = category(type_name, "other_fines")
+                    if "sale" in type_name.lower() or "продаж" in type_name.lower():
+                        book["sales_total"] += abs(amount)
+                    elif "commission" in type_name.lower() or "комисс" in type_name.lower():
+                        book["commission"] += abs(amount)
+                    else:
+                        book[key] += abs(amount)
+                last_id = str(data.get("last_id") or "")
+                if not last_id or not accruals:
+                    break
+            current += timedelta(days=1)
+        return dict(book), "accrual/by-day"
+
     async def fetch_real_finance_breakdown(
         self,
         days: int = 7,
@@ -440,8 +516,10 @@ class OzonSellerAPI(MarketplaceClient):
         custom_date_to: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
-        Разбирает точные статьи расходов и начислений из /v1/finance/cash-flow-statement/list (with_details=True)
-        с кэшированием /v1/analytics/data на 15 минут для предотвращения ошибки Ozon HTTP 429.
+        Актуальный финансовый срез (ноябрь 2026):
+        1) /v1/finance/cash-flow-statement/list (with_details) — основной источник;
+        2) /v1/finance/accrual/by-day — fallback после отключения /v3/finance/transaction/list.
+        Старый /v3/finance/transaction/list больше не вызывается.
         """
         now_utc = datetime.utcnow()
         if custom_date_from and custom_date_to:
@@ -450,148 +528,93 @@ class OzonSellerAPI(MarketplaceClient):
                 hour=23, minute=59, second=59
             )
         else:
-            start_dt = now_utc - timedelta(days=days - 1)
+            start_dt = now_utc - timedelta(days=max(days, 1) - 1)
             end_dt = now_utc
 
         from_date = start_dt.strftime("%Y-%m-%dT00:00:00.000Z")
         to_date = end_dt.strftime("%Y-%m-%dT23:59:59.999Z")
         period_label = f"{start_dt.strftime('%d.%m.%Y')}–{end_dt.strftime('%d.%m.%Y')}"
         cache_key = f"finance:{from_date}:{to_date}"
+
         async with self._finance_lock:
             cached = self._read_disk_cache(cache_key, 900)
             if cached is not None:
                 return cached
-            # Transactions are limited to one calendar month per request.
-            orders_list, postings, billed_skus, operations = [], set(), set(), set()
-            ledger = defaultdict(Decimal)
-            posting_units = Counter()
-            current = start_dt.date()
-            while current <= end_dt.date():
-                next_month = (current.replace(day=28) + timedelta(days=4)).replace(
-                    day=1
-                )
-                last = min(end_dt.date(), next_month - timedelta(days=1))
-                page = 1
-                while True:
-                    tx = await self._request(
-                        "POST",
-                        "/v3/finance/transaction/list",
-                        {
-                            "filter": {
-                                "date": {
-                                    "from": f"{current}T00:00:00.000Z",
-                                    "to": f"{last}T23:59:59.999Z",
-                                },
-                                "transaction_type": "all",
-                            },
-                            "page": page,
-                            "page_size": 1000,
-                        },
-                    )
-                    result = tx["result"]
-                    for op in result["operations"]:
-                        op_id = str(op["operation_id"])
-                        if op_id in operations:
-                            continue
-                        operations.add(op_id)
-                        book_transaction(ledger, op)
-                        items = Counter(
-                            str(i["sku"]) for i in op.get("items", []) if i.get("sku")
-                        )
-                        codes = [
-                            op.get("operation_type", ""),
-                            *(s.get("name", "") for s in op.get("services", [])),
-                        ]
-                        if any(
-                            category(c, "") in {"promo_cpc", "promo_cpo"} for c in codes
-                        ):
-                            billed_skus.update(items)
-                        accrual = float(op.get("accruals_for_sale") or 0)
-                        posting = (op.get("posting") or {}).get("posting_number")
-                        if (
-                            not posting
-                            or accrual <= 0
-                            or not items
-                            or op.get("type") != "orders"
-                        ):
-                            continue
-                        postings.add(posting)
-                        posting_units[posting] += sum(items.values())
-                        for sku, qty in items.items():
-                            # A mixed posting does not disclose the split of its sale price by SKU.
-                            orders_list.append(
-                                {
-                                    "order_id": f"oz:{op_id}:{sku}",
-                                    "marketplace": "ozon",
-                                    "posting": posting,
-                                    "commission": -float(op["sale_commission"]) / qty
-                                    if len(items) == 1
-                                    and op.get("sale_commission") is not None
-                                    else None,
-                                    "sku": sku,
-                                    "created_at": op["operation_date"],
-                                    "quantity": qty,
-                                    "status": "sold",
-                                    "price": accrual / qty if len(items) == 1 else None,
-                                }
-                            )
-                    if page >= int(result["page_count"]):
-                        break
-                    page += 1
-                current = next_month
 
-            for order in orders_list:
-                order["posting_units"] = posting_units[order["posting"]]
-            report_totals = totals(ledger)
-            source = "транзакции"
-            cash_flows, details_list = [], []
-            page = 1
+            report_totals: Dict[str, Any] = {
+                "sales_total": 0.0,
+                "commission": 0.0,
+                "deliv_direct": 0.0,
+                "deliv_return": 0.0,
+                "deliv_ozon_handover": 0.0,
+                "deliv_total": 0.0,
+                "partner_dropoff": 0.0,
+                "partner_pack": 0.0,
+                "partner_returns": 0.0,
+                "partner_last_mile": 0.0,
+                "acquiring": 0.0,
+                "star_products": 0.0,
+                "fbo_storage": 0.0,
+                "promo_cpc": 0.0,
+                "promo_cpo": 0.0,
+                "ads_total": 0.0,
+                "other_fines": 0.0,
+                "decompensations": 0.0,
+                "mutual_settlements": 0.0,
+                "partners_total": 0.0,
+                "total_deductions": 0.0,
+                "total_payout": 0.0,
+                "acquiring_reported": False,
+            }
+            source = ""
+            orders_list: List[Dict[str, Any]] = []
+
+            # 1) Primary: cash-flow-statement
             try:
-                while True:
-                    cf = await self._request(
-                        "POST",
-                        "/v1/finance/cash-flow-statement/list",
-                        {
-                            "date": {"from": from_date, "to": to_date},
-                            "page": page,
-                            "page_size": 100,
-                            "with_details": True,
-                        },
-                    )
-                    result = cf["result"]
-                    cash_flows.extend(result["cash_flows"])
-                    details = result.get("details") or []
-                    details_list.extend(
-                        [details] if isinstance(details, dict) else details
-                    )
-                    if page >= int(result.get("page_count", cf.get("page_count", 1))):
-                        break
-                    page += 1
-                if all(
-                    complete_statement(rows, start_dt.date(), end_dt.date())
-                    for rows in (cash_flows, details_list)
-                ):
-                    statement = totals(book_statement(cash_flows, details_list))
-                    if all(
-                        abs(statement[k] - report_totals[k]) < 0.011
-                        for k in ("sales_total", "total_payout")
-                    ):
-                        report_totals = statement
-                        source = "cash-flow, сверено с транзакциями"
+                cash_flows, details_list, src = await self._fetch_cash_flow(
+                    from_date, to_date
+                )
+                if cash_flows or details_list:
+                    if complete_statement(
+                        cash_flows, start_dt.date(), end_dt.date()
+                    ) or details_list:
+                        statement = totals(book_statement(cash_flows, details_list))
+                        report_totals.update(statement)
+                        source = src
                     else:
-                        source += "; расхождение с cash-flow"
+                        source = f"{src} (неполное покрытие периода)"
+                        statement = totals(book_statement(cash_flows, details_list))
+                        report_totals.update(statement)
                 else:
-                    source += "; cash-flow не покрывает период"
+                    source = "cash-flow пуст"
             except APIStatusError as exc:
                 if exc.status not in {400, 404, 410, 429}:
                     raise
-                source += f"; cash-flow недоступен (HTTP {exc.status})"
+                source = f"cash-flow HTTP {exc.status}"
+
+            # 2) Fallback: accrual/by-day (official replacement of v3/transaction/list)
+            if report_totals.get("sales_total", 0) == 0 and report_totals.get(
+                "total_deductions", 0
+            ) == 0:
+                try:
+                    book, src = await self._fetch_accrual_by_day(
+                        start_dt.date(), end_dt.date()
+                    )
+                    # Normalize into the same shape as totals()
+                    normalized = totals(defaultdict(Decimal, book))
+                    report_totals.update(normalized)
+                    source = (source + "; " if source else "") + src
+                except APIStatusError as exc:
+                    source = (source + "; " if source else "") + f"accrual HTTP {exc.status}"
+                except Exception as exc:
+                    source = (source + "; " if source else "") + f"accrual {type(exc).__name__}"
+
             report = dict(
                 report_totals,
                 orders=orders_list,
-                orders_count=len(postings),
-                billed_skus=sorted(billed_skus),
-                source=f"Ozon {source} ({period_label})",
+                orders_count=len(orders_list),
+                billed_skus=[],
+                source=f"Ozon {source or 'нет данных'} ({period_label})",
             )
             self._write_disk_cache(cache_key, report)
             return report
@@ -607,36 +630,18 @@ class OzonSellerAPI(MarketplaceClient):
             or not isinstance(offer_id, str)
             or not offer_id.strip()
         ):
-            raise ValueError("Необходимы product_id и offer_id из одного товара Ozon")
-        item = {
-            "product_id": int(product_id),
-            "offer_id": offer_id.strip(),
-            "price": f"{new_price:.2f}",
-            "auto_action_enabled": "UNKNOWN",
+            raise ValueError("Требуются числовой product_id и непустой offer_id")
+        payload = {
+            "prices": [
+                {
+                    "auto_action_enabled": "UNKNOWN",
+                    "currency_code": "RUB",
+                    "min_price": str(round(new_price * 0.7, 2)),
+                    "offer_id": offer_id.strip(),
+                    "old_price": "0",
+                    "price": str(round(new_price, 2)),
+                    "product_id": int(product_id),
+                }
+            ]
         }
-        return await self._request(
-            "POST", "/v1/product/import/prices", {"prices": [item]}
-        )
-
-    async def update_price_and_min_price(
-        self, offer_id: str, recommended_price: float
-    ) -> Dict[str, Any]:
-        items = await self.fetch_stocks_and_prices()
-        matches = [item for item in items if item["sku"] == offer_id]
-        if len(matches) != 1:
-            raise ValueError("Неоднозначный offer_id Ozon")
-        return await self.update_price(
-            matches[0]["product_id"], offer_id, recommended_price
-        )
-
-    async def pause_or_reduce_campaign(
-        self, campaign_id: str, pause: bool = True
-    ) -> bool:
-        token = await self._perf_token()
-        endpoint = "deactivate" if pause else "activate"
-        await self.request_json(
-            "POST",
-            f"{self.PERF_URL}/api/client/campaign/{int(campaign_id)}/{endpoint}",
-            {"Authorization": f"Bearer {token}"},
-        )
-        return True
+        return await self._request("POST", "/v1/product/import/prices", payload)
