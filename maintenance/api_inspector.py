@@ -1,9 +1,11 @@
+import html
 import time
 from datetime import datetime
+
+from services.common.ai_advisory_board import check_gemini_api_health
+from services.common.buyer_questions import call_fast_gemini
 from services.ozon.seller_api import OzonSellerAPI
 from services.wb.statistics_api import WBStatisticsAPI
-from services.common.buyer_questions import call_fast_gemini
-from services.common.ai_advisory_board import check_gemini_api_health
 
 
 async def run_monthly_api_audit() -> str:
@@ -17,7 +19,7 @@ async def run_monthly_api_audit() -> str:
         oz_ms = int((time.perf_counter() - t0) * 1000)
         oz_status = f"🟢 <b>OK</b> ({oz_ms} мс) — получено {len(oz_items)} SKU"
     except Exception as exc:
-        oz_status = f"🔴 <b>СБОЙ:</b> <code>{str(exc)[:120]}</code>"
+        oz_status = f"🔴 <b>СБОЙ:</b> <code>{html.escape(str(exc)[:120])}</code>"
 
     # 2. WB
     t1 = time.perf_counter()
@@ -25,28 +27,35 @@ async def run_monthly_api_audit() -> str:
         wb_items = await wb.fetch_stocks_and_prices()
         wb_tariffs = await wb.fetch_wb_tariffs()
         wb_ms = int((time.perf_counter() - t1) * 1000)
+        comm_pct = float((wb_tariffs or {}).get("commission_rate", 0.0)) * 100.0
+        log_rub = float((wb_tariffs or {}).get("logistics_rub", 0.0))
         wb_status = (
             f"🟢 <b>OK</b> ({wb_ms} мс) — получено {len(wb_items)} SKU, "
-            f"комиссия {wb_tariffs['commission_rate']*100:.1f}%, логистика {wb_tariffs['logistics_rub']:.0f} ₽"
+            f"комиссия {comm_pct:.1f}%, логистика {log_rub:.0f} ₽"
         )
     except Exception as exc:
-        wb_status = f"🔴 <b>СБОЙ:</b> <code>{str(exc)[:120]}</code>"
+        wb_status = f"🔴 <b>СБОЙ:</b> <code>{html.escape(str(exc)[:120])}</code>"
 
     # 3. Старшая модель (Совет ИИ)
     ai_health = await check_gemini_api_health()
-    if ai_health["ok"]:
-        ai_main_status = f"🟢 <b>OK</b> ({ai_health['latency_ms']} мс, <code>{ai_health['model']}</code>)"
+    if ai_health.get("ok"):
+        model_escaped = html.escape(str(ai_health.get("model") or "gemini"))
+        ai_main_status = f"🟢 <b>OK</b> ({ai_health.get('latency_ms', 0)} мс, <code>{model_escaped}</code>)"
     else:
-        ai_main_status = f"🔴 <b>СБОЙ:</b> <code>{ai_health['detail'][:100]}</code>"
+        detail_escaped = html.escape(str(ai_health.get("detail") or "Неизвестная ошибка")[:100])
+        ai_main_status = f"🔴 <b>СБОЙ:</b> <code>{detail_escaped}</code>"
 
     # 4. Легковесная модель (Отзывы и Вопросы)
     t2 = time.perf_counter()
     try:
-        fast_resp = await call_fast_gemini("Тест связи: ответь одним словом ОК")
+        fast_resp = await call_fast_gemini("Тест связи: ответь одним словом ОК", raise_on_error=True)
         fast_ms = int((time.perf_counter() - t2) * 1000)
-        ai_fast_status = f"🟢 <b>OK</b> ({fast_ms} мс) — эконом-модель активна"
+        if fast_resp.strip():
+            ai_fast_status = f"🟢 <b>OK</b> ({fast_ms} мс) — эконом-модель активна"
+        else:
+            ai_fast_status = "🔴 <b>СБОЙ:</b> <code>Пустой ответ модели</code>"
     except Exception as exc:
-        ai_fast_status = f"🔴 <b>СБОЙ:</b> <code>{str(exc)[:100]}</code>"
+        ai_fast_status = f"🔴 <b>СБОЙ:</b> <code>{html.escape(str(exc)[:100])}</code>"
 
     now_str = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
     return (

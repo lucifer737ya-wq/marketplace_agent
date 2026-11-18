@@ -3,9 +3,9 @@ import re
 import json
 import time
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
-from config import BASE_DIR, LOGS_DIR  # noqa: F401
+from config import BASE_DIR, LOGS_DIR, settings  # noqa: F401
 
 # =============================================================================
 # Константы и калиброванные координаты (viewport 1440x900)
@@ -53,30 +53,135 @@ DIRECT_BROWSER_ARGS = [
 
 MIN_TARGET_DATE = datetime(2026, 11, 13, 0, 0, 0)
 
-def _is_date_from_nov_13_2026(text: str) -> bool:
+_RU_MONTH_PREFIXES: Tuple[Tuple[str, int], ...] = (
+    ("янв", 1),
+    ("фев", 2),
+    ("мар", 3),
+    ("апр", 4),
+    ("мая", 5),
+    ("май", 5),
+    ("июн", 6),
+    ("июл", 7),
+    ("авг", 8),
+    ("сен", 9),
+    ("окт", 10),
+    ("ноя", 11),
+    ("дек", 12),
+)
+
+
+def _get_min_target_date() -> datetime:
+    raw = str(getattr(settings, "OZON_REVIEWS_MIN_DATE", "") or "").strip()
+    if raw:
+        try:
+            return datetime.strptime(raw, "%d.%m.%Y")
+        except ValueError:
+            pass
+    return MIN_TARGET_DATE
+
+
+def _resolve_short_year(month: int, day: int, now_dt: datetime) -> int:
+    try:
+        cand = datetime(now_dt.year, month, day)
+        if cand > now_dt + timedelta(days=1):
+            return now_dt.year - 1
+        return now_dt.year
+    except ValueError:
+        return now_dt.year
+
+
+def _is_date_from_nov_13_2026(text: str, *, require_date: bool = False) -> bool:
     """
     Проверяет дату отзыва или вопроса в строке/шторке.
     Берет в работу все записи начиная с 13.11.2026 (включая сегодняшние).
     """
-    # Формат ДД.ММ.ГГГГ
-    m_full = re.search(r"\b(\d{2})\.(\d{2})\.(20\d{2})\b", text)
-    if m_full:
+    min_date = _get_min_target_date()
+    src = (text or "").strip()
+    if not src:
+        return not require_date
+
+    now_dt = datetime.now()
+
+    # 1. Формат ДД.ММ.ГГГГ
+    for m_full in re.finditer(r"\b(\d{1,2})\.(\d{1,2})\.(20\d{2})\b", src):
         d, mo, y = int(m_full.group(1)), int(m_full.group(2)), int(m_full.group(3))
         try:
-            return datetime(y, mo, d) >= MIN_TARGET_DATE
-        except Exception:
-            return True
+            return datetime(y, mo, d) >= min_date
+        except ValueError:
+            continue
 
-    # Формат таблицы Ozon ДД.ММ ЧЧ:ММ
-    m_short = re.search(r"\b(\d{2})\.(\d{2})\s+\d{2}:\d{2}\b", text)
-    if m_short:
-        d, mo = int(m_short.group(1)), int(m_short.group(2))
+    # 2. ISO формат ГГГГ-ММ-ДД
+    for m_iso in re.finditer(r"\b(20\d{2})-(\d{1,2})-(\d{1,2})\b", src):
+        y, mo, d = int(m_iso.group(1)), int(m_iso.group(2)), int(m_iso.group(3))
         try:
-            return datetime(2026, mo, d) >= MIN_TARGET_DATE
-        except Exception:
-            return True
+            return datetime(y, mo, d) >= min_date
+        except ValueError:
+            continue
 
-    return True
+    # 3. Короткий год ДД.ММ.ГГ
+    for m_yy in re.finditer(r"\b(\d{1,2})\.(\d{1,2})\.(\d{2})\b", src):
+        d, mo, y = int(m_yy.group(1)), int(m_yy.group(2)), 2000 + int(m_yy.group(3))
+        try:
+            return datetime(y, mo, d) >= min_date
+        except ValueError:
+            continue
+
+    # 4. Русские названия месяцев ("13 ноября 2026", "12 нояб.", "12 нояб 2026")
+    ru_pattern = (
+        r"\b(\d{1,2})\s+"
+        r"(янв(?:ар[яь])?|фев(?:р(?:ал[яь])?)?|мар(?:та?)?|апр(?:ел[яь])?|ма[йя]|"
+        r"июн[яь]?|июл[яь]?|авг(?:уст[а]?)?|сен(?:т(?:ябр[яь])?)?|окт(?:ябр[яь])?|"
+        r"ноя(?:б(?:р[яь])?)?|дек(?:абр[яь])?)\.?(?:\s+(20\d{2}))?\b"
+    )
+    for m_ru in re.finditer(ru_pattern, src, re.IGNORECASE):
+        d = int(m_ru.group(1))
+        mon_word = m_ru.group(2).lower()
+        mo = next((m_num for pref, m_num in _RU_MONTH_PREFIXES if mon_word.startswith(pref)), 0)
+        if mo:
+            y = int(m_ru.group(3)) if m_ru.group(3) else _resolve_short_year(mo, d, now_dt)
+            try:
+                return datetime(y, mo, d) >= min_date
+            except ValueError:
+                continue
+
+    # 5. Формат таблицы Ozon ДД.ММ ЧЧ:ММ
+    for m_short in re.finditer(r"\b(\d{1,2})\.(\d{1,2})\s+\d{2}:\d{2}\b", src):
+        d, mo = int(m_short.group(1)), int(m_short.group(2))
+        y = _resolve_short_year(mo, d, now_dt)
+        try:
+            return datetime(y, mo, d) >= min_date
+        except ValueError:
+            continue
+
+    # 6. Относительные обозначения даты
+    low = src.lower()
+    today_dt = now_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+    if re.search(r"\bсегодня\b|\bтолько что\b|\bминут[уы]?\s+назад\b|\bчас(?:а|ов)?\s+назад\b", low):
+        return today_dt >= min_date
+    if re.search(r"\bвчера\b", low):
+        return (today_dt - timedelta(days=1)) >= min_date
+
+    return not require_date
+
+
+async def _close_browser_context_safe(context: Any, timeout: float = 15.0) -> None:
+    """Гарантированно закрывает страницы и persistent-контекст Playwright без зависаний."""
+    if context is None:
+        return
+    try:
+        pages = list(getattr(context, "pages", []) or [])
+        for pg in pages:
+            try:
+                if hasattr(pg, "is_closed") and not pg.is_closed():
+                    await asyncio.wait_for(pg.close(), timeout=min(5.0, timeout))
+            except Exception:
+                pass
+    except Exception:
+        pass
+    try:
+        await asyncio.wait_for(context.close(), timeout=timeout)
+    except Exception:
+        pass
 
 REVIEW_SUBTABS = [("Новые", ["Новые", "Новое"]), ("Просмотренные", ["Просмотренные", "Просмотрено"])]
 QUESTION_SUBTABS = [("Новые", ["Новые", "Новое"]), ("Просмотренные", ["Просмотренные", "Просмотрено"])]
@@ -676,23 +781,21 @@ async def run_interactive_login() -> None:
     from playwright.async_api import async_playwright
     print("\n[Ozon Browser] Запуск браузера без VPN для авторизации...")
     async with async_playwright() as p:
-        context = await p.chromium.launch_persistent_context(
-            user_data_dir=str(BROWSER_DATA_DIR),
-            headless=False,
-            args=DIRECT_BROWSER_ARGS + ["--start-maximized"],
-            env=_get_direct_env(),
-            viewport=None,
-        )
+        context = None
         try:
+            context = await p.chromium.launch_persistent_context(
+                user_data_dir=str(BROWSER_DATA_DIR),
+                headless=False,
+                args=DIRECT_BROWSER_ARGS + ["--start-maximized"],
+                env=_get_direct_env(),
+                viewport=None,
+            )
             page = context.pages[0] if context.pages else await context.new_page()
             await page.goto(REVIEWS_URL, wait_until="domcontentloaded", timeout=60000)
             while len(context.pages) > 0:
                 await asyncio.sleep(1)
         finally:
-            try:
-                await context.close()
-            except Exception:
-                pass
+            await _close_browser_context_safe(context)
 
 
 # =============================================================================
@@ -717,14 +820,15 @@ async def auto_reply_unanswered_reviews(
     print("[Ozon Reviews] Запуск браузерного модуля...")
     try:
         async with async_playwright() as p:
-            context = await p.chromium.launch_persistent_context(
-                user_data_dir=str(BROWSER_DATA_DIR),
-                headless=headless,
-                args=DIRECT_BROWSER_ARGS,
-                env=_get_direct_env(),
-                viewport=VIEWPORT,
-            )
+            context = None
             try:
+                context = await p.chromium.launch_persistent_context(
+                    user_data_dir=str(BROWSER_DATA_DIR),
+                    headless=headless,
+                    args=DIRECT_BROWSER_ARGS,
+                    env=_get_direct_env(),
+                    viewport=VIEWPORT,
+                )
                 page = context.pages[0] if context.pages else await context.new_page()
                 await page.goto(REVIEWS_URL, wait_until="domcontentloaded", timeout=60000)
                 await asyncio.sleep(3.5)
@@ -776,6 +880,11 @@ async def auto_reply_unanswered_reviews(
                             processed_row_keys.add(row_key)
                             new_rows_in_pass += 1
 
+                            # Фильтр дат >= 13.11.2026 по строке таблицы до открытия шторки
+                            if not _is_date_from_nov_13_2026(row_text, require_date=False):
+                                print(f"[Ozon Reviews] Пропуск отзыва до {_get_min_target_date().strftime('%d.%m.%Y')}: «{row_text[:60]}...»")
+                                continue
+
                             cells = row.locator("td")
                             cell_count = await cells.count()
                             if cell_count >= 8:
@@ -815,6 +924,12 @@ async def auto_reply_unanswered_reviews(
                                 }
                                 return document.body.innerText;
                             }""")
+
+                            # Повторная строгая проверка даты >= 13.11.2026 по открытой шторке и строке
+                            if not _is_date_from_nov_13_2026(f"{row_text}\n{drawer_text}", require_date=True):
+                                print(f"[Ozon Reviews] Пропуск отзыва (дата < {_get_min_target_date().strftime('%d.%m.%Y')} или не распознана)")
+                                await _close_review_drawer(page)
+                                continue
 
                             # Считывание артикула, оценки и текста отзыва
                             raw_sku_point = await _read_text_at_point(page, REV_SKU_PT[0], REV_SKU_PT[1])
@@ -902,10 +1017,7 @@ async def auto_reply_unanswered_reviews(
                 except Exception:
                     pass
             finally:
-                try:
-                    await context.close()
-                except Exception:
-                    pass
+                await _close_browser_context_safe(context)
 
             return {
                 "status": "success",
@@ -940,14 +1052,15 @@ async def auto_reply_unanswered_questions(
     print("[Ozon Questions] Запуск браузерного модуля...")
     try:
         async with async_playwright() as p:
-            context = await p.chromium.launch_persistent_context(
-                user_data_dir=str(BROWSER_DATA_DIR),
-                headless=headless,
-                args=DIRECT_BROWSER_ARGS,
-                env=_get_direct_env(),
-                viewport=VIEWPORT,
-            )
+            context = None
             try:
+                context = await p.chromium.launch_persistent_context(
+                    user_data_dir=str(BROWSER_DATA_DIR),
+                    headless=headless,
+                    args=DIRECT_BROWSER_ARGS,
+                    env=_get_direct_env(),
+                    viewport=VIEWPORT,
+                )
                 page = context.pages[0] if context.pages else await context.new_page()
 
                 print("[Ozon Questions] Открытие раздела вопросов...")
@@ -1112,10 +1225,7 @@ async def auto_reply_unanswered_questions(
                 except Exception:
                     pass
             finally:
-                try:
-                    await context.close()
-                except Exception:
-                    pass
+                await _close_browser_context_safe(context)
 
             return {
                 "status": "success",
