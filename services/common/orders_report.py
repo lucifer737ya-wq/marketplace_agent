@@ -1,10 +1,345 @@
 import asyncio
-from typing import Dict, Any, List, Optional
+import html
+import math
+from datetime import datetime
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from typing import Any, Dict, List, Optional, Set, Tuple
+
 from sqlalchemy import select
-from database.models import AsyncSessionLocal, OrderRecord, Product
+from sqlalchemy.exc import IntegrityError
+
+from config import settings
+from database.crud import _db_write_lock
+from database.models import OrderRecord, Product, get_db_session, utcnow_naive
+from products_catalog import OZON_SKU_TO_ART, WB_SKU_TO_ART
 from services.ozon.seller_api import OzonSellerAPI
 from services.wb.statistics_api import WBStatisticsAPI
-from products_catalog import PRODUCTS_CATALOG
+
+CANCELLED_ORDER_STATUSES: Set[str] = {
+    "cancelled",
+    "canceled",
+    "returned",
+    "return",
+    "отменен",
+    "отменён",
+    "возврат",
+}
+
+_SQLITE_IN_CHUNK_SIZE = 500
+_CENT = Decimal("0.01")
+_TENTH = Decimal("0.1")
+
+
+def _to_dec(value: Any, default: Decimal = Decimal("0")) -> Decimal:
+    if value is None or isinstance(value, bool):
+        return default
+    if isinstance(value, Decimal):
+        return value if value.is_finite() else default
+    if isinstance(value, int):
+        return Decimal(value)
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            return default
+        return Decimal(str(value))
+    if isinstance(value, str):
+        cleaned = value.strip().replace("\u00a0", "").replace(" ", "").replace(",", ".")
+        if not cleaned:
+            return default
+        try:
+            parsed = Decimal(cleaned)
+            return parsed if parsed.is_finite() else default
+        except InvalidOperation:
+            return default
+    return default
+
+
+def _round_rub(value: Any) -> float:
+    return float(_to_dec(value).quantize(_CENT, rounding=ROUND_HALF_UP))
+
+
+def _mul_rub(amount: Any, rate: Any) -> float:
+    return float((_to_dec(amount) * _to_dec(rate)).quantize(_CENT, rounding=ROUND_HALF_UP))
+
+
+def _div_rub(numerator: Any, denominator: Any, default: float = 0.0) -> float:
+    den = _to_dec(denominator)
+    if den <= Decimal("0"):
+        return default
+    return float((_to_dec(numerator) / den).quantize(_CENT, rounding=ROUND_HALF_UP))
+
+
+def _round_pct(numerator: Any, denominator: Any, default: float = 0.0) -> float:
+    den = _to_dec(denominator)
+    if den <= Decimal("0"):
+        return default
+    return float(((_to_dec(numerator) / den) * Decimal("100")).quantize(_TENTH, rounding=ROUND_HALF_UP))
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    if value is None or isinstance(value, bool):
+        return default
+    if isinstance(value, str):
+        cleaned = value.strip().replace("\u00a0", "").replace(" ", "").replace(",", ".")
+        if not cleaned:
+            return default
+        value = cleaned
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if math.isfinite(parsed) else default
+
+
+def _safe_nonneg(value: Any, default: float = 0.0) -> float:
+    return max(_safe_float(value, default), 0.0)
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    if value is None or isinstance(value, bool):
+        return default
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(parsed):
+        return default
+    return int(parsed)
+
+
+def _parse_order_datetime(value: Any) -> datetime:
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=None) if value.tzinfo is not None else value
+    if isinstance(value, str):
+        raw = value.strip().replace("Z", "+00:00")
+        if raw:
+            try:
+                dt = datetime.fromisoformat(raw)
+                return dt.replace(tzinfo=None) if dt.tzinfo is not None else dt
+            except ValueError:
+                pass
+    return utcnow_naive()
+
+
+def _resolve_order_sku(raw_sku: Any, marketplace: str) -> str:
+    clean = str(raw_sku or "").strip()
+    if not clean:
+        return ""
+    mp = str(marketplace or "").strip().lower()
+    if mp == "ozon":
+        return OZON_SKU_TO_ART.get(clean, clean)
+    if mp == "wb":
+        return WB_SKU_TO_ART.get(clean, clean)
+    return clean
+
+
+def _pct(value: float, base: float) -> str:
+    if not (math.isfinite(value) and math.isfinite(base)) or base <= 0.0:
+        return "0.0%"
+    return f"{_round_pct(value, base):.1f}%"
+
+
+def _fmt_money(value: float) -> str:
+    if not math.isfinite(value) or abs(value) < 0.005:
+        return "0"
+    if abs(value - round(value)) >= 0.005:
+        return f"{value:,.2f}"
+    return f"{value:,.0f}"
+
+
+def _fmt_expense(value: float) -> str:
+    amt = max(_safe_float(value, 0.0), 0.0)
+    if amt < 0.005:
+        return "0 ₽"
+    return f"-{_fmt_money(amt)} ₽"
+
+
+def _index_products_by_marketplace(
+    all_prods: List[Product],
+) -> Tuple[Dict[Tuple[str, str], Product], Dict[Tuple[str, str], Product]]:
+    by_mp_sku: Dict[Tuple[str, str], Product] = {}
+    by_mp_ext: Dict[Tuple[str, str], Product] = {}
+    for prod in all_prods:
+        mp = str(prod.marketplace or "").strip().lower()
+        sku = str(prod.sku or "").strip()
+        ext = str(prod.external_id or "").strip()
+        if mp and sku:
+            by_mp_sku[(mp, sku)] = prod
+        if mp and ext and (mp, ext) not in by_mp_ext:
+            by_mp_ext[(mp, ext)] = prod
+    return by_mp_sku, by_mp_ext
+
+
+def _lookup_product_for_order(
+    marketplace: str,
+    raw_sku: str,
+    by_mp_sku: Dict[Tuple[str, str], Product],
+    by_mp_ext: Dict[Tuple[str, str], Product],
+) -> Optional[Product]:
+    mp = str(marketplace or "").strip().lower()
+    clean_raw = str(raw_sku or "").strip()
+    resolved = _resolve_order_sku(clean_raw, mp)
+    return (
+        by_mp_sku.get((mp, resolved))
+        or by_mp_sku.get((mp, clean_raw))
+        or by_mp_ext.get((mp, clean_raw))
+        or by_mp_ext.get((mp, resolved))
+    )
+
+
+def _calculate_marketplace_cogs(
+    orders_list: Any,
+    marketplace: str,
+    by_mp_sku: Dict[Tuple[str, str], Product],
+    by_mp_ext: Dict[Tuple[str, str], Product],
+) -> Tuple[float, int, List[str]]:
+    """
+    Рассчитывает подтвержденную себестоимость (сырье + упаковка + первая миля) строго в разрезе
+    конкретного маркетплейса, без подстановки вымышленных значений и без учета отмененных заказов.
+    Возвращает: (total_cogs_rub, missing_cogs_units, sorted_missing_skus).
+    """
+    if not isinstance(orders_list, list):
+        return 0.0, 0, []
+
+    mp = str(marketplace or "").strip().lower()
+    total_cogs = Decimal("0")
+    missing_units = 0
+    missing_skus: Set[str] = set()
+    seen_order_ids: Set[str] = set()
+
+    for order in orders_list:
+        if not isinstance(order, dict):
+            continue
+        order_id = str(order.get("order_id") or "").strip()
+        if order_id:
+            if order_id in seen_order_ids:
+                continue
+            seen_order_ids.add(order_id)
+
+        status = str(order.get("status") or "ordered").strip().lower()
+        if status in CANCELLED_ORDER_STATUSES:
+            continue
+
+        qty = max(_safe_int(order.get("quantity"), 1), 1)
+        raw_sku = str(order.get("sku") or "").strip()
+        art = _resolve_order_sku(raw_sku, mp)
+        prod = _lookup_product_for_order(mp, raw_sku, by_mp_sku, by_mp_ext)
+
+        if prod is not None and _safe_nonneg(prod.cost_price) > 0.0:
+            unit_cogs = (
+                _to_dec(_safe_nonneg(prod.cost_price))
+                + _to_dec(_safe_nonneg(prod.packaging_cost))
+                + _to_dec(_safe_nonneg(prod.first_mile_unit_cost))
+            )
+            total_cogs += unit_cogs * Decimal(qty)
+        else:
+            missing_units += qty
+            if art or raw_sku:
+                missing_skus.add(art or raw_sku)
+
+    return _round_rub(total_cogs), missing_units, sorted(missing_skus)
+
+
+def _count_active_orders(orders_list: Any) -> int:
+    if not isinstance(orders_list, list):
+        return 0
+    count = 0
+    seen_order_ids: Set[str] = set()
+    for order in orders_list:
+        if not isinstance(order, dict):
+            continue
+        order_id = str(order.get("order_id") or "").strip()
+        if order_id:
+            if order_id in seen_order_ids:
+                continue
+            seen_order_ids.add(order_id)
+        status = str(order.get("status") or "ordered").strip().lower()
+        if status in CANCELLED_ORDER_STATUSES:
+            continue
+        count += max(_safe_int(order.get("quantity"), 1), 1)
+    return count
+
+
+def _prepare_clean_orders(ozon_fin: Any, wb_fin: Any) -> List[Dict[str, Any]]:
+    deduped: Dict[str, Dict[str, Any]] = {}
+    sources: List[Tuple[str, Any]] = [("ozon", ozon_fin), ("wb", wb_fin)]
+
+    for default_mp, payload in sources:
+        if not isinstance(payload, dict):
+            continue
+        orders = payload.get("orders")
+        if not isinstance(orders, list):
+            continue
+        for ord_data in orders:
+            if not isinstance(ord_data, dict):
+                continue
+            order_id = str(ord_data.get("order_id") or "").strip()
+            if not order_id or order_id in deduped:
+                continue
+            mp = str(ord_data.get("marketplace") or default_mp).strip().lower()
+            if mp not in {"ozon", "wb"}:
+                mp = default_mp
+            raw_sku = str(ord_data.get("sku") or "").strip()
+            deduped[order_id] = {
+                "order_id": order_id[:128],
+                "marketplace": mp,
+                "sku": _resolve_order_sku(raw_sku, mp)[:64],
+                "created_at": _parse_order_datetime(ord_data.get("created_at")),
+                "price": round(_safe_nonneg(ord_data.get("price")), 2),
+                "commission": round(_safe_nonneg(ord_data.get("commission")), 2),
+                "logistics": round(_safe_nonneg(ord_data.get("logistics")), 2),
+                "status": str(ord_data.get("status") or "ordered").strip()[:64],
+            }
+    return list(deduped.values())
+
+
+async def _load_products_and_persist_orders(
+    clean_orders: List[Dict[str, Any]],
+) -> List[Product]:
+    async with _db_write_lock:
+        async with get_db_session() as session:
+            prods_res = await session.execute(select(Product))
+            all_prods = list(prods_res.scalars().all())
+
+            if clean_orders:
+                all_ids = [item["order_id"] for item in clean_orders]
+                existing_ids: Set[str] = set()
+                for offset in range(0, len(all_ids), _SQLITE_IN_CHUNK_SIZE):
+                    chunk = all_ids[offset : offset + _SQLITE_IN_CHUNK_SIZE]
+                    res = await session.execute(
+                        select(OrderRecord.order_id).where(OrderRecord.order_id.in_(chunk))
+                    )
+                    existing_ids.update(row[0] for row in res.fetchall())
+
+                pending_rows = [item for item in clean_orders if item["order_id"] not in existing_ids]
+                if pending_rows:
+                    for item in pending_rows:
+                        session.add(OrderRecord(**item))
+                    try:
+                        await session.commit()
+                    except IntegrityError:
+                        await session.rollback()
+                        for item in pending_rows:
+                            try:
+                                async with session.begin_nested():
+                                    session.add(OrderRecord(**item))
+                            except IntegrityError:
+                                continue
+                        await session.commit()
+
+            return all_prods
+
+
+def _format_missing_cogs_note(missing_units: int, missing_skus: List[str]) -> str:
+    if missing_units <= 0:
+        return ""
+    sample = ", ".join(html.escape(s) for s in missing_skus[:8])
+    if len(missing_skus) > 8:
+        sample += f" и ещё {len(missing_skus) - 8}"
+    sku_part = f" (арт.: <code>{sample}</code>)" if sample else ""
+    return (
+        f"⚠️ <i>Не задана себестоимость для <b>{missing_units} шт.</b>{sku_part} — "
+        f"чистая прибыль не учитывает их закупочную стоимость.</i>\n"
+    )
 
 
 async def sync_and_generate_orders_report(
@@ -15,202 +350,360 @@ async def sync_and_generate_orders_report(
     custom_date_to: Optional[str] = None,
     report_title: str = "📊 Точный финансовый отчет (Данные ЛК Ozon и WB)",
 ) -> str:
+    safe_days = max(_safe_int(days, 7), 1)
+    tax_rate = _safe_nonneg(getattr(settings, "TAX_RATE", 0.06), 0.06)
+    acq_rate = _safe_nonneg(getattr(settings, "ACQUIRING_RATE", 0.015), 0.015)
+    tax_pct_label = f"{tax_rate * 100.0:.0f}%" if abs(tax_rate * 100.0 - round(tax_rate * 100.0)) < 0.05 else f"{tax_rate * 100.0:.1f}%"
+    acq_pct_label = f"{acq_rate * 100.0:.1f}%"
+
     ozon_fin, wb_fin = await asyncio.gather(
         ozon_service.fetch_real_finance_breakdown(
-            days=days, custom_date_from=custom_date_from, custom_date_to=custom_date_to
+            days=safe_days, custom_date_from=custom_date_from, custom_date_to=custom_date_to
         ),
         wb_service.fetch_real_finance_breakdown(
-            days=days, custom_date_from=custom_date_from, custom_date_to=custom_date_to
+            days=safe_days, custom_date_from=custom_date_from, custom_date_to=custom_date_to
         ),
         return_exceptions=True,
     )
 
-    ext_to_art: Dict[str, str] = {}
-    for art_key, meta in PRODUCTS_CATALOG.items():
-        if meta.get("ozon_sku"):
-            ext_to_art[str(meta["ozon_sku"])] = art_key
-        if meta.get("wb_sku"):
-            ext_to_art[str(meta["wb_sku"])] = art_key
+    clean_orders = _prepare_clean_orders(ozon_fin, wb_fin)
+    all_prods = await _load_products_and_persist_orders(clean_orders)
+    by_mp_sku, by_mp_ext = _index_products_by_marketplace(all_prods)
 
-    async with AsyncSessionLocal() as session:
-        prods_res = await session.execute(select(Product))
-        all_prods = prods_res.scalars().all()
-        products_by_sku: Dict[str, Product] = {p.sku: p for p in all_prods}
-        for p in all_prods:
-            if p.external_id:
-                products_by_sku[p.external_id] = p
-
-        all_new_orders = []
-        if isinstance(ozon_fin, dict):
-            all_new_orders.extend(ozon_fin.get("orders", []))
-        if isinstance(wb_fin, dict):
-            all_new_orders.extend(wb_fin.get("orders", []))
-
-        for ord_data in all_new_orders:
-            if not ord_data.get("order_id"):
-                continue
-            raw_sku = str(ord_data.get("sku", ""))
-            clean_order = {
-                "order_id": ord_data["order_id"],
-                "marketplace": ord_data["marketplace"],
-                "sku": ext_to_art.get(raw_sku, raw_sku),
-                "created_at": ord_data["created_at"],
-                "price": float(ord_data.get("price", 0.0)),
-                "commission": float(ord_data.get("commission", 0.0)),
-                "logistics": float(ord_data.get("logistics", 0.0)),
-                "status": str(ord_data.get("status", "ordered")),
-            }
-            stmt = select(OrderRecord).where(OrderRecord.order_id == clean_order["order_id"])
-            res = await session.execute(stmt)
-            if not res.scalar_one_or_none():
-                session.add(OrderRecord(**clean_order))
-        await session.commit()
-
-    def calc_cogs(orders_list: List[Dict[str, Any]]) -> float:
-        total_cogs = 0.0
-        for o in orders_list:
-            raw_sku = str(o.get("sku", ""))
-            lookup_sku = ext_to_art.get(raw_sku, raw_sku)
-            p = products_by_sku.get(lookup_sku) or products_by_sku.get(raw_sku)
-            if p:
-                total_cogs += (p.cost_price + p.packaging_cost + p.first_mile_unit_cost)
-        return total_cogs
-
-    def pct(val: float, base: float) -> str:
-        return f"{(val / base * 100):.1f}%" if base > 0 else "0.0%"
+    api_errors_count = 0
 
     # --- БЛОК OZON ---
-    if isinstance(ozon_fin, Exception):
-        ozon_block = f"🔵 <b>OZON:</b>\n❌ Ошибка API Ozon:\n<code>{ozon_fin}</code>\n\n"
-        oz_sales = oz_net_profit = oz_cogs = oz_ded_tot = oz_tax = 0.0
-        oz_count = 0
+    if not isinstance(ozon_fin, dict):
+        api_errors_count += 1
+        err_text = html.escape(str(ozon_fin))
+        ozon_block = f"🔵 <b>OZON:</b>\n❌ Ошибка API Ozon:\n<code>{err_text}</code>\n\n"
+        oz_sales = oz_net_profit = oz_cogs = oz_ded_tot = oz_tax = oz_acq = 0.0
+        oz_count = oz_missing_cogs = 0
     else:
-        oz_count = int(ozon_fin.get("orders_count", 0))
-        oz_sales = float(ozon_fin.get("sales_total", 0.0))
-        oz_comm = float(ozon_fin.get("commission", 0.0))
+        oz_orders = ozon_fin.get("orders") if isinstance(ozon_fin.get("orders"), list) else []
+        raw_oz_count = ozon_fin.get("orders_count")
+        oz_count = (
+            max(_safe_int(raw_oz_count, 0), 0)
+            if raw_oz_count is not None
+            else _count_active_orders(oz_orders)
+        )
 
-        oz_deliv = float(ozon_fin.get("deliv_total", 0.0))
-        oz_d_dir = float(ozon_fin.get("deliv_direct", 0.0))
-        oz_d_ret = float(ozon_fin.get("deliv_return", 0.0))
-        oz_d_ho = float(ozon_fin.get("deliv_ozon_handover", 0.0))
+        oz_sales = round(_safe_float(ozon_fin.get("sales_total")), 2)
+        oz_comm = round(_safe_nonneg(ozon_fin.get("commission")), 2)
 
-        oz_part = float(ozon_fin.get("partners_total", 0.0))
-        oz_dropoff = float(ozon_fin.get("partner_dropoff", 0.0))
-        oz_pack = float(ozon_fin.get("partner_pack", 0.0))
-        oz_pret = float(ozon_fin.get("partner_returns", 0.0))
-        oz_acq = float(ozon_fin.get("acquiring", 0.0))
-        oz_star = float(ozon_fin.get("star_products", 0.0))
-        oz_plm = float(ozon_fin.get("partner_last_mile", 0.0))
+        oz_d_dir = round(_safe_nonneg(ozon_fin.get("deliv_direct")), 2)
+        oz_d_ret = round(_safe_nonneg(ozon_fin.get("deliv_return")), 2)
+        oz_d_ho = round(_safe_nonneg(ozon_fin.get("deliv_ozon_handover")), 2)
+        oz_deliv = (
+            round(_safe_nonneg(ozon_fin.get("deliv_total")), 2)
+            if ozon_fin.get("deliv_total") is not None
+            else round(oz_d_dir + oz_d_ret + oz_d_ho, 2)
+        )
+        oz_deliv_per_order: Optional[float] = (
+            _div_rub(oz_deliv, oz_count) if oz_count > 0 else None
+        )
 
-        oz_fbo = float(ozon_fin.get("fbo_storage", 0.0))
-        oz_ads = float(ozon_fin.get("ads_total", 0.0))
-        oz_cpo = float(ozon_fin.get("promo_cpo", 0.0))
-        oz_cpc = float(ozon_fin.get("promo_cpc", 0.0))
-        oz_fines = float(ozon_fin.get("other_fines", 0.0))
-        oz_decomp = float(ozon_fin.get("decompensations", 0.0))
-        oz_mutual = float(ozon_fin.get("mutual_settlements", 0.0))
-        oz_ded_tot = float(ozon_fin.get("total_deductions", 0.0))
-        oz_payout = float(ozon_fin.get("total_payout", 0.0))
+        oz_dropoff = _round_rub(_safe_nonneg(ozon_fin.get("partner_dropoff")))
+        oz_pack = _round_rub(_safe_nonneg(ozon_fin.get("partner_pack")))
+        oz_pret = _round_rub(_safe_nonneg(ozon_fin.get("partner_returns")))
+        raw_oz_acq = _round_rub(_safe_nonneg(ozon_fin.get("acquiring")))
+        oz_star = _round_rub(_safe_nonneg(ozon_fin.get("star_products")))
+        oz_plm = _round_rub(_safe_nonneg(ozon_fin.get("partner_last_mile")))
 
-        oz_cogs = calc_cogs(ozon_fin.get("orders", []))
-        oz_tax = oz_sales * 0.06
-        oz_net_profit = oz_payout - oz_cogs - oz_tax
+        # Если эквайринг еще не отражен в cash-flow Ozon при положительных продажах,
+        # учитываем эталонный эквайринг 1.5% (settings.ACQUIRING_RATE) без двойного списания.
+        oz_fbo = _round_rub(_safe_nonneg(ozon_fin.get("fbo_storage")))
+        oz_cpo = _round_rub(_safe_nonneg(ozon_fin.get("promo_cpo")))
+        oz_cpc = _round_rub(_safe_nonneg(ozon_fin.get("promo_cpc")))
+        oz_ads = (
+            _round_rub(_safe_nonneg(ozon_fin.get("ads_total")))
+            if ozon_fin.get("ads_total") is not None
+            else _round_rub(_to_dec(oz_cpo) + _to_dec(oz_cpc))
+        )
+        oz_fines = _round_rub(_safe_nonneg(ozon_fin.get("other_fines")))
+        oz_decomp = _round_rub(_safe_nonneg(ozon_fin.get("decompensations")))
+        oz_mutual = _round_rub(_safe_nonneg(ozon_fin.get("mutual_settlements")))
+
+        oz_part_no_acq = (
+            _round_rub(_safe_nonneg(ozon_fin.get("partners_total")))
+            if ozon_fin.get("partners_total") is not None
+            else _round_rub(
+                _to_dec(oz_dropoff)
+                + _to_dec(oz_pack)
+                + _to_dec(oz_pret)
+                + _to_dec(oz_star)
+                + _to_dec(oz_plm)
+            )
+        )
+        known_oz_ded_no_acq = _round_rub(
+            _to_dec(oz_comm)
+            + _to_dec(oz_deliv)
+            + _to_dec(oz_part_no_acq)
+            + _to_dec(oz_fbo)
+            + _to_dec(oz_ads)
+            + _to_dec(oz_fines)
+            + _to_dec(oz_decomp)
+            + _to_dec(oz_mutual)
+        )
+
+        oz_acq_estimated = False
+        if raw_oz_acq > 0.0:
+            oz_acq = raw_oz_acq
+            oz_acq_delta = 0.0
+        elif oz_sales > 0.0 and acq_rate > 0.0:
+            est_oz_acq = _mul_rub(oz_sales, acq_rate)
+            raw_tot_ded = ozon_fin.get("total_deductions")
+            lump_sum_already_covers_acq = (
+                "acquiring" not in ozon_fin
+                and raw_tot_ded is not None
+                and _safe_nonneg(raw_tot_ded) >= known_oz_ded_no_acq + est_oz_acq - 0.05
+            )
+            oz_acq = est_oz_acq
+            oz_acq_delta = 0.0 if lump_sum_already_covers_acq else est_oz_acq
+            oz_acq_estimated = True
+        else:
+            oz_acq = 0.0
+            oz_acq_delta = 0.0
+
+        if ozon_fin.get("partners_total") is not None:
+            oz_part = _round_rub(_to_dec(oz_part_no_acq) + _to_dec(oz_acq_delta))
+        else:
+            oz_part = _round_rub(
+                _to_dec(oz_dropoff)
+                + _to_dec(oz_pack)
+                + _to_dec(oz_pret)
+                + _to_dec(oz_acq)
+                + _to_dec(oz_star)
+                + _to_dec(oz_plm)
+            )
+
+        computed_oz_ded = _round_rub(
+            _to_dec(oz_comm)
+            + _to_dec(oz_deliv)
+            + _to_dec(oz_part)
+            + _to_dec(oz_fbo)
+            + _to_dec(oz_ads)
+            + _to_dec(oz_fines)
+            + _to_dec(oz_decomp)
+            + _to_dec(oz_mutual)
+        )
+        if ozon_fin.get("total_deductions") is not None:
+            oz_ded_tot = _round_rub(_to_dec(_safe_nonneg(ozon_fin.get("total_deductions"))) + _to_dec(oz_acq_delta))
+        else:
+            oz_ded_tot = computed_oz_ded
+
+        if ozon_fin.get("total_payout") is not None:
+            oz_payout = _round_rub(_to_dec(_safe_float(ozon_fin.get("total_payout"))) - _to_dec(oz_acq_delta))
+        else:
+            oz_payout = _round_rub(_to_dec(oz_sales) - _to_dec(oz_ded_tot))
+
+        oz_cogs, oz_missing_cogs, oz_missing_skus = _calculate_marketplace_cogs(
+            oz_orders, "ozon", by_mp_sku, by_mp_ext
+        )
+        oz_tax_base = max(oz_sales, 0.0)
+        oz_tax = _mul_rub(oz_tax_base, tax_rate)
+        oz_net_profit = _round_rub(_to_dec(oz_payout) - _to_dec(oz_cogs) - _to_dec(oz_tax))
+
+        oz_source = html.escape(str(ozon_fin.get("source") or "ЛК Ozon Финансы"))
+        oz_sales_share = "100.0%" if oz_sales > 0.0 else "0.0%"
+        oz_deliv_unit_str = (
+            f" | факт. <b>{oz_deliv_per_order:.2f} ₽/заказ</b>"
+            if oz_deliv_per_order is not None
+            else ""
+        )
+        oz_acq_title = f"Эквайринг (расч. {acq_pct_label})" if oz_acq_estimated else "Эквайринг"
+        oz_missing_note = _format_missing_cogs_note(oz_missing_cogs, oz_missing_skus)
 
         ozon_block = (
-            f"🔵 <b>OZON ({ozon_fin.get('source')}):</b>\n"
+            f"🔵 <b>OZON ({oz_source}):</b>\n"
             f"• Заказано единиц: <b>{oz_count} шт.</b>\n"
-            f"• <b>Продажи и возвраты: {oz_sales:,.0f} ₽</b> (100%)\n"
-            f"• <b>Начисления МП (всего): -{oz_ded_tot:,.0f} ₽</b> ({pct(oz_ded_tot, oz_sales)})\n\n"
+            f"• <b>Продажи и возвраты: {_fmt_money(oz_sales)} ₽</b> ({oz_sales_share})\n"
+            f"• <b>Начисления МП (всего): {_fmt_expense(oz_ded_tot)}</b> ({_pct(oz_ded_tot, oz_sales)})\n\n"
             f"<b>Детализация расходов Ozon:</b>\n"
-            f"• <b>Вознаграждение Ozon: -{oz_comm:,.0f} ₽</b> ({pct(oz_comm, oz_sales)})\n"
-            f"• <b>Услуги доставки: -{oz_deliv:,.0f} ₽</b> ({pct(oz_deliv, oz_sales)})\n"
-            f"  ├ Логистика (прямая): -{oz_d_dir:,.0f} ₽\n"
-            f"  ├ Обратная логистика: -{oz_d_ret:,.0f} ₽\n"
-            f"  └ Доставка до места выдачи Ozon: -{oz_d_ho:,.0f} ₽\n"
-            f"• <b>Услуги партнёров: -{oz_part:,.0f} ₽</b> ({pct(oz_part, oz_sales)})\n"
-            f"  ├ Обработка Drop-off (сдача в ПВЗ): -{oz_dropoff:,.0f} ₽\n"
-            f"  ├ Упаковка товара партнёрами: -{oz_pack:,.0f} ₽\n"
-            f"  ├ Обработка возвратов и невыкупов: -{oz_pret:,.0f} ₽\n"
-            f"  ├ Эквайринг: -{oz_acq:,.0f} ₽ ({pct(oz_acq, oz_sales)})\n"
-            f"  ├ Звёздные товары: -{oz_star:,.0f} ₽\n"
-            f"  └ Доставка до места выдачи партнёрами: -{oz_plm:,.0f} ₽\n"
-            f"• <b>Услуги FBO (хранение на складе): -{oz_fbo:,.0f} ₽</b> ({pct(oz_fbo, oz_sales)})\n"
-            f"• <b>Продвижение и реклама: -{oz_ads:,.0f} ₽</b> ({pct(oz_ads, oz_sales)})\n"
-            f"  ├ Продвижение с оплатой за заказ: -{oz_cpo:,.0f} ₽\n"
-            f"  └ Оплата за клик / Трафареты: -{oz_cpc:,.0f} ₽\n"
-            f"• <b>Другие услуги и штрафы: -{oz_fines:,.0f} ₽</b> ({pct(oz_fines, oz_sales)})\n"
-            f"• <b>Компенсации и декомпенсации: -{oz_decomp:,.0f} ₽</b>\n"
-            f"• <b>Взаимозачет между договорами: -{oz_mutual:,.0f} ₽</b>\n\n"
-            f"💳 <b>Всего к выплате Ozon: {oz_payout:,.0f} ₽</b>\n"
-            f"📦 Себестоимость + Упаковка: <b>-{oz_cogs:,.0f} ₽</b> ({pct(oz_cogs, oz_sales)})\n"
-            f"🏛 Налог УСН (6%): <b>-{oz_tax:,.0f} ₽</b> (6.0%)\n"
-            f"👉 <b>Чистая прибыль Ozon:</b> <code>{oz_net_profit:,.0f} ₽</code> (<b>{pct(oz_net_profit, oz_sales)}</b>)\n\n"
+            f"• <b>Вознаграждение Ozon: {_fmt_expense(oz_comm)}</b> ({_pct(oz_comm, oz_sales)})\n"
+            f"• <b>Услуги доставки: {_fmt_expense(oz_deliv)}</b> ({_pct(oz_deliv, oz_sales)}{oz_deliv_unit_str})\n"
+            f"  ├ Логистика (прямая): {_fmt_expense(oz_d_dir)}\n"
+            f"  ├ Обратная логистика: {_fmt_expense(oz_d_ret)}\n"
+            f"  └ Доставка до места выдачи Ozon: {_fmt_expense(oz_d_ho)}\n"
+            f"• <b>Услуги партнёров: {_fmt_expense(oz_part)}</b> ({_pct(oz_part, oz_sales)})\n"
+            f"  ├ Обработка Drop-off (сдача в ПВЗ): {_fmt_expense(oz_dropoff)}\n"
+            f"  ├ Упаковка товара партнёрами: {_fmt_expense(oz_pack)}\n"
+            f"  ├ Обработка возвратов и невыкупов: {_fmt_expense(oz_pret)}\n"
+            f"  ├ {oz_acq_title}: {_fmt_expense(oz_acq)} ({_pct(oz_acq, oz_sales)})\n"
+            f"  ├ Звёздные товары: {_fmt_expense(oz_star)}\n"
+            f"  └ Доставка до места выдачи партнёрами: {_fmt_expense(oz_plm)}\n"
+            f"• <b>Услуги FBO (хранение на складе): {_fmt_expense(oz_fbo)}</b> ({_pct(oz_fbo, oz_sales)})\n"
+            f"• <b>Продвижение и реклама: {_fmt_expense(oz_ads)}</b> ({_pct(oz_ads, oz_sales)})\n"
+            f"  ├ Продвижение с оплатой за заказ: {_fmt_expense(oz_cpo)}\n"
+            f"  └ Оплата за клик / Трафареты: {_fmt_expense(oz_cpc)}\n"
+            f"• <b>Другие услуги и штрафы: {_fmt_expense(oz_fines)}</b> ({_pct(oz_fines, oz_sales)})\n"
+            f"• <b>Компенсации и декомпенсации: {_fmt_expense(oz_decomp)}</b>\n"
+            f"• <b>Взаимозачет между договорами: {_fmt_expense(oz_mutual)}</b>\n\n"
+            f"💳 <b>Всего к выплате Ozon: {_fmt_money(oz_payout)} ₽</b>\n"
+            f"📦 Себестоимость + Упаковка + Первая миля: <b>{_fmt_expense(oz_cogs)}</b> ({_pct(oz_cogs, oz_sales)})\n"
+            f"{oz_missing_note}"
+            f"🏛 Налог УСН ({tax_pct_label}): <b>{_fmt_expense(oz_tax)}</b> ({_pct(oz_tax, oz_sales)})\n"
+            f"👉 <b>Чистая прибыль Ozon:</b> <code>{_fmt_money(oz_net_profit)} ₽</code> (<b>{_pct(oz_net_profit, oz_sales)}</b>)\n\n"
         )
 
     # --- БЛОК WILDBERRIES ---
-    if isinstance(wb_fin, Exception):
-        wb_block = f"🟣 <b>WILDBERRIES:</b>\n❌ Ошибка API WB: <code>{wb_fin}</code>\n\n"
-        wb_rev_s = wb_net_profit = wb_cogs = wb_ded_tot = wb_tax = 0.0
-        wb_count = 0
+    if not isinstance(wb_fin, dict):
+        api_errors_count += 1
+        err_text = html.escape(str(wb_fin))
+        wb_block = f"🟣 <b>WILDBERRIES:</b>\n❌ Ошибка API WB: <code>{err_text}</code>\n\n"
+        wb_rev_s = wb_net_profit = wb_cogs = wb_ded_tot = wb_tax = wb_acq = 0.0
+        wb_count = wb_missing_cogs = 0
     else:
-        wb_count = int(wb_fin.get("orders_count", 0))
-        wb_rev_s = float(wb_fin.get("revenue_seller", 0.0))
-        wb_rev_b = float(wb_fin.get("revenue_buyer", wb_rev_s))
-        wb_ret = float(wb_fin.get("returns_amount", 0.0))
-        wb_comm = float(wb_fin.get("commission", 0.0))
-        wb_acq = float(wb_fin.get("acquiring", 0.0))
-        wb_log = float(wb_fin.get("logistics", 0.0))
-        wb_log_dir = float(wb_fin.get("logistics_direct", wb_log))
-        wb_log_ret = float(wb_fin.get("logistics_return", 0.0))
-        wb_stor = float(wb_fin.get("storage", 0.0))
-        wb_acc = float(wb_fin.get("acceptance", 0.0))
-        wb_ads = float(wb_fin.get("ads", 0.0))
-        wb_other = float(wb_fin.get("other_services", 0.0))
-        wb_ded_tot = float(wb_fin.get("total_deductions", wb_comm + wb_acq + wb_log + wb_stor + wb_acc + wb_ads + wb_other))
-        wb_payout = float(wb_fin.get("total_payout", wb_rev_s - wb_ded_tot))
-
-        wb_cogs = calc_cogs(wb_fin.get("orders", []))
-        wb_tax = wb_rev_b * 0.06
-        wb_net_profit = wb_payout - wb_cogs - wb_tax
-
-        wb_block = (
-            f"🟣 <b>WILDBERRIES ({wb_fin.get('source')}):</b>\n"
-            f"• Заказано единиц: <b>{wb_count} шт.</b> (Отмены/возвраты: {wb_ret:,.0f} ₽)\n"
-            f"• <b>Продажи в ценах ЛК (priceWithDisc): {wb_rev_s:,.0f} ₽</b> (100%)\n"
-            f"• <b>Цена для покупателя с СПП (база УСН): {wb_rev_b:,.0f} ₽</b>\n"
-            f"• <b>Удержания WB (всего): -{wb_ded_tot:,.0f} ₽</b> ({pct(wb_ded_tot, wb_rev_s)})\n\n"
-            f"<b>Детализация расходов Wildberries:</b>\n"
-            f"• <b>Вознаграждение WB (с НДС): -{wb_comm:,.0f} ₽</b> ({pct(wb_comm, wb_rev_s)})\n"
-            f"• <b>Эквайринг WB: -{wb_acq:,.0f} ₽</b> ({pct(wb_acq, wb_rev_s)})\n"
-            f"• <b>Услуги логистики WB: -{wb_log:,.0f} ₽</b> ({pct(wb_log, wb_rev_s)})\n"
-            f"  ├ Прямая доставка до покупателя: -{wb_log_dir:,.0f} ₽\n"
-            f"  └ Обратная логистика (возвраты/отмены): -{wb_log_ret:,.0f} ₽\n"
-            f"• <b>Платное хранение на складах WB: -{wb_stor:,.0f} ₽</b> ({pct(wb_stor, wb_rev_s)})\n"
-            f"• <b>Платная приёмка товара: -{wb_acc:,.0f} ₽</b> ({pct(wb_acc, wb_rev_s)})\n"
-            f"• <b>ВБ.Продвижение (Реклама): -{wb_ads:,.0f} ₽</b> ({pct(wb_ads, wb_rev_s)})\n"
-            f"• <b>Штрафы и прочие удержания: -{wb_other:,.0f} ₽</b> ({pct(wb_other, wb_rev_s)})\n\n"
-            f"💳 <b>Всего к перечислению WB: {wb_payout:,.0f} ₽</b>\n"
-            f"📦 Себестоимость + Упаковка: <b>-{wb_cogs:,.0f} ₽</b> ({pct(wb_cogs, wb_rev_s)})\n"
-            f"🏛 Налог УСН 6% (с {wb_rev_b:,.0f} ₽): <b>-{wb_tax:,.0f} ₽</b>\n"
-            f"👉 <b>Чистая прибыль WB:</b> <code>{wb_net_profit:,.0f} ₽</code> (<b>{pct(wb_net_profit, wb_rev_s)}</b>)\n\n"
+        wb_orders = wb_fin.get("orders") if isinstance(wb_fin.get("orders"), list) else []
+        raw_wb_count = wb_fin.get("orders_count")
+        wb_count = (
+            max(_safe_int(raw_wb_count, 0), 0)
+            if raw_wb_count is not None
+            else _count_active_orders(wb_orders)
         )
 
-    tot_sales = oz_sales + wb_rev_s
-    tot_ded = oz_ded_tot + wb_ded_tot
-    tot_cogs = oz_cogs + wb_cogs
-    tot_tax = oz_tax + wb_tax
-    tot_profit = oz_net_profit + wb_net_profit
+        wb_rev_s = round(_safe_float(wb_fin.get("revenue_seller")), 2)
+        wb_rev_b = (
+            round(_safe_float(wb_fin.get("revenue_buyer")), 2)
+            if wb_fin.get("revenue_buyer") is not None
+            else wb_rev_s
+        )
+        wb_ret = round(_safe_nonneg(wb_fin.get("returns_amount")), 2)
+        wb_comm = round(_safe_nonneg(wb_fin.get("commission")), 2)
 
+        raw_wb_acq = _round_rub(_safe_nonneg(wb_fin.get("acquiring")))
+        wb_acq_base = max(wb_rev_b, wb_rev_s, 0.0)
+
+        wb_log_ret = _round_rub(_safe_nonneg(wb_fin.get("logistics_return")))
+        if wb_fin.get("logistics") is not None:
+            wb_log = _round_rub(_safe_nonneg(wb_fin.get("logistics")))
+            wb_log_dir = (
+                _round_rub(_safe_nonneg(wb_fin.get("logistics_direct")))
+                if wb_fin.get("logistics_direct") is not None
+                else _round_rub(max(_to_dec(wb_log) - _to_dec(wb_log_ret), Decimal("0")))
+            )
+        else:
+            wb_log_dir = _round_rub(_safe_nonneg(wb_fin.get("logistics_direct")))
+            wb_log = _round_rub(_to_dec(wb_log_dir) + _to_dec(wb_log_ret))
+
+        wb_stor = _round_rub(_safe_nonneg(wb_fin.get("storage")))
+        wb_acc = _round_rub(_safe_nonneg(wb_fin.get("acceptance")))
+        wb_ads = _round_rub(_safe_nonneg(wb_fin.get("ads")))
+        wb_other = _round_rub(_safe_nonneg(wb_fin.get("other_services")))
+
+        known_wb_ded_no_acq = _round_rub(
+            _to_dec(wb_comm)
+            + _to_dec(wb_log)
+            + _to_dec(wb_stor)
+            + _to_dec(wb_acc)
+            + _to_dec(wb_ads)
+            + _to_dec(wb_other)
+        )
+
+        wb_acq_estimated = False
+        if raw_wb_acq > 0.0:
+            wb_acq = raw_wb_acq
+            wb_acq_delta = 0.0
+        elif wb_acq_base > 0.0 and acq_rate > 0.0:
+            est_wb_acq = _mul_rub(wb_acq_base, acq_rate)
+            raw_wb_tot_ded = wb_fin.get("total_deductions")
+            wb_lump_covers_acq = (
+                "acquiring" not in wb_fin
+                and raw_wb_tot_ded is not None
+                and _safe_nonneg(raw_wb_tot_ded) >= known_wb_ded_no_acq + est_wb_acq - 0.05
+            )
+            wb_acq = est_wb_acq
+            wb_acq_delta = 0.0 if wb_lump_covers_acq else est_wb_acq
+            wb_acq_estimated = True
+        else:
+            wb_acq = 0.0
+            wb_acq_delta = 0.0
+
+        computed_wb_ded = _round_rub(_to_dec(known_wb_ded_no_acq) + _to_dec(wb_acq))
+        if wb_fin.get("total_deductions") is not None:
+            wb_ded_tot = _round_rub(_to_dec(_safe_nonneg(wb_fin.get("total_deductions"))) + _to_dec(wb_acq_delta))
+        else:
+            wb_ded_tot = computed_wb_ded
+
+        if wb_fin.get("total_payout") is not None:
+            wb_payout = _round_rub(_to_dec(_safe_float(wb_fin.get("total_payout"))) - _to_dec(wb_acq_delta))
+        else:
+            wb_payout = _round_rub(_to_dec(wb_rev_s) - _to_dec(wb_ded_tot))
+
+        wb_cogs, wb_missing_cogs, wb_missing_skus = _calculate_marketplace_cogs(
+            wb_orders, "wb", by_mp_sku, by_mp_ext
+        )
+        wb_tax_base = max(wb_rev_b, 0.0)
+        wb_tax = _mul_rub(wb_tax_base, tax_rate)
+        wb_net_profit = _round_rub(_to_dec(wb_payout) - _to_dec(wb_cogs) - _to_dec(wb_tax))
+
+        wb_source = html.escape(str(wb_fin.get("source") or "ЛК Wildberries"))
+        wb_sales_share = "100.0%" if wb_rev_s > 0.0 else "0.0%"
+        wb_acq_title = (
+            f"Эквайринг WB (расч. {acq_pct_label})" if wb_acq_estimated else "Эквайринг WB"
+        )
+        wb_log_unit_str = (
+            f" | факт. <b>{_div_rub(wb_log, wb_count):.2f} ₽/заказ</b>" if wb_count > 0 else ""
+        )
+        wb_missing_note = _format_missing_cogs_note(wb_missing_cogs, wb_missing_skus)
+
+        wb_block = (
+            f"🟣 <b>WILDBERRIES ({wb_source}):</b>\n"
+            f"• Заказано единиц: <b>{wb_count} шт.</b> (Отмены/возвраты: {_fmt_money(wb_ret)} ₽)\n"
+            f"• <b>Продажи в ценах ЛК (priceWithDisc): {_fmt_money(wb_rev_s)} ₽</b> ({wb_sales_share})\n"
+            f"• <b>Цена для покупателя с СПП (база УСН): {_fmt_money(wb_rev_b)} ₽</b>\n"
+            f"• <b>Удержания WB (всего): {_fmt_expense(wb_ded_tot)}</b> ({_pct(wb_ded_tot, wb_rev_s)})\n\n"
+            f"<b>Детализация расходов Wildberries:</b>\n"
+            f"• <b>Вознаграждение WB (с НДС): {_fmt_expense(wb_comm)}</b> ({_pct(wb_comm, wb_rev_s)})\n"
+            f"• <b>{wb_acq_title}: {_fmt_expense(wb_acq)}</b> ({_pct(wb_acq, wb_rev_s)})\n"
+            f"• <b>Услуги логистики WB: {_fmt_expense(wb_log)}</b> ({_pct(wb_log, wb_rev_s)}{wb_log_unit_str})\n"
+            f"  ├ Прямая доставка до покупателя: {_fmt_expense(wb_log_dir)}\n"
+            f"  └ Обратная логистика (возвраты/отмены): {_fmt_expense(wb_log_ret)}\n"
+            f"• <b>Платное хранение на складах WB: {_fmt_expense(wb_stor)}</b> ({_pct(wb_stor, wb_rev_s)})\n"
+            f"• <b>Платная приёмка товара: {_fmt_expense(wb_acc)}</b> ({_pct(wb_acc, wb_rev_s)})\n"
+            f"• <b>ВБ.Продвижение (Реклама): {_fmt_expense(wb_ads)}</b> ({_pct(wb_ads, wb_rev_s)})\n"
+            f"• <b>Штрафы и прочие удержания: {_fmt_expense(wb_other)}</b> ({_pct(wb_other, wb_rev_s)})\n\n"
+            f"💳 <b>Всего к перечислению WB: {_fmt_money(wb_payout)} ₽</b>\n"
+            f"📦 Себестоимость + Упаковка + Первая миля: <b>{_fmt_expense(wb_cogs)}</b> ({_pct(wb_cogs, wb_rev_s)})\n"
+            f"{wb_missing_note}"
+            f"🏛 Налог УСН {tax_pct_label} (с {_fmt_money(wb_tax_base)} ₽): <b>{_fmt_expense(wb_tax)}</b>\n"
+            f"👉 <b>Чистая прибыль WB:</b> <code>{_fmt_money(wb_net_profit)} ₽</code> (<b>{_pct(wb_net_profit, wb_rev_s)}</b>)\n\n"
+        )
+
+    tot_count = oz_count + wb_count
+    tot_sales = _round_rub(_to_dec(oz_sales) + _to_dec(wb_rev_s))
+    tot_ded = _round_rub(_to_dec(oz_ded_tot) + _to_dec(wb_ded_tot))
+    tot_acq = _round_rub(_to_dec(oz_acq) + _to_dec(wb_acq))
+    tot_cogs = _round_rub(_to_dec(oz_cogs) + _to_dec(wb_cogs))
+    tot_tax = _round_rub(_to_dec(oz_tax) + _to_dec(wb_tax))
+    tot_profit = _round_rub(_to_dec(oz_net_profit) + _to_dec(wb_net_profit))
+    tot_missing_cogs = oz_missing_cogs + wb_missing_cogs
+
+    summary_warnings: List[str] = []
+    if api_errors_count > 0:
+        summary_warnings.append(
+            "⚠️ <i>Внимание: данные одного или обоих маркетплейсов недоступны — сводный итог неполный.</i>"
+        )
+    elif tot_count == 0 and tot_sales == 0.0 and tot_ded == 0.0:
+        summary_warnings.append("ℹ️ <i>За выбранный период продаж и удержаний не зафиксировано.</i>")
+    if tot_missing_cogs > 0:
+        summary_warnings.append(
+            f"⚠️ <i>По {tot_missing_cogs} ед. товара отсутствует себестоимость в БД — внесите её через /costs.</i>"
+        )
+    warnings_suffix = ("\n" + "\n".join(summary_warnings)) if summary_warnings else ""
+
+    safe_title = html.escape(str(report_title))
     return (
-        f"<b>{report_title}</b>\n\n"
+        f"<b>{safe_title}</b>\n\n"
         f"{ozon_block}"
         f"{wb_block}"
         f"➖➖➖➖➖➖➖➖➖➖\n"
         f"🏁 <b>СВОДНЫЙ ИТОГ (Ozon + WB):</b>\n"
-        f"• Всего единиц: <b>{oz_count + wb_count} шт.</b>\n"
-        f"• Общий оборот (в ценах ЛК): <b>{tot_sales:,.0f} ₽</b>\n"
-        f"• Все удержания маркетплейсов: <b>-{tot_ded:,.0f} ₽</b> ({pct(tot_ded, tot_sales)})\n"
-        f"• Себестоимость и упаковка: <b>-{tot_cogs:,.0f} ₽</b> ({pct(tot_cogs, tot_sales)})\n"
-        f"• Налог УСН 6%: <b>-{tot_tax:,.0f} ₽</b>\n"
-        f"💰 <b>ИТОГОВАЯ ЧИСТАЯ ПРИБЫЛЬ:</b> <code>{tot_profit:,.0f} ₽</code> (<b>{pct(tot_profit, tot_sales)} ROS</b>)"
+        f"• Всего единиц: <b>{tot_count} шт.</b>\n"
+        f"• Общий оборот (в ценах ЛК): <b>{_fmt_money(tot_sales)} ₽</b>\n"
+        f"• Все удержания маркетплейсов: <b>{_fmt_expense(tot_ded)}</b> ({_pct(tot_ded, tot_sales)}), в т.ч. эквайринг <b>{_fmt_expense(tot_acq)}</b>\n"
+        f"• Себестоимость, упаковка и первая миля: <b>{_fmt_expense(tot_cogs)}</b> ({_pct(tot_cogs, tot_sales)})\n"
+        f"• Налог УСН {tax_pct_label}: <b>{_fmt_expense(tot_tax)}</b>\n"
+        f"💰 <b>ИТОГОВАЯ ЧИСТАЯ ПРИБЫЛЬ:</b> <code>{_fmt_money(tot_profit)} ₽</code> (<b>{_pct(tot_profit, tot_sales)} ROS</b>)"
+        f"{warnings_suffix}"
     )
