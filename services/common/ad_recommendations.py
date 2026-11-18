@@ -5,7 +5,7 @@ import math
 import re
 from typing import Any, Dict, List, Optional, Sequence, Set
 
-import aiohttp
+from services.common.gemini import generate
 from sqlalchemy import select
 
 from config import settings
@@ -23,9 +23,6 @@ from services.common.orders_report import (
     _to_dec,
 )
 
-GEMINI_TIMEOUT = aiohttp.ClientTimeout(total=120, connect=15, sock_connect=15, sock_read=90)
-GEMINI_MODELS_TIMEOUT = aiohttp.ClientTimeout(total=12, connect=8, sock_connect=8, sock_read=10)
-
 INACTIVE_CAMPAIGN_STATES: Set[str] = {
     "INACTIVE",
     "STOPPED",
@@ -41,14 +38,6 @@ INACTIVE_CAMPAIGN_STATES: Set[str] = {
     "CAMPAIGN_STATE_PLANNED",
 }
 
-_EXCLUDED_GEMINI_MODEL_TOKENS = ("tts", "embedding", "imagen", "veo", "aqa", "whisper", "audio")
-_FALLBACK_GEMINI_MODELS = (
-    "gemini-2.5-flash",
-    "gemini-2.5-pro",
-    "gemini-2.0-flash",
-    "gemini-1.5-flash",
-    "gemini-1.5-pro",
-)
 _TAG_TOKEN_RE = re.compile(r"<(/?)(b|i|code)>", re.IGNORECASE)
 
 
@@ -102,117 +91,12 @@ def sanitize_telegram_html(raw_text: str) -> str:
     return "".join(out).strip()
 
 
-async def _discover_models_via_proxy(
-    session: aiohttp.ClientSession,
-    api_key: str,
-    proxy_url: str,
-) -> List[str]:
-    configured = str(getattr(settings, "GEMINI_MODEL", "") or "").replace("models/", "").strip()
-    discovered: List[str] = []
-    url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
-    try:
-        async with session.get(url, proxy=proxy_url, timeout=GEMINI_MODELS_TIMEOUT) as resp:
-            if resp.status == 200:
-                raw = await resp.text(encoding="utf-8", errors="replace")
-                data = json.loads(raw)
-                for item in data.get("models") or []:
-                    if not isinstance(item, dict):
-                        continue
-                    methods = item.get("supportedGenerationMethods") or []
-                    name = str(item.get("name") or "").replace("models/", "").strip()
-                    low = name.lower()
-                    if (
-                        name
-                        and "generateContent" in methods
-                        and not any(tok in low for tok in _EXCLUDED_GEMINI_MODEL_TOKENS)
-                    ):
-                        discovered.append(name)
-    except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError, OSError):
-        pass
-
-    discovered.sort(
-        key=lambda x: ("2.5-flash" in x, "flash" in x, "2.5" in x),
-        reverse=True,
-    )
-    ordered = [
-        m
-        for m in [configured, *discovered, *_FALLBACK_GEMINI_MODELS]
-        if m and not any(tok in m.lower() for tok in _EXCLUDED_GEMINI_MODEL_TOKENS)
-    ]
-    return list(dict.fromkeys(ordered))
-
-
 async def _call_gemini_unlimited(prompt: str) -> str:
-    """
-    Запрашивает аналитические рекомендации Gemini строго через настроенный локальный прокси
-    (settings.LOCAL_PROXY_URL, trust_env=False) с гарантированным закрытием сессии и коннектора.
-    """
-    api_key = str(getattr(settings, "GEMINI_API_KEY", "") or "").strip()
-    if not api_key:
-        return "⚠️ <i>GEMINI_API_KEY не задан — показан только проверенный фактический расчет.</i>"
-
-    proxy_url = str(getattr(settings, "LOCAL_PROXY_URL", "") or "").strip()
-    if not proxy_url:
-        return "⚠️ <i>LOCAL_PROXY_URL не задан — прямой вызов Gemini отключён правилами маршрутизации.</i>"
-
-    last_error = "нет ответа от доступных моделей"
-    connector = aiohttp.TCPConnector(limit=4, ssl=True, enable_cleanup_closed=True)
     try:
-        async with aiohttp.ClientSession(
-            connector=connector,
-            connector_owner=True,
-            trust_env=False,
-            timeout=GEMINI_TIMEOUT,
-        ) as session:
-            models = await _discover_models_via_proxy(session, api_key, proxy_url)
-            payload = {
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {"temperature": 0.15, "maxOutputTokens": 8192},
-            }
-            for model_name in models:
-                url = (
-                    f"https://generativelanguage.googleapis.com/v1beta/models/"
-                    f"{model_name}:generateContent?key={api_key}"
-                )
-                try:
-                    async with session.post(url, json=payload, proxy=proxy_url) as resp:
-                        body_text = await resp.text(encoding="utf-8", errors="replace")
-                        if resp.status in (401, 403):
-                            last_error = f"{model_name}: HTTP {resp.status} (доступ отклонён)"
-                            break
-                        if resp.status != 200:
-                            last_error = f"{model_name}: HTTP {resp.status}"
-                            continue
-                        data = json.loads(body_text)
-                        candidates = data.get("candidates") or []
-                        if not candidates:
-                            continue
-                        parts = (candidates[0].get("content") or {}).get("parts") or []
-                        text_out = "".join(
-                            str(p.get("text") or "")
-                            for p in parts
-                            if isinstance(p, dict) and not p.get("thought", False)
-                        ).strip()
-                        if text_out:
-                            return sanitize_telegram_html(text_out)
-                except asyncio.TimeoutError:
-                    last_error = f"{model_name}: таймаут запроса"
-                    continue
-                except (aiohttp.ClientError, json.JSONDecodeError, OSError) as exc:
-                    last_error = f"{model_name}: {type(exc).__name__}"
-                    continue
-    except asyncio.TimeoutError:
-        last_error = "таймаут подключения к локальному прокси"
-    except (aiohttp.ClientError, OSError) as exc:
-        last_error = f"ошибка прокси ({type(exc).__name__})"
-    finally:
-        if not connector.closed:
-            await connector.close()
-
-    return (
-        f"⚠️ <i>Рекомендации ИИ временно недоступны ({html.escape(last_error)}). "
-        f"Выше приведён точный фактический расчёт по данным API.</i>"
-    )
+        text, _ = await generate(prompt, max_tokens=8192, temperature=0.15)
+        return sanitize_telegram_html(text)
+    except RuntimeError as exc:
+        return f"⚠️ <i>Рекомендации ИИ временно недоступны ({html.escape(str(exc))}).</i>"
 
 
 def calculate_ozon_ad_unit_economics(
@@ -257,7 +141,7 @@ def calculate_ozon_ad_unit_economics(
         }
 
     base_comm = _safe_nonneg(commission_rate_under_300)
-    if not (0.0 < base_comm < 1.0):
+    if not 0.22 <= base_comm <= 0.23:
         base_comm = 0.23
     eff_comm = base_comm if clean_price <= low_limit else high_comm
 
@@ -452,6 +336,7 @@ def analyze_ozon_campaigns(
             )
 
     stock_by_art: Dict[str, Dict[str, Any]] = {}
+    market_sku_to_art = dict(OZON_SKU_TO_ART)
     known_offer_ids: Set[str] = set(PRODUCTS_CATALOG.keys())
     for item in oz_stocks or []:
         if not isinstance(item, dict):
@@ -462,6 +347,8 @@ def analyze_ozon_campaigns(
         art = OZON_SKU_TO_ART.get(raw_offer, raw_offer)
         known_offer_ids.add(art)
         stock_by_art[art] = item
+        for market_sku in item.get("ozon_skus", []):
+            market_sku_to_art[str(market_sku)] = art
         pid = str(item.get("product_id") or item.get("external_id") or "").strip()
         if pid:
             prod_id_to_art[pid] = art
@@ -472,8 +359,8 @@ def analyze_ozon_campaigns(
             return ""
         if clean in known_offer_ids:
             return clean
-        if clean in OZON_SKU_TO_ART:
-            return OZON_SKU_TO_ART[clean]
+        if clean in market_sku_to_art:
+            return market_sku_to_art[clean]
         if clean in prod_id_to_art:
             return prod_id_to_art[clean]
         return clean
@@ -491,7 +378,7 @@ def analyze_ozon_campaigns(
         price = round(_safe_nonneg(st_item.get("current_price")), 2)
         c_fbo = _safe_nonneg(st_item.get("commission_rate_fbo") or st_item.get("commission_rate"))
         c_fbs = _safe_nonneg(st_item.get("commission_rate_fbs") or c_fbo)
-        if fbo_st > 0 and fbs_st > 0 and c_fbo > 0.0 and c_fbs > 0.0:
+        if fbo_st > 0 and fbs_st > 0:
             weighted_comm = (c_fbo * fbo_st + c_fbs * fbs_st) / total_st
             fbs_share = fbs_st / total_st
         elif fbs_st > 0:
@@ -501,7 +388,8 @@ def analyze_ozon_campaigns(
             weighted_comm = c_fbo
             fbs_share = 0.0
 
-        weighted_pvz = round(actual_dropoff_per_order * fbs_share, 2)
+        pvz = st_item.get("fbs_pvz_dropoff_rub")
+        weighted_pvz = (round(float(pvz) * fbs_share, 2) if pvz is not None else actual_dropoff_per_order) if fbs_share else 0.0
         cogs_val = oz_cogs_by_sku.get(art)
         econ_current = calculate_ozon_ad_unit_economics(
             price=price,
@@ -586,6 +474,7 @@ def analyze_ozon_campaigns(
             "overlapping_skus": [],
             "zero_stock_promoted_skus": [],
             "low_stock_promoted_skus": [],
+            "finance_available": isinstance(oz_fin, dict),
             "finance": {
                 "orders_count": oz_orders_cnt,
                 "sales_total": oz_sales_total,
@@ -626,29 +515,24 @@ def analyze_ozon_campaigns(
 
         spend_raw = camp.get("spend_7d_rub")
         if spend_raw is None:
-            spend_raw = camp.get("spend_rub", 0.0)
+            spend_raw = camp.get("spend_rub")
         rev_raw = camp.get("promo_revenue_7d_rub")
         if rev_raw is None:
-            rev_raw = camp.get("revenue_rub", 0.0)
+            rev_raw = camp.get("revenue_rub")
         drr_raw = camp.get("drr_in_promo_pct")
         if drr_raw is None:
             drr_raw = camp.get("drr_pct")
 
-        spend_rub = round(_safe_nonneg(spend_raw), 2)
-        revenue_rub = round(_safe_nonneg(rev_raw), 2)
-
-        if revenue_rub > 0.0:
-            drr_pct: Optional[float] = _round_pct(spend_rub, revenue_rub)
-            drr_status = "calculated"
-        elif spend_rub > 0.0:
-            drr_pct = None
-            drr_status = "spend_without_revenue"
-        elif drr_raw is not None and _safe_nonneg(drr_raw) > 0.0:
-            drr_pct = round(_safe_nonneg(drr_raw), 1)
-            drr_status = "reported"
+        spend_rub = _round_rub(spend_raw) if spend_raw is not None else None
+        revenue_rub = _round_rub(rev_raw) if rev_raw is not None else None
+        if spend_rub is not None and revenue_rub is not None and revenue_rub > 0 and spend_rub >= 0:
+            drr_pct, drr_status = _round_pct(spend_rub, revenue_rub), 'calculated'
+        elif spend_rub and spend_rub > 0 and revenue_rub == 0:
+            drr_pct, drr_status = None, 'spend_without_revenue'
+        elif drr_raw is not None and camp.get('stats_available') is not False:
+            drr_pct, drr_status = _round_rub(drr_raw), 'reported'
         else:
-            drr_pct = 0.0
-            drr_status = "zero"
+            drr_pct, drr_status = None, 'unavailable'
 
         camp_items: List[Dict[str, Any]] = []
         for art in resolved_skus:
@@ -674,13 +558,16 @@ def analyze_ozon_campaigns(
                 "drr_in_promo_pct": drr_pct,
                 "drr_status": drr_status,
                 "items": camp_items,
-                "products_missing": len(resolved_skus) == 0,
+                "products_missing": not resolved_skus or any(art not in known_offer_ids for art in resolved_skus),
                 "source": str(camp.get("source") or "Ozon Performance API"),
             }
         )
 
     # 5. Строгое выделение органических SKU (в наличии и НЕ входят ни в одну активную РК)
+    billed = {resolve_ozon_identifier(s) for s in fin_dict.get("billed_skus", [])}
     has_unlisted_campaign_products = any(c["products_missing"] for c in parsed_campaigns)
+    # A debit with neither a matching campaign expense nor SKU attribution cannot be organic.
+    unmatched_spend = not billed and ads_total - sum(c['spend_7d_rub'] or 0 for c in parsed_campaigns) > .01
     organic_items: List[Dict[str, Any]] = []
     unclassified_items: List[Dict[str, Any]] = []
 
@@ -688,7 +575,7 @@ def analyze_ozon_campaigns(
         total_st = max(_safe_int(st.get("stock_fbo"), 0), 0) + max(_safe_int(st.get("stock_fbs"), 0), 0)
         if total_st <= 0 or art in promoted_set:
             continue
-        if has_unlisted_campaign_products:
+        if not isinstance(oz_fin, dict) or unmatched_spend or has_unlisted_campaign_products or art in billed:
             # Если хотя бы одна активная РК вернулась без списка товаров, не объявляем остальные SKU органикой
             unclassified_items.append(build_sku_card(art, drr_pct=None))
         else:
@@ -706,6 +593,7 @@ def analyze_ozon_campaigns(
         "overlapping_skus": overlapping_skus,
         "zero_stock_promoted_skus": sorted(zero_stock_promoted),
         "low_stock_promoted_skus": sorted(low_stock_promoted),
+        "finance_available": isinstance(oz_fin, dict),
         "finance": {
             "orders_count": oz_orders_cnt,
             "sales_total": oz_sales_total,
@@ -775,6 +663,9 @@ def _render_factual_ads_header(
         ),
     ]
 
+    if not oz_analysis['finance_available']:
+        lines[1:] = ['• Выручка, доставка и списания: нет финансового отчёта за период.']
+
     if not oz_analysis["campaigns_available"]:
         err_msg = html.escape(str(oz_analysis.get("campaigns_error") or "API недоступен"))
         lines.append(
@@ -791,8 +682,9 @@ def _render_factual_ads_header(
             lines.append(
                 f"\n🎯 <b>Кампания №{idx}: {safe_title}</b> (ID: <code>{safe_id}</code>)\n"
                 f"• Товаров в РК: <b>{camp['products_count']} шт.</b> | ДРР в продвижении: <b>{drr_lbl}</b>\n"
-                f"• Расход 7 дн.: <b>{_fmt_money(camp['spend_7d_rub'])} ₽</b> | "
-                f"Выручка в РК: <b>{_fmt_money(camp['promo_revenue_7d_rub'])} ₽</b>"
+                + (f"• Расход 7 дн.: <b>{_fmt_money(camp['spend_7d_rub'])} ₽</b> | "
+                 f"Выручка в РК: <b>{_fmt_money(camp['promo_revenue_7d_rub'])} ₽</b>"
+                 if None not in (camp["spend_7d_rub"], camp["promo_revenue_7d_rub"]) else "• Расход и выручка в РК: н/д")
             )
             if camp["products_missing"]:
                 lines.append("  ⚠️ <i>API не вернул список SKU внутри кампании.</i>")
@@ -803,21 +695,21 @@ def _render_factual_ads_header(
                     f"{_format_unit_profit_brief(card)}"
                 )
 
-        if oz_analysis["organic_items"]:
+    if oz_analysis["organic_items"]:
+        lines.append(
+            f"\n🌿 <b>Органические SKU Ozon (вне рекламы — {len(oz_analysis['organic_items'])} шт., ДРР 0.0%):</b>"
+        )
+        for card in oz_analysis["organic_items"]:
+            safe_sku = html.escape(card["sku"])
             lines.append(
-                f"\n🌿 <b>Органические SKU Ozon (вне рекламы — {len(oz_analysis['organic_items'])} шт., ДРР 0.0%):</b>"
+                f"  ├ Арт. <code>{safe_sku}</code>: FBO {card['stock_fbo']} / FBS {card['stock_fbs']} шт. | "
+                f"{_format_unit_profit_brief(card)}"
             )
-            for card in oz_analysis["organic_items"]:
-                safe_sku = html.escape(card["sku"])
-                lines.append(
-                    f"  ├ Арт. <code>{safe_sku}</code>: FBO {card['stock_fbo']} / FBS {card['stock_fbs']} шт. | "
-                    f"{_format_unit_profit_brief(card)}"
-                )
-        elif oz_analysis["unclassified_items"]:
-            uncl_skus = ", ".join(html.escape(c["sku"]) for c in oz_analysis["unclassified_items"])
-            lines.append(
-                f"\n⚠️ <i>SKU с неподтверждённым статусом рекламы: <code>{uncl_skus}</code>.</i>"
-            )
+    if oz_analysis["unclassified_items"]:
+        uncl_skus = ", ".join(html.escape(c["sku"]) for c in oz_analysis["unclassified_items"])
+        lines.append(
+            f"\n⚠️ <i>SKU с неподтверждённым статусом рекламы: <code>{uncl_skus}</code>.</i>"
+        )
 
     if oz_analysis["overlapping_skus"]:
         ov_str = ", ".join(html.escape(s) for s in oz_analysis["overlapping_skus"])
@@ -833,12 +725,14 @@ def _render_factual_ads_header(
     wb_fin_dict = wb_fin if isinstance(wb_fin, dict) else {}
     wb_rev = _safe_float(wb_fin_dict.get("revenue_seller"))
     wb_ads = _safe_nonneg(wb_fin_dict.get("ads"))
-    wb_drr = _round_pct(wb_ads, wb_rev) if wb_rev > 0.0 else 0.0
-    lines.append(
-        f"\n🟣 <b>ФАКТИЧЕСКИЙ СРЕЗ РЕКЛАМЫ WB (7 дн.):</b>\n"
-        f"• Выручка ЛК: <b>{_fmt_money(wb_rev)} ₽</b> | Списания ВБ.Продвижение: "
-        f"<b>{_fmt_money(wb_ads)} ₽</b> (ДРР {wb_drr:.1f}%) | Активных/учтённых РК: <b>{len(wb_campaigns)}</b>"
-    )
+    drr_label = f'{_round_pct(wb_ads, wb_rev):.1f}%' if wb_rev > 0 else 'н/д'
+    lines.append('\n🟣 <b>ФАКТИЧЕСКИЙ СРЕЗ РЕКЛАМЫ WB (7 дн.):</b>')
+    if isinstance(wb_fin, dict):
+        lines.append(f'• Выручка ЛК: <b>{_fmt_money(wb_rev)} ₽</b> | Списания ВБ.Продвижение: '
+                     f'<b>{_fmt_money(wb_ads)} ₽</b> (ДРР {drr_label})')
+    else:
+        lines.append('• Финансовый отчёт WB недоступен.')
+    lines.append(f'• Получено активных/учтённых РК: <b>{len(wb_campaigns)}</b>')
 
     if api_errors:
         lines.append("\n" + "\n".join(api_errors))
@@ -946,17 +840,17 @@ async def generate_weekly_ads_report_and_recommendations(ozon_api, wb_api) -> st
         art = WB_SKU_TO_ART.get(raw_sku, raw_sku)
         nm_id = str(item.get("nm_id") or item.get("external_id") or "")
         cur_price = _safe_nonneg(item.get("current_price"))
-        comm_pct = _safe_nonneg(item.get("commission_rate"), 0.25) * 100.0
-        daily_sales = _safe_nonneg(item.get("daily_sales"))
+        comm_pct = f"{100 * item['commission_rate']:.1f}%" if item.get('commission_rate') is not None else 'н/д'
+        daily_sales = f"{item['daily_sales']:.2f}" if item.get('daily_sales') is not None else 'н/д'
         wb_summary.append(
-            f"SKU {art} (nmID {nm_id}): цена {cur_price:.0f} ₽, комиссия WB={comm_pct:.1f}%, "
-            f"FBO={st_fbo} шт., FBS={st_fbs} шт., продаж/день={daily_sales:.2f}"
+            f"SKU {art} (nmID {nm_id}): цена {cur_price:.0f} ₽, комиссия WB={comm_pct}, "
+            f"FBO={st_fbo} шт., FBS={st_fbs} шт., продаж/день={daily_sales}"
         )
 
     prompt_payload_ozon = {
         "campaigns_available": oz_analysis["campaigns_available"],
         "campaigns_error": oz_analysis["campaigns_error"],
-        "finance_7d": oz_analysis["finance"],
+        "finance_7d": oz_analysis["finance"] if oz_fin is not None else None,
         "campaigns": [
             {
                 "index": idx,

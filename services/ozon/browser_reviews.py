@@ -1,17 +1,20 @@
+import logging
+import hashlib
 import os
 import re
 import json
 import time
 import asyncio
 from datetime import datetime, timedelta
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
-from config import BASE_DIR, LOGS_DIR, settings  # noqa: F401
+from typing import Any, Dict, List, Optional, Set, Tuple
+from config import LOGS_DIR, settings
+from services.common.storage import write_json
+from zoneinfo import ZoneInfo
 
 # =============================================================================
 # Константы и калиброванные координаты (viewport 1440x900)
 # =============================================================================
 BROWSER_DATA_DIR = LOGS_DIR / "ozon_browser_profile"
-BROWSER_DATA_DIR.mkdir(parents=True, exist_ok=True)
 TRACKER_FILE = LOGS_DIR / "replies_tracker.json"
 MAX_DAILY_REPLIES = 50
 VIEWPORT = {"width": 1440, "height": 900}
@@ -74,9 +77,9 @@ def _get_min_target_date() -> datetime:
     raw = str(getattr(settings, "OZON_REVIEWS_MIN_DATE", "") or "").strip()
     if raw:
         try:
-            return datetime.strptime(raw, "%d.%m.%Y")
+            return max(datetime.strptime(raw, "%d.%m.%Y"), MIN_TARGET_DATE)
         except ValueError:
-            pass
+            return MIN_TARGET_DATE
     return MIN_TARGET_DATE
 
 
@@ -100,7 +103,7 @@ def _is_date_from_nov_13_2026(text: str, *, require_date: bool = False) -> bool:
     if not src:
         return not require_date
 
-    now_dt = datetime.now()
+    now_dt = datetime.now(ZoneInfo(settings.TIMEZONE)).replace(tzinfo=None)
 
     # 1. Формат ДД.ММ.ГГГГ
     for m_full in re.finditer(r"\b(\d{1,2})\.(\d{1,2})\.(20\d{2})\b", src):
@@ -111,7 +114,7 @@ def _is_date_from_nov_13_2026(text: str, *, require_date: bool = False) -> bool:
             continue
 
     # 2. ISO формат ГГГГ-ММ-ДД
-    for m_iso in re.finditer(r"\b(20\d{2})-(\d{1,2})-(\d{1,2})\b", src):
+    for m_iso in re.finditer(r"\b(20\d{2})-(\d{1,2})-(\d{1,2})(?=T|\b)", src):
         y, mo, d = int(m_iso.group(1)), int(m_iso.group(2)), int(m_iso.group(3))
         try:
             return datetime(y, mo, d) >= min_date
@@ -156,7 +159,11 @@ def _is_date_from_nov_13_2026(text: str, *, require_date: bool = False) -> bool:
     # 6. Относительные обозначения даты
     low = src.lower()
     today_dt = now_dt.replace(hour=0, minute=0, second=0, microsecond=0)
-    if re.search(r"\bсегодня\b|\bтолько что\b|\bминут[уы]?\s+назад\b|\bчас(?:а|ов)?\s+назад\b", low):
+    relative = re.search(r"(\d+)\s+(минут|час)\w*\s+назад", low)
+    if relative:
+        n = int(relative[1])
+        return now_dt - timedelta(minutes=n if relative[2] == 'минут' else n * 60) >= min_date
+    if re.search(r"\bсегодня\b|\bтолько что\b", low):
         return today_dt >= min_date
     if re.search(r"\bвчера\b", low):
         return (today_dt - timedelta(days=1)) >= min_date
@@ -169,21 +176,10 @@ async def _close_browser_context_safe(context: Any, timeout: float = 15.0) -> No
     if context is None:
         return
     try:
-        pages = list(getattr(context, "pages", []) or [])
-        for pg in pages:
-            try:
-                if hasattr(pg, "is_closed") and not pg.is_closed():
-                    await asyncio.wait_for(pg.close(), timeout=min(5.0, timeout))
-            except Exception:
-                pass
-    except Exception:
-        pass
-    try:
         await asyncio.wait_for(context.close(), timeout=timeout)
-    except Exception:
-        pass
+    except Exception as exc:
+        logging.getLogger(__name__).warning('Не удалось закрыть контекст Playwright: %s', type(exc).__name__)
 
-REVIEW_SUBTABS = [("Новые", ["Новые", "Новое"]), ("Просмотренные", ["Просмотренные", "Просмотрено"])]
 QUESTION_SUBTABS = [("Новые", ["Новые", "Новое"]), ("Просмотренные", ["Просмотренные", "Просмотрено"])]
 
 
@@ -213,16 +209,18 @@ def _get_direct_env() -> Dict[str, str]:
 
 
 def _load_tracker() -> Dict[str, Any]:
-    today_str = datetime.now().strftime("%Y-%m-%d")
-    if TRACKER_FILE.exists():
-        try:
-            data = json.loads(TRACKER_FILE.read_text(encoding="utf-8"))
-            if data.get("date") == today_str:
-                data.setdefault("processed_review_ids", [])
-                data.setdefault("processed_question_ids", [])
-                return data
-        except Exception:
-            pass
+    today_str = datetime.now(ZoneInfo(settings.TIMEZONE)).date().isoformat()
+    try:
+        data = json.loads(TRACKER_FILE.read_bytes())
+    except FileNotFoundError:
+        data = {}
+    if data.get('date') == today_str:
+        if type(data.get('replied_count')) is not int or data['replied_count'] < 0:
+            raise ValueError('Некорректный счётчик ответов; нужна проверка трекера')
+        for key in ('processed_review_ids', 'processed_question_ids'):
+            if not isinstance(data.setdefault(key, []), list):
+                raise ValueError('Повреждён трекер ответов')
+        return data
     return {
         "date": today_str,
         "replied_count": 0,
@@ -233,10 +231,7 @@ def _load_tracker() -> Dict[str, Any]:
 
 
 def _save_tracker(data: Dict[str, Any]) -> None:
-    try:
-        TRACKER_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    except Exception:
-        pass
+    write_json(TRACKER_FILE, data)
 
 
 async def _read_text_at_point(page, x: int, y: int, max_len: int = 260) -> str:
@@ -302,258 +297,84 @@ async def _js_is_drawer_open(page) -> bool:
         return False
 
 
-async def _blur_active(page) -> None:
+_REPLY_NAME = re.compile(r'^Ответить(?: на отзыв)?$', re.I)
+_SELLER_ANSWER = '[data-testid*="seller-reply" i], [data-testid*="seller-answer" i], [data-testid*="brand-reply" i]'
+
+
+async def _item_date(container, *, table_row: bool) -> str:
+    """Use the publication date field, never a date mentioned in customer text."""
+    return await container.evaluate(r'''(el, row) => {
+        if (row) {
+            const headings = Array.from(el.closest('table')?.querySelectorAll('thead th') || []);
+            const idx = headings.findIndex(h => /^(дата|опубликован)/i.test(h.innerText.trim()));
+            if (idx >= 0 && el.cells[idx]) return el.cells[idx].innerText;
+        }
+        const dates = el.querySelectorAll('time, [data-testid*="review-date" i], [data-testid*="question-date" i]');
+        if (dates.length === 1) return dates[0].getAttribute('datetime') || dates[0].innerText;
+        if (!row) {
+            const label = [...el.querySelectorAll('span,dt,label,div')].find(n => /^Дата (отзыва|вопроса|публикации)[:：]?$/.test(n.innerText.trim()));
+            return label?.nextElementSibling?.innerText || '';
+        }
+        const cells = Array.from(el.cells || []).filter((c, i) => i !== 3 &&
+            /^(?:\d{1,2}[. ](?:\d|[а-я])|20\d\d-|сегодня|вчера)/i.test(c.innerText.trim()));
+        return cells.length === 1 ? cells[0].innerText : '';
+    }''', table_row)
+
+
+async def _has_seller_reply(drawer) -> bool:
+    marker = drawer.locator(f':is({_SELLER_ANSWER}):visible')
+    label = drawer.get_by_text(re.compile(r'^(?:Ответ продавца|Ответ бренда|Ответ представителя бренда|Ваш ответ)[:：]?$', re.I))
+    return await marker.first.is_visible() or await label.first.is_visible()
+
+
+async def _submit_review_reply(page, drawer, field, reply: str) -> bool:
+    """One send. A cleared input, closed drawer or newly hidden opener alone is not a receipt."""
+    from playwright.async_api import TimeoutError as PlaywrightTimeout
+
+    card = await drawer.element_handle()
+    send = page.locator(f'{PORTAL_SEL} button:visible, {DIALOG_SEL} button:visible').filter(
+        has_text=re.compile(r'^\s*(Отправить(?: ответ)?|Сохранить)\s*$', re.I))
+    if await send.count() == 1:
+        await send.click()
+    elif await send.count() == 0:
+        await field.press('Control+Enter')
+    else:
+        raise RuntimeError('Неоднозначная кнопка отправки ответа')
     try:
-        await page.evaluate("() => { const a = document.activeElement; if (a && a.blur) a.blur(); }")
-    except Exception:
-        pass
-
-
-def _sector_points(cx: int, cy: int, radius: int = 36, step: int = 8) -> List[Tuple[int, int]]:
-    x_min, x_max = 8, VIEWPORT["width"] - 18
-    y_min, y_max = 8, VIEWPORT["height"] - 8
-    seen: set = set()
-    pts: List[Tuple[int, int]] = []
-
-    def _add(x: int, y: int) -> None:
-        x = min(max(x, x_min), x_max)
-        y = min(max(y, y_min), y_max)
-        if (x, y) not in seen:
-            seen.add((x, y))
-            pts.append((x, y))
-
-    _add(cx, cy)
-    r = step
-    while r <= radius:
-        ring: List[Tuple[int, int]] = []
-        dx = -r
-        while dx <= r:
-            dy = -r
-            while dy <= r:
-                if max(abs(dx), abs(dy)) == r:
-                    ring.append((dx, dy))
-                dy += step
-            dx += step
-        ring.sort(key=lambda d: d[0] * d[0] + d[1] * d[1])
-        for dx, dy in ring:
-            _add(cx + dx, cy + dy)
-        r += step
-    return pts
-
-
-async def _confirm_discard_if_shown(page) -> None:
-    try:
-        await page.evaluate(r"""() => {
-            const btns = document.querySelectorAll('button');
-            for (const b of btns) {
-                const t = (b.innerText || '').trim().toLowerCase();
-                if (['да', 'закрыть', 'отменить', 'не сохранять', 'выйти'].includes(t) ||
-                    t.includes('без сохранения') || t.includes('не сохранять') || t.includes('отменить')) {
-                    if (!b.disabled) { b.click(); return; }
-                }
-            }
-        }""")
-    except Exception:
-        pass
-
-
-async def _open_review_row(page, row, click_x: int, click_y: int) -> bool:
-    try:
-        cells = row.locator("td")
-        if await cells.count() >= 4:
-            rev_cell = cells.nth(3)
-            await rev_cell.scroll_into_view_if_needed(timeout=1500)
-            target = rev_cell.locator("span, div, a, p").first
-            if await target.count() > 0 and await target.is_visible():
-                await target.click()
-            else:
-                await rev_cell.click()
-            await asyncio.sleep(1.2)
-            if await _js_is_drawer_open(page):
-                return True
-    except Exception:
-        pass
-
-    pts = _sector_points(click_x, click_y, radius=24, step=8)
-    for (px, py) in pts:
-        try:
-            await page.mouse.click(px, py)
-            await asyncio.sleep(0.35)
-            if await _js_is_drawer_open(page):
-                return True
-        except Exception:
-            pass
-    return await _js_is_drawer_open(page)
-
-
-async def _click_reply_to_review_button(page) -> bool:
-    try:
-        btn = page.locator('button, [role="button"]').filter(has_text=re.compile(r"^Ответить на отзыв$", re.I)).first
-        if await btn.count() > 0 and await btn.is_visible():
-            await btn.click()
-            print("👉 [Нажата кнопка «Ответить на отзыв» через селектор]")
-            await asyncio.sleep(1.2)
-            return True
-    except Exception:
-        pass
-
-    try:
-        clicked = await page.evaluate(r"""() => {
-            const btns = Array.from(document.querySelectorAll('button, [role="button"], span, div'));
-            for (const b of btns) {
-                const t = (b.innerText || '').trim().toLowerCase();
-                if (t === 'ответить на отзыв' || t === 'ответить') {
-                    b.click();
-                    return true;
-                }
-            }
-            return false;
-        }""")
-        if clicked:
-            print("👉 [Нажата кнопка «Ответить на отзыв» через JS]")
-            await asyncio.sleep(1.2)
-            return True
-    except Exception:
-        pass
-
-    print("👉 [Нажата кнопка «Ответить на отзыв» по координатам (280, 595)]")
-    await page.mouse.click(280, 595)
-    await asyncio.sleep(1.2)
-    return True
-
-
-async def _submit_review_reply(page) -> bool:
-    """
-    Отправка ответа на отзыв:
-    1. Нажатие Control+Enter прямо в активном поле ввода.
-    2. Поиск кнопки «Отправить» / «Сохранить» в DOM.
-    3. Клик по координатам кнопки (1147, 739) и сектору вокруг.
-    4. Нажатие Enter на фокусе.
-    """
-    # 1. Горячие клавиши Control+Enter
-    try:
-        print("👉 [Отправка ответа: комбинация Control+Enter]")
-        await page.keyboard.press("Control+Enter")
-        await asyncio.sleep(1.5)
-        ta = page.locator("textarea").last
-        if await ta.count() == 0 or (await ta.input_value()).strip() == "":
-            return True
-    except Exception:
-        pass
-
-    # 2. Клик по кнопке отправки в DOM
-    try:
-        send_btn = page.locator(
-            f"{PORTAL_SEL} button, {DIALOG_SEL} button, button"
-        ).filter(has_text=re.compile(r"^Отправить( ответ)?$|^Сохранить$", re.I)).last
-        if await send_btn.count() > 0 and await send_btn.is_visible():
-            await send_btn.click()
-            print("👉 [Отправка ответа: клик по кнопке «Отправить»]")
-            await asyncio.sleep(2.0)
-            return True
-    except Exception:
-        pass
-
-    # 3. JS-клик
-    try:
-        clicked_js = await page.evaluate(r"""() => {
-            const btns = Array.from(document.querySelectorAll('button, [role="button"]'));
-            for (let i = btns.length - 1; i >= 0; i--) {
-                const t = (btns[i].innerText || '').trim().toLowerCase();
-                if (t === 'отправить' || t === 'отправить ответ' || t === 'сохранить') {
-                    btns[i].click();
-                    return true;
-                }
-            }
-            return false;
-        }""")
-        if clicked_js:
-            print("👉 [Отправка ответа: JS-клик по кнопке]")
-            await asyncio.sleep(2.0)
-            return True
-    except Exception:
-        pass
-
-    # 4. Клик по калиброванным координатам (1147, 739)
-    print(f"👉 [Отправка ответа: клик по координатам ({REV_SEND_PT[0]}, {REV_SEND_PT[1]})]")
-    for (sx, sy) in _sector_points(REV_SEND_PT[0], REV_SEND_PT[1], radius=28, step=7):
-        try:
-            await page.mouse.click(sx, sy)
-            await asyncio.sleep(0.1)
-        except Exception:
-            pass
-
-    # 5. Резервный Enter
-    try:
-        await page.keyboard.press("Enter")
-    except Exception:
-        pass
-
-    await asyncio.sleep(3.0)
-    return True
+        await page.wait_for_function(r'''([card, text]) => {
+            const visible = el => el.isConnected && el.getClientRects().length > 0 && getComputedStyle(el).visibility !== 'hidden';
+            if (!visible(card) || !/Отзыв на товар/i.test(card.innerText)) return false;
+            if ([...document.querySelectorAll('textarea,[contenteditable=true]')].some(visible)) return false;
+            if (card.querySelector('[aria-busy=true], [role=alert]')) return false;
+            const norm = s => s.replace(/\s+/g, ' ').trim();
+            const published = [...card.querySelectorAll('div, span, p')].some(e =>
+                visible(e) && norm(e.innerText) === norm(text));
+            const opener = [...card.querySelectorAll('button,[role=button]')].some(e =>
+                visible(e) && /^ответить( на отзыв)?$/i.test(norm(e.innerText)));
+            return published || (!opener && /(?:^|\n)(ответ продавца|ответ бренда|ваш ответ)[:\s]*(?:\n|$)/i.test(card.innerText));
+        }''', arg=[card, reply], timeout=8000)
+        return True
+    except PlaywrightTimeout:
+        return False
+    finally:
+        await card.dispose()
 
 
 async def _close_review_drawer(page) -> bool:
-    """Блокирующее закрытие шторки отзыва."""
-    if not await _js_is_drawer_open(page):
-        return True
-
-    for round_no in range(1, 6):
-        await _blur_active(page)
-        await _confirm_discard_if_shown(page)
-
-        # 1. Клик по крестику через DOM
-        try:
-            await page.evaluate(r"""() => {
-                const all = Array.from(document.querySelectorAll('button, svg, [role="button"]'));
-                for (const el of all) {
-                    const r = el.getBoundingClientRect();
-                    if (r.top < 160 && r.left > 1100 && r.left < 1250) {
-                        (el.closest('button') || el).click();
-                        return;
-                    }
-                }
-            }""")
-        except Exception:
-            pass
-        await asyncio.sleep(0.25)
-        if not await _js_is_drawer_open(page):
-            print("✅ [Шторка отзыва закрыта через DOM-крестик]")
+    drawer = page.locator(f'{DIALOG_SEL}:visible, {PORTAL_SEL}:visible').filter(has_text=re.compile('Отзыв на товар', re.I)).last
+    for _ in range(3):
+        if not await drawer.is_visible():
             return True
-
-        # 2. Клик по крестику окна (1165, 125) и (1179, 23)
-        for (cx, cy) in [(REV_MODAL_CLOSE_PT[0], REV_MODAL_CLOSE_PT[1]), (REV_CLOSE_PT[0], REV_CLOSE_PT[1])]:
-            try:
-                await page.mouse.click(cx, cy)
-                await asyncio.sleep(0.1)
-            except Exception:
-                pass
-            if not await _js_is_drawer_open(page):
-                print(f"✅ [Шторка отзыва закрыта кликом в крестик ({cx}, {cy})]")
-                return True
-
-        # 3. Escape x 3
-        for _ in range(3):
-            await page.keyboard.press("Escape")
-            await asyncio.sleep(0.12)
-            if not await _js_is_drawer_open(page):
-                print("✅ [Шторка отзыва закрыта клавишей Escape]")
-                return True
-
-        # 4. Клик по подложке слева
-        for bx in (50, 100, 150):
-            try:
-                await page.mouse.click(bx, 450)
-                await asyncio.sleep(0.1)
-            except Exception:
-                pass
-            if not await _js_is_drawer_open(page):
-                print("✅ [Шторка отзыва закрыта кликом по подложке]")
-                return True
-
-        await asyncio.sleep(0.3)
-
-    return not await _js_is_drawer_open(page)
+        button = drawer.get_by_role('button', name=re.compile('^(Закрыть|Close)$', re.I))
+        if await button.first.is_visible():
+            await button.first.click()
+        else:
+            await page.keyboard.press('Escape')
+        await page.wait_for_timeout(250)
+        discard = page.get_by_role('button', name=re.compile('^(Не сохранять|Выйти без сохранения)$', re.I))
+        if await discard.first.is_visible():
+            await discard.first.click()
+    return not await drawer.is_visible()
 
 
 async def _close_question_drawer(page) -> bool:
@@ -562,8 +383,8 @@ async def _close_question_drawer(page) -> bool:
     try:
         await page.mouse.click(Q_CLOSE_PT[0], Q_CLOSE_PT[1])
         await asyncio.sleep(0.4)
-    except Exception:
-        pass
+    except Exception as exc:
+        logging.getLogger(__name__).debug('Playwright: %s', type(exc).__name__)
     if not await _js_is_drawer_open(page):
         return True
     for dx, dy in [(-6, 0), (6, 0), (0, -6), (0, 6)]:
@@ -572,8 +393,8 @@ async def _close_question_drawer(page) -> bool:
             await asyncio.sleep(0.15)
             if not await _js_is_drawer_open(page):
                 return True
-        except Exception:
-            pass
+        except Exception as exc:
+            logging.getLogger(__name__).debug('Playwright: %s', type(exc).__name__)
     for _ in range(3):
         await page.keyboard.press("Escape")
         await asyncio.sleep(0.2)
@@ -581,91 +402,10 @@ async def _close_question_drawer(page) -> bool:
             return True
     try:
         await page.mouse.click(100, 400)
-    except Exception:
-        pass
+    except Exception as exc:
+        logging.getLogger(__name__).debug('Playwright: %s', type(exc).__name__)
     await asyncio.sleep(0.4)
     return not await _js_is_drawer_open(page)
-
-
-async def _apply_reviews_content_filter(page) -> None:
-    print("👉 [Фильтр Ozon] Выставляем фильтр: «С текстом» + «С медиа»...")
-    try:
-        filter_btn = page.locator("button, [role='button'], div").filter(has_text=re.compile(r"^Фильтры$", re.I)).first
-        if await filter_btn.count() > 0 and await filter_btn.is_visible():
-            await filter_btn.click()
-        else:
-            for (fx, fy) in _sector_points(355, 425, radius=25, step=8):
-                await page.mouse.click(fx, fy)
-                await asyncio.sleep(0.15)
-                if await page.locator("text=Контент").count() > 0:
-                    break
-
-        await asyncio.sleep(1.0)
-
-        content_tab = page.locator("div, span, li, button").filter(has_text=re.compile(r"^Контент$", re.I)).last
-        if await content_tab.count() > 0 and await content_tab.is_visible():
-            await content_tab.click()
-            await asyncio.sleep(0.6)
-
-        await page.evaluate(r"""() => {
-            const labels = [...document.querySelectorAll('label, div, span')];
-            const toggleOption = (textRegex, shouldCheck) => {
-                for (const el of labels) {
-                    const txt = (el.innerText || '').trim();
-                    if (!textRegex.test(txt)) continue;
-                    const row = el.closest('label') || el.parentElement;
-                    if (!row) continue;
-                    const inp = row.querySelector('input[type="checkbox"]');
-                    if (inp) {
-                        if (Boolean(inp.checked) !== shouldCheck) {
-                            row.click();
-                        }
-                        return true;
-                    }
-                }
-                return false;
-            };
-            toggleOption(/^Только с оценкой$/i, false);
-            toggleOption(/^С текстом$/i, true);
-            toggleOption(/^С медиа$/i, true);
-        }""")
-        await asyncio.sleep(0.5)
-
-        for opt_name in ("С текстом", "С медиа"):
-            opt_loc = page.locator("label, div, span").filter(has_text=re.compile(rf"^{opt_name}$", re.I)).last
-            if await opt_loc.count() > 0 and await opt_loc.is_visible():
-                try:
-                    is_checked = await opt_loc.evaluate(r"""el => {
-                        const row = el.closest('label') || el.parentElement;
-                        const inp = row ? row.querySelector('input[type="checkbox"]') : null;
-                        return inp ? Boolean(inp.checked) : false;
-                    }""")
-                    if not is_checked:
-                        await opt_loc.click()
-                        await asyncio.sleep(0.2)
-                except Exception:
-                    pass
-
-        apply_btn = page.locator("button").filter(has_text=re.compile(r"^Применить$", re.I)).last
-        if await apply_btn.count() > 0 and await apply_btn.is_visible():
-            await apply_btn.click()
-        else:
-            await page.evaluate(r"""() => {
-                const btns = [...document.querySelectorAll('button')];
-                for (const b of btns) {
-                    if ((b.innerText || '').trim().toLowerCase() === 'применить') {
-                        b.click();
-                        break;
-                    }
-                }
-            }""")
-
-        await asyncio.sleep(2.5)
-        await page.keyboard.press("Escape")
-        await asyncio.sleep(0.5)
-        print("✅ [Фильтр Ozon] Фильтр «С текстом» и «С медиа» успешно применен!")
-    except Exception as exc:
-        print(f"⚠️ [Фильтр Ozon] Ошибка применения фильтра: {exc}")
 
 
 async def _scroll_main_table_down(page) -> bool:
@@ -694,22 +434,7 @@ def _extract_sku(*texts: str) -> Optional[str]:
     return None
 
 
-async def _extract_rating_accurately(page, drawer_text: str, row_text: str) -> int:
-    try:
-        dom_stars = await page.evaluate(r"""() => {
-            const all = Array.from(document.querySelectorAll('*'));
-            for (const el of all) {
-                const txt = (el.innerText || '').trim();
-                const m = txt.match(/^Оценка\s*([1-5])(\s*★)?$/i);
-                if (m) return parseInt(m[1], 10);
-            }
-            return null;
-        }""")
-        if dom_stars:
-            return int(dom_stars)
-    except Exception:
-        pass
-
+async def _extract_rating_accurately(page, drawer_text: str, row_text: str) -> Optional[int]:
     m = re.search(r"Оценка[:\s\n]*([1-5])", drawer_text, re.I)
     if m:
         return int(m.group(1))
@@ -727,7 +452,7 @@ async def _extract_rating_accurately(page, drawer_text: str, row_text: str) -> i
     if m_row:
         return int(m_row.group(1))
 
-    return 5
+    return None
 
 
 def _extract_review_comment(drawer_text: str) -> str:
@@ -801,233 +526,187 @@ async def run_interactive_login() -> None:
 # =============================================================================
 # МОДУЛЬ: ОТЗЫВЫ (ПРЯМОЙ ПЕРЕХОД ПО КНОПКЕ «ОТВЕТИТЬ НА ОТЗЫВ»)
 # =============================================================================
-async def auto_reply_unanswered_reviews(
-    headless: bool = True,
-    dry_run: bool = False,
-    max_per_run: int = 1,
-) -> Dict[str, Any]:
-    from playwright.async_api import async_playwright
+async def _reset_review_filters(page) -> None:
+    """The persistent profile may retain the old text/media-only content filter."""
+    reset = page.get_by_role('button', name=re.compile(r'^Сбросить (?:все )?фильтры$', re.I)).first
+    if await reset.is_visible():
+        await reset.click()
+        return
+    filters = page.get_by_role('button', name=re.compile(r'^Фильтры(?:\s*\d+)?$', re.I)).first
+    if not await filters.is_visible():
+        return
+    await filters.click()
+    reset = page.get_by_role('button', name=re.compile(r'^(Сбросить|Очистить)(?: все| всё| фильтры| все фильтры)?$', re.I)).last
+    if await reset.is_visible() and await reset.is_enabled():
+        await reset.click()
+    else:
+        content = page.get_by_text('Контент', exact=True).last
+        if await content.is_visible():
+            await content.click()
+        for name in ('Только с оценкой', 'С текстом', 'С медиа'):
+            option = page.get_by_role('checkbox', name=name, exact=True)
+            if await option.count() == 1 and await option.is_checked():
+                await option.uncheck()
+    apply = page.get_by_role('button', name='Применить', exact=True).last
+    if await apply.is_visible() and await apply.is_enabled():
+        await apply.click()
+    else:
+        await page.keyboard.press('Escape')
+
+
+async def _review_tab(page, names: list[str]) -> bool:
+    for name in names:
+        rx = re.compile(r'^' + re.escape(name) + r'(?:\s*[(]?\d+[)]?)?$', re.I)
+        for role in (('tab', 'radio') if name == 'Все' else ('tab', 'radio', 'button', 'link')):
+            tab = page.get_by_role(role, name=rx)
+            if await tab.count() == 1 and await tab.is_visible():
+                await tab.click()
+                await page.wait_for_timeout(400)
+                return True
+        if name == 'Все':
+            continue  # a generic status label is not evidence of the complete reviews tab
+        fallback = page.get_by_text(rx)
+        if await fallback.count() == 1 and await fallback.is_visible():
+            await fallback.click()
+            await page.wait_for_timeout(400)
+            return True
+    return False
+
+
+async def _scan_reviews(page, tracker, dry_run: bool, max_per_run: int) -> dict:
     from services.common.buyer_questions import generate_review_reply
 
-    tracker = _load_tracker()
-    if tracker.get("replied_count", 0) >= MAX_DAILY_REPLIES:
-        return {"status": "limit_reached", "replied": 0, "message": f"Достигнут дневной лимит ({MAX_DAILY_REPLIES})."}
-
-    replied_in_session = 0
-    reviews_found: List[Dict[str, Any]] = []
-    processed_row_keys: Set[str] = set()
-
-    print("[Ozon Reviews] Запуск браузерного модуля...")
-    try:
-        async with async_playwright() as p:
-            context = None
-            try:
-                context = await p.chromium.launch_persistent_context(
-                    user_data_dir=str(BROWSER_DATA_DIR),
-                    headless=headless,
-                    args=DIRECT_BROWSER_ARGS,
-                    env=_get_direct_env(),
-                    viewport=VIEWPORT,
-                )
-                page = context.pages[0] if context.pages else await context.new_page()
-                await page.goto(REVIEWS_URL, wait_until="domcontentloaded", timeout=60000)
-                await asyncio.sleep(3.5)
-
-                if "login" in page.url.lower():
-                    return {"status": "need_auth", "replied": 0, "message": "Сессия устарела. Запустите авторизацию."}
-
-                for sub_title, sub_variants in REVIEW_SUBTABS:
-                    if tracker.get("replied_count", 0) >= MAX_DAILY_REPLIES or replied_in_session >= max_per_run:
-                        break
-
-                    await _close_review_drawer(page)
-                    print(f"[Ozon Reviews] Переход во вкладку «{sub_title}»...")
-                    await _click_subtab(page, sub_variants)
-
-                    # Выставляем фильтр Ozon «С текстом» + «С медиа»
-                    await _apply_reviews_content_filter(page)
-
-                    no_new_rows_count = 0
-                    while no_new_rows_count < 3:
-                        if tracker.get("replied_count", 0) >= MAX_DAILY_REPLIES or replied_in_session >= max_per_run:
-                            break
-
-                        rows = page.locator("tbody tr")
-                        row_count = await rows.count()
-                        print(f"[Ozon Reviews] Отфильтрованных отзывов в таблице: {row_count}")
-                        new_rows_in_pass = 0
-
-                        for i in range(row_count):
-                            if tracker.get("replied_count", 0) >= MAX_DAILY_REPLIES or replied_in_session >= max_per_run:
-                                break
-
-                            # Закрываем предыдущую шторку, если она осталась открыта
-                            if await _js_is_drawer_open(page):
-                                print("⚠️ Предыдущая шторка открыта! Дожимаем закрытие...")
-                                while await _js_is_drawer_open(page):
-                                    await _close_review_drawer(page)
-                                    await asyncio.sleep(0.5)
-
-                            row = rows.nth(i)
-                            row_text = (await row.inner_text()).strip()
-                            if not row_text or "нет отзывов" in row_text.lower():
-                                continue
-
-                            row_key = row_text[:120]
-                            if row_key in processed_row_keys:
-                                continue
-
-                            processed_row_keys.add(row_key)
-                            new_rows_in_pass += 1
-
-                            # Фильтр дат >= 13.11.2026 по строке таблицы до открытия шторки
-                            if not _is_date_from_nov_13_2026(row_text, require_date=False):
-                                print(f"[Ozon Reviews] Пропуск отзыва до {_get_min_target_date().strftime('%d.%m.%Y')}: «{row_text[:60]}...»")
-                                continue
-
-                            cells = row.locator("td")
-                            cell_count = await cells.count()
-                            if cell_count >= 8:
-                                ans_str = (await cells.nth(cell_count - 3).inner_text()).strip()
-                                if ans_str.isdigit() and int(ans_str) > 0:
-                                    continue
-
-                            # Превью отзыва и оценка из строки таблицы
-                            row_comment_preview = ""
-                            if cell_count > 3:
-                                row_comment_preview = _clean_review_text(await cells.nth(3).inner_text())
-
-                            row_stars = 5
-                            if cell_count > 4:
-                                st_txt = await cells.nth(4).inner_text()
-                                m_st = re.search(r"([1-5])", st_txt)
-                                if m_st:
-                                    row_stars = int(m_st.group(1))
-
-                            await row.scroll_into_view_if_needed(timeout=2000)
-                            row_box = await row.bounding_box()
-                            if not row_box:
-                                continue
-
-                            click_y = int(row_box["y"] + row_box["height"] / 2)
-                            print(f"\n👉 [Открытие отзыва #{i} в точке ({REV_CLICK_X}, {click_y})]")
-
-                            if not await _open_review_row(page, row, REV_CLICK_X, click_y):
-                                print("⚠️ Окно отзыва не открылось, пропускаю строку")
-                                continue
-
-                            await asyncio.sleep(1.8)
-                            drawer_text = await page.evaluate(r"""() => {
-                                const all = Array.from(document.querySelectorAll('div, [role="dialog"], #ui-kit-side-page-portal-container'));
-                                for (const d of all) {
-                                    if ((d.innerText || '').includes('Отзыв на товар')) return d.innerText;
-                                }
-                                return document.body.innerText;
-                            }""")
-
-                            # Повторная строгая проверка даты >= 13.11.2026 по открытой шторке и строке
-                            if not _is_date_from_nov_13_2026(f"{row_text}\n{drawer_text}", require_date=True):
-                                print(f"[Ozon Reviews] Пропуск отзыва (дата < {_get_min_target_date().strftime('%d.%m.%Y')} или не распознана)")
-                                await _close_review_drawer(page)
-                                continue
-
-                            # Считывание артикула, оценки и текста отзыва
-                            raw_sku_point = await _read_text_at_point(page, REV_SKU_PT[0], REV_SKU_PT[1])
-                            sku_detected = _extract_sku(raw_sku_point, drawer_text, row_text)
-
-                            stars = await _extract_rating_accurately(page, drawer_text, row_text)
-                            if not stars:
-                                stars = row_stars
-
-                            full_comment = _extract_review_comment(drawer_text)
-                            if not full_comment or len(full_comment) < 2:
-                                full_comment = row_comment_preview
-
-                            rev_id = f"{full_comment[:35]}_{stars}_{sku_detected or 'any'}"
-                            if rev_id in tracker.get("processed_review_ids", []):
-                                print(f"[Ozon Reviews] Отзыв уже обрабатывался: «{full_comment[:30]}...»")
-                                await _close_review_drawer(page)
-                                continue
-
-                            prompt_text = full_comment if len(full_comment.strip()) >= 2 else "Покупатель поставил высокую оценку и прикрепил фото/видео маникюра к отзыву."
-                            reply_text = await generate_review_reply(review_text=prompt_text, rating=stars, sku=sku_detected)
-                            cleaned_reply = _clean_text_for_input(reply_text)
-
-                            print(f"📦 [Артикул]: {sku_detected or 'YaSoKo'}")
-                            print(f"⭐ [Оценка]: {stars}★ | 📝 [Текст отзыва]: «{full_comment or '[Фото/Видео маникюра]'}»")
-                            print(f"💬 [Сгенерированный ответ ИИ]:\n{cleaned_reply}\n")
-
-                            reviews_found.append({
-                                "subtab": sub_title,
-                                "text": full_comment,
-                                "sku": sku_detected,
-                                "stars": stars,
-                                "reply": cleaned_reply,
-                            })
-
-                            # 1. Нажимаем кнопку «Ответить на отзыв» (Ozon сам откроет и сфокусирует поле ввода!)
-                            await _click_reply_to_review_button(page)
-
-                            # 2. Просто вставляем текст ответа (нажимать на экран не нужно!)
-                            print("👉 [Вставка текста ответа в активное поле]")
-                            field = page.locator("textarea, [contenteditable='true']").last
-                            if await field.count() > 0:
-                                try:
-                                    await field.fill(cleaned_reply)
-                                except Exception:
-                                    await page.keyboard.insert_text(cleaned_reply)
-                            else:
-                                await page.keyboard.insert_text(cleaned_reply)
-
-                            await asyncio.sleep(1.0)
-
-                            if dry_run:
-                                print("ℹ️ [Dry Run]: Ответ успешно вставлен! Закрываю окно...")
-                                await asyncio.sleep(1.2)
-                            else:
-                                # 3. Надежная отправка ответа (Ctrl+Enter + DOM + координаты + Enter)
-                                await _submit_review_reply(page)
-                                print("✅ [Успех] Ответ на отзыв опубликован!")
-                                tracker["replied_count"] = tracker.get("replied_count", 0) + 1
-                                replied_in_session += 1
-                                tracker.setdefault("processed_review_ids", []).append(rev_id)
-                                _save_tracker(tracker)
-
-                            # 4. Закрытие шторки с гарантированным контролем
-                            print("👉 [Закрытие шторки отзыва...]")
-                            await _close_review_drawer(page)
-                            await asyncio.sleep(0.8)
-
-                            # Если окно все еще видно — не идем дальше, а дожимаем закрытие!
-                            retry_close = 0
-                            while await _js_is_drawer_open(page) and retry_close < 6:
-                                retry_close += 1
-                                print(f"⚠️ Окно отзыва все еще открыто (попытка {retry_close}/6)...")
-                                await _close_review_drawer(page)
-                                await asyncio.sleep(0.8)
-
-                        table_scrolled = await _scroll_main_table_down(page)
-                        if new_rows_in_pass == 0 and not table_scrolled:
-                            no_new_rows_count += 1
-                        else:
-                            no_new_rows_count = 0
-
+    reviews, confirmed, failures = [], 0, []
+    attempted = set()
+    await _reset_review_filters(page)
+    # Prefer the complete list. Otherwise process viewed first so a previous failure is retried.
+    if await _review_tab(page, ['Все отзывы', 'Все']):
+        tabs = [('Все', [])]
+    else:
+        tabs = [('Просмотренные', ['Просмотренные', 'Просмотрено']), ('Новые', ['Новые', 'Новое'])]
+    for title, names in tabs:
+        if names and not await _review_tab(page, names):
+            failures.append(f'Не найдена вкладка «{title}»')
+            continue
+        visited = set()
+        last_page = None
+        idle = 0
+        while idle < 2 and len(reviews) < max_per_run and tracker['replied_count'] < MAX_DAILY_REPLIES:
+            rows = page.locator('tbody tr')
+            progress = False
+            for i in range(await rows.count()):
+                if len(reviews) >= max_per_run or tracker['replied_count'] >= MAX_DAILY_REPLIES:
+                    break
+                row = rows.nth(i)
+                if not await row.count():
+                    break  # opening a new review may remove its row
+                row_text = (await row.inner_text()).strip()
+                if not row_text or 'нет отзывов' in row_text.lower():
+                    continue
+                ident = await row.get_attribute('data-review-id') or await row.get_attribute('data-row-key')
+                # A text fingerprint is only a traversal hint, not proof that two reviews are identical.
+                key = ident or (i, row_text)
+                if key in visited or (ident and ('review:' + ident in tracker['processed_review_ids'] or ident in attempted)):
+                    continue
+                visited.add(key)
+                stamp = await _item_date(row, table_row=True)
+                if not _is_date_from_nov_13_2026(stamp):
+                    continue
+                cells = row.locator('td')
+                if await cells.count() < 4:
+                    continue
+                comment = _clean_review_text(await cells.nth(3).inner_text())
+                await cells.nth(3).click()
+                drawer = page.locator(f'{PORTAL_SEL}:visible, {DIALOG_SEL}:visible').filter(
+                    has_text=re.compile('Отзыв на товар', re.I)).last
+                await drawer.wait_for(timeout=5000)
                 try:
-                    await page.screenshot(path=str(LOGS_DIR / "ozon_reviews_run.png"))
-                except Exception:
-                    pass
+                    drawer_stamp = await _item_date(drawer, table_row=False)
+                    if not _is_date_from_nov_13_2026(drawer_stamp or stamp, require_date=True):
+                        continue
+                    opener = drawer.get_by_role('button', name=_REPLY_NAME)
+                    if not await opener.first.is_visible() or await _has_seller_reply(drawer):
+                        continue
+                    text = await drawer.inner_text()
+                    sku = _extract_sku(text, row_text)
+                    stars = await _extract_rating_accurately(page, text, row_text)
+                    comment = _extract_review_comment(text) or comment
+                    try:
+                        reply = _clean_text_for_input(await generate_review_reply(comment or 'Без комментария', stars, sku))
+                    except RuntimeError as exc:
+                        failures.append(str(exc))
+                        continue  # no tracker entry: eligible again under Viewed
+                    reviews.append({'subtab': title, 'sku': sku, 'text': comment, 'stars': stars, 'reply': reply})
+                    if not dry_run:
+                        await opener.first.click()
+                        field = page.locator(f'{PORTAL_SEL} textarea:visible, {DIALOG_SEL} textarea:visible, '
+                                             f'{PORTAL_SEL} [contenteditable=true]:visible, {DIALOG_SEL} [contenteditable=true]:visible')
+                        await field.fill(reply, timeout=5000)
+                        if ident:
+                            attempted.add(ident)
+                        if not await _submit_review_reply(page, drawer, field, reply):
+                            problem = 'Публикация не подтверждена в карточке; перепроверка в следующем цикле'
+                            if not ident:
+                                raise RuntimeError(problem)
+                            failures.append(problem)
+                            continue
+                        confirmed += 1
+                        tracker['replied_count'] += 1
+                        tracker['processed_review_ids'].append('review:' + ident if ident else
+                            'receipt:' + hashlib.sha256((row_text + reply).encode()).hexdigest())
+                        _save_tracker(tracker)
+                finally:
+                    if not await _close_review_drawer(page):
+                        raise RuntimeError('Не удалось закрыть карточку отзыва')
+                progress = True
+                break  # reacquire the live list; indices can shift
+            if progress:
+                idle = 0
+                continue
+            before = await rows.all_inner_texts()
+            if await _scroll_main_table_down(page) or before != await rows.all_inner_texts():
+                idle = 0
+            else:
+                idle += 1
+                if idle == 2:
+                    nxt = page.get_by_role('button', name=re.compile('^(Следующая страница|Далее)$', re.I)).first
+                    if await nxt.is_visible() and await nxt.is_enabled():
+                        page_key = tuple(await rows.all_inner_texts())
+                        if page_key == last_page:
+                            raise RuntimeError('Пагинация отзывов не продвигается')
+                        last_page = page_key
+                        await nxt.click()
+                        await page.wait_for_timeout(500)
+                        # Keep the current page's traversal hints until the next page actually appears.
+                        if page_key != tuple(await rows.all_inner_texts()):
+                            visited.clear()
+                        idle = 0
+    return {'status': 'partial' if failures else 'success', 'replied': confirmed, 'reviews': reviews,
+            'message': f'Опубликовано ответов: {confirmed}. ' + '; '.join(dict.fromkeys(failures))}
+
+
+async def auto_reply_unanswered_reviews(headless: bool = True, dry_run: bool = False, max_per_run: int = 1) -> Dict[str, Any]:
+    from playwright.async_api import async_playwright
+
+    tracker = _load_tracker()
+    starting_count = tracker['replied_count']
+    if starting_count >= MAX_DAILY_REPLIES:
+        return {'status': 'limit_reached', 'replied': 0, 'message': 'Достигнут дневной лимит'}
+    try:
+        async with async_playwright() as pw:
+            context = await pw.chromium.launch_persistent_context(user_data_dir=str(BROWSER_DATA_DIR),
+                headless=headless, args=DIRECT_BROWSER_ARGS, env=_get_direct_env(), viewport=VIEWPORT)
+            try:
+                page = context.pages[0] if context.pages else await context.new_page()
+                await page.goto(REVIEWS_URL, wait_until='domcontentloaded', timeout=60000)
+                if 'login' in page.url.lower():
+                    return {'status': 'need_auth', 'replied': 0, 'message': 'Необходима авторизация Ozon'}
+                await page.wait_for_timeout(1500)
+                return await _scan_reviews(page, tracker, dry_run, max_per_run)
             finally:
                 await _close_browser_context_safe(context)
-
-            return {
-                "status": "success",
-                "replied": replied_in_session,
-                "reviews": reviews_found,
-                "message": f"Опубликовано ответов: {replied_in_session}. Найдено по фильтру: {len(reviews_found)}.",
-            }
     except Exception as exc:
-        print(f"❌ [Ozon Reviews Error]: {exc}")
-        return {"status": "error", "replied": replied_in_session, "message": str(exc)}
+        return {'status': 'error', 'replied': tracker['replied_count'] - starting_count, 'message': str(exc)}
 
 
 # =============================================================================
@@ -1130,6 +809,9 @@ async def auto_reply_unanswered_questions(
                             if not row_box:
                                 continue
 
+                            row_stamp = await _item_date(row, table_row=True)
+                            if not _is_date_from_nov_13_2026(row_stamp):
+                                continue
                             click_y = int(row_box["y"] + row_box["height"] / 2)
                             print(f"\n👉 [Вопрос] X={Q_CLICK_X}, Y={click_y}: «{q_cell_text[:50]}...»")
                             await page.mouse.click(Q_CLICK_X, click_y)
@@ -1139,9 +821,15 @@ async def auto_reply_unanswered_questions(
                                 await page.mouse.click(Q_CLICK_X, click_y)
                                 await asyncio.sleep(2.0)
 
-                            drawer = page.locator(f"{PORTAL_SEL}, {DIALOG_SEL}").first
+                            drawer = page.locator(f"{PORTAL_SEL}:visible, {DIALOG_SEL}:visible").first
                             drawer_text = await drawer.inner_text() if await drawer.count() > 0 else ""
 
+                            # Keep the existing question UI; require a publication date before generating/sending.
+                            stamp = await _item_date(drawer, table_row=False) if await drawer.count() else ""
+                            stamp = stamp or row_stamp
+                            if not _is_date_from_nov_13_2026(stamp, require_date=True):
+                                await _close_question_drawer(page)
+                                continue
                             sku_detected = _extract_sku(drawer_text, q_cell_text)
                             q_full_text = _extract_question_text(drawer_text, fallback=q_cell_text)
                             q_id = f"{q_full_text[:35]}_{sku_detected or 'any'}"
@@ -1173,8 +861,8 @@ async def auto_reply_unanswered_questions(
                                 for _ in range(3):
                                     await page.keyboard.press("PageDown")
                                     await asyncio.sleep(0.1)
-                            except Exception:
-                                pass
+                            except Exception as exc:
+                                logging.getLogger(__name__).debug('Playwright: %s', type(exc).__name__)
 
                             print(f"👉 [Клик в поле ввода вопроса ({Q_INPUT_PT[0]}, {Q_INPUT_PT[1]})]")
                             await page.mouse.click(Q_INPUT_PT[0], Q_INPUT_PT[1])
@@ -1222,8 +910,8 @@ async def auto_reply_unanswered_questions(
 
                 try:
                     await page.screenshot(path=str(LOGS_DIR / "ozon_questions_run.png"))
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logging.getLogger(__name__).debug('Playwright: %s', type(exc).__name__)
             finally:
                 await _close_browser_context_safe(context)
 

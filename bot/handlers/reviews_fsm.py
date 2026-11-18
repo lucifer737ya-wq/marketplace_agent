@@ -1,10 +1,8 @@
-import asyncio
 import html
-import json
-import urllib.error
-import urllib.request
-from typing import Any, Dict, List, Optional
+import logging
+from contextlib import suppress
 
+from aiogram.exceptions import TelegramAPIError
 from aiogram import F, Router
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
@@ -21,7 +19,7 @@ from products_catalog import (
     LEGAL_COMPLIANCE_INFO,
     get_catalog_product,
 )
-from services.common.ai_advisory_board import _extract_model_name, _is_supported_text_model
+from services.common.gemini import generate
 
 reviews_router = Router()
 
@@ -71,34 +69,7 @@ def _build_review_fallback_reply(product_meta: dict) -> str:
     )
 
 
-def _get_review_proxy_openers() -> List[urllib.request.OpenerDirector]:
-    openers: List[urllib.request.OpenerDirector] = []
-    proxy_url = str(getattr(settings, "LOCAL_PROXY_URL", "") or "").strip()
-    if proxy_url:
-        openers.append(
-            urllib.request.build_opener(
-                urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
-            )
-        )
-    openers.append(urllib.request.build_opener(urllib.request.ProxyHandler({})))
-    return openers
-
-
-def generate_review_reply_llm(sku: str, product_meta: dict, review_text: str) -> str:
-    """Генерация строгого ответа на отзыв с учетом каталога YaSoKo и каскадом моделей."""
-    raw_model = _extract_model_name(str(getattr(settings, "GEMINI_MODEL", "") or "gemini-2.5-flash"))
-    candidate_pool = [
-        raw_model,
-        "gemini-2.5-flash",
-        "gemini-2.5-flash-lite",
-        "gemini-2.5-pro",
-        "gemini-2.0-flash",
-    ]
-    models_to_try = list(dict.fromkeys(m for m in candidate_pool if _is_supported_text_model(m)))
-    api_key = str(getattr(settings, "GEMINI_API_KEY", "") or "").strip().strip('"').strip("'")
-    if not api_key:
-        return _build_review_fallback_reply(product_meta)
-
+async def generate_review_reply_llm(sku: str, product_meta: dict, review_text: str) -> str:
     art = product_meta.get("art", sku)
     shade = product_meta.get("shade", "")
     color = product_meta.get("color_name", "")
@@ -142,51 +113,11 @@ def generate_review_reply_llm(sku: str, product_meta: dict, review_text: str) ->
         f"Текст отзыва: \"\"\"{review_text}\"\"\""
     )
 
-    for opener in _get_review_proxy_openers():
-        for model in models_to_try:
-            gen_config: Dict[str, Any] = {
-                "temperature": 0.35,
-                "maxOutputTokens": 1500,
-            }
-            if "2.5-flash" in model:
-                gen_config["thinkingConfig"] = {"thinkingBudget": 0}
-
-            payload = {
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": gen_config,
-            }
-            req_data = json.dumps(payload).encode("utf-8")
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
-            req = urllib.request.Request(
-                url,
-                data=req_data,
-                headers={"Content-Type": "application/json"},
-            )
-
-            try:
-                with opener.open(req, timeout=30) as resp:
-                    body = json.loads(resp.read().decode("utf-8"))
-
-                candidates = body.get("candidates") or []
-                if candidates:
-                    parts = (candidates[0].get("content") or {}).get("parts") or []
-                    text_chunks = [
-                        str(p.get("text") or "")
-                        for p in parts
-                        if isinstance(p, dict) and not p.get("thought", False) and p.get("text")
-                    ]
-                    reply = "".join(text_chunks).strip()
-                    if reply:
-                        return reply
-
-            except urllib.error.HTTPError as http_err:
-                if http_err.code in (401, 403):
-                    break
-                continue
-            except Exception:
-                continue
-
-    return _build_review_fallback_reply(product_meta)
+    try:
+        text, _ = await generate(prompt, max_tokens=1500, fast=True)
+        return text
+    except RuntimeError:
+        return _build_review_fallback_reply(product_meta)
 
 
 @reviews_router.message(F.text == "💬 Ответ на отзыв")
@@ -242,22 +173,19 @@ async def process_review_text(message: Message, state: FSMContext) -> None:
             prod = res.scalars().first()
             if prod and prod.title and not product_meta.get("title"):
                 product_meta["title"] = prod.title
-    except Exception:
-        pass
+    except Exception as exc:
+        logging.getLogger(__name__).warning("Каталог БД недоступен: %s", type(exc).__name__)
 
     status_msg = await message.answer("⏳ Составляю персонализированный ответ по стандартам YaSoKo...")
     try:
-        reply_text = await asyncio.to_thread(
-            generate_review_reply_llm,
+        reply_text = await generate_review_reply_llm(
             sku=sku_input,
             product_meta=product_meta,
             review_text=review_text,
         )
     except Exception as exc:
-        try:
+        with suppress(TelegramAPIError):
             await status_msg.delete()
-        except Exception:
-            pass
         await state.clear()
         await message.answer(
             f"❌ Ошибка генерации ответа на отзыв: <code>{html.escape(str(exc))}</code>",
@@ -266,10 +194,8 @@ async def process_review_text(message: Message, state: FSMContext) -> None:
         )
         return
 
-    try:
+    with suppress(TelegramAPIError):
         await status_msg.delete()
-    except Exception:
-        pass
     await state.clear()
 
     product_header = f"{product_meta.get('title')} (арт. {sku_input})"

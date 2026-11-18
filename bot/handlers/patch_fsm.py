@@ -1,3 +1,5 @@
+from contextlib import suppress
+from aiogram.exceptions import TelegramAPIError
 import html
 
 from aiogram import F, Router
@@ -8,7 +10,7 @@ from aiogram.types import Message
 
 from bot.keyboards import get_main_menu_keyboard
 from config import settings
-from maintenance.supervisor import apply_code_patch, get_project_tree_overview
+from maintenance.supervisor import apply_code_patch, get_project_tree_overview, queue_if_supervised
 
 patch_router = Router()
 
@@ -65,21 +67,23 @@ async def process_patch_instruction(message: Message, state: FSMContext) -> None
         target_file = parts[0]
         instruction = parts[1]
 
+    await state.clear()
+    if queue_if_supervised('patch', instruction, target_file):
+        await message.answer('Запрос принят. Супервизор проверит код, перезапустит worker и сообщит результат.')
+        return
     wait_msg = await message.answer("⏳ Определяю затронутый модуль, генерирую полный код и проверяю AST-синтаксис...")
     try:
         success, detail = await apply_code_patch(instruction=instruction, target_file_rel=target_file)
     except Exception as exc:
         success, detail = False, f"Ошибка при обращении к LLM: {exc}"
 
-    try:
+    with suppress(TelegramAPIError):
         await wait_msg.delete()
-    except Exception:
-        pass
 
     await state.clear()
     if success:
         await message.answer(
-            f"✅ <b>Патч успешно применен:</b>\n{detail}",
+            f"✅ <b>Патч успешно применен:</b>\n{html.escape(detail)}",
             parse_mode="HTML",
             reply_markup=get_main_menu_keyboard(),
         )

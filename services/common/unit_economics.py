@@ -1,3 +1,4 @@
+import math
 from dataclasses import dataclass, field
 from typing import List, Dict, Any
 from config import settings
@@ -13,7 +14,7 @@ class PricingRecommendation:
     locked_by_promo: bool
     promo_max_price: float
     stock_critical: bool
-    days_of_stock: float
+    days_of_stock: float | None
     alternatives: List[Dict[str, Any]] = field(default_factory=list)
 
 
@@ -33,6 +34,9 @@ def calculate_floor_price(
     Floor = (Себестоимость + Упаковка + Логистика FBO + Доставка первой мили + Прибыль) /
             (1 - (Комиссия + Эквайринг + Налог 6% + ДРР))
     """
+    if any(not math.isfinite(x) or x < 0 for x in (cost_price, packaging_cost, fbo_logistics_cost,
+            first_mile_unit_cost, target_profit, commission_rate, acquiring_rate, tax_rate, drr_rate)):
+        raise ValueError("Нужны конечные неотрицательные суммы и ставки")
     numerator = (
         cost_price
         + packaging_cost
@@ -78,8 +82,8 @@ def evaluate_product_decision(
         drr_rate=drr_rate,
     )
 
-    days_of_stock = round(stock_fbo / max(avg_daily_sales, 0.1), 1)
-    stock_critical = days_of_stock < 2.0
+    days_of_stock = round(stock_fbo / avg_daily_sales, 1) if avg_daily_sales > 0 else None
+    stock_critical = days_of_stock is not None and days_of_stock < 2.0
 
     in_trap = marketplace.lower() == "ozon" and floor_price > 300.0
     if marketplace.lower() == "ozon" and floor_price > 300.0:

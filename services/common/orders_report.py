@@ -1,7 +1,7 @@
 import asyncio
 import html
 import math
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -10,7 +10,7 @@ from sqlalchemy.exc import IntegrityError
 
 from config import settings
 from database.crud import _db_write_lock
-from database.models import OrderRecord, Product, get_db_session, utcnow_naive
+from database.models import OrderRecord, Product, get_db_session
 from products_catalog import OZON_SKU_TO_ART, WB_SKU_TO_ART
 from services.ozon.seller_api import OzonSellerAPI
 from services.wb.statistics_api import WBStatisticsAPI
@@ -106,18 +106,12 @@ def _safe_int(value: Any, default: int = 0) -> int:
     return int(parsed)
 
 
-def _parse_order_datetime(value: Any) -> datetime:
-    if isinstance(value, datetime):
-        return value.replace(tzinfo=None) if value.tzinfo is not None else value
-    if isinstance(value, str):
-        raw = value.strip().replace("Z", "+00:00")
-        if raw:
-            try:
-                dt = datetime.fromisoformat(raw)
-                return dt.replace(tzinfo=None) if dt.tzinfo is not None else dt
-            except ValueError:
-                pass
-    return utcnow_naive()
+def _parse_order_datetime(value: Any) -> Optional[datetime]:
+    try:
+        dt = value if isinstance(value, datetime) else datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+    except ValueError:
+        return None  # do not backdate historical sales to the report run
+    return dt.astimezone(timezone.utc).replace(tzinfo=None) if dt.tzinfo else dt
 
 
 def _resolve_order_sku(raw_sku: Any, marketplace: str) -> str:
@@ -147,8 +141,10 @@ def _fmt_money(value: float) -> str:
 
 
 def _fmt_expense(value: float) -> str:
-    amt = max(_safe_float(value, 0.0), 0.0)
-    if amt < 0.005:
+    amt = _safe_float(value)
+    if amt < -0.005:
+        return f"+{_fmt_money(-amt)} ₽"
+    if abs(amt) < 0.005:
         return "0 ₽"
     return f"-{_fmt_money(amt)} ₽"
 
@@ -273,20 +269,23 @@ def _prepare_clean_orders(ozon_fin: Any, wb_fin: Any) -> List[Dict[str, Any]]:
             if not isinstance(ord_data, dict):
                 continue
             order_id = str(ord_data.get("order_id") or "").strip()
-            if not order_id or order_id in deduped:
+            if not order_id or order_id in deduped or ord_data.get("price") is None:
                 continue
             mp = str(ord_data.get("marketplace") or default_mp).strip().lower()
             if mp not in {"ozon", "wb"}:
                 mp = default_mp
             raw_sku = str(ord_data.get("sku") or "").strip()
+            created = _parse_order_datetime(ord_data.get("created_at"))
+            if created is None:
+                continue
             deduped[order_id] = {
                 "order_id": order_id[:128],
                 "marketplace": mp,
                 "sku": _resolve_order_sku(raw_sku, mp)[:64],
-                "created_at": _parse_order_datetime(ord_data.get("created_at")),
+                "created_at": created,
                 "price": round(_safe_nonneg(ord_data.get("price")), 2),
-                "commission": round(_safe_nonneg(ord_data.get("commission")), 2),
-                "logistics": round(_safe_nonneg(ord_data.get("logistics")), 2),
+                "commission": round(_safe_float(ord_data.get("commission")), 2),
+                "logistics": round(_safe_float(ord_data.get("logistics")), 2),
                 "status": str(ord_data.get("status") or "ordered").strip()[:64],
             }
     return list(deduped.values())
@@ -389,13 +388,13 @@ async def sync_and_generate_orders_report(
         )
 
         oz_sales = round(_safe_float(ozon_fin.get("sales_total")), 2)
-        oz_comm = round(_safe_nonneg(ozon_fin.get("commission")), 2)
+        oz_comm = round(_safe_float(ozon_fin.get("commission")), 2)
 
-        oz_d_dir = round(_safe_nonneg(ozon_fin.get("deliv_direct")), 2)
-        oz_d_ret = round(_safe_nonneg(ozon_fin.get("deliv_return")), 2)
-        oz_d_ho = round(_safe_nonneg(ozon_fin.get("deliv_ozon_handover")), 2)
+        oz_d_dir = round(_safe_float(ozon_fin.get("deliv_direct")), 2)
+        oz_d_ret = round(_safe_float(ozon_fin.get("deliv_return")), 2)
+        oz_d_ho = round(_safe_float(ozon_fin.get("deliv_ozon_handover")), 2)
         oz_deliv = (
-            round(_safe_nonneg(ozon_fin.get("deliv_total")), 2)
+            round(_safe_float(ozon_fin.get("deliv_total")), 2)
             if ozon_fin.get("deliv_total") is not None
             else round(oz_d_dir + oz_d_ret + oz_d_ho, 2)
         )
@@ -403,29 +402,29 @@ async def sync_and_generate_orders_report(
             _div_rub(oz_deliv, oz_count) if oz_count > 0 else None
         )
 
-        oz_dropoff = _round_rub(_safe_nonneg(ozon_fin.get("partner_dropoff")))
-        oz_pack = _round_rub(_safe_nonneg(ozon_fin.get("partner_pack")))
-        oz_pret = _round_rub(_safe_nonneg(ozon_fin.get("partner_returns")))
-        raw_oz_acq = _round_rub(_safe_nonneg(ozon_fin.get("acquiring")))
-        oz_star = _round_rub(_safe_nonneg(ozon_fin.get("star_products")))
-        oz_plm = _round_rub(_safe_nonneg(ozon_fin.get("partner_last_mile")))
+        oz_dropoff = _round_rub(_safe_float(ozon_fin.get("partner_dropoff")))
+        oz_pack = _round_rub(_safe_float(ozon_fin.get("partner_pack")))
+        oz_pret = _round_rub(_safe_float(ozon_fin.get("partner_returns")))
+        raw_oz_acq = _round_rub(_safe_float(ozon_fin.get("acquiring")))
+        oz_star = _round_rub(_safe_float(ozon_fin.get("star_products")))
+        oz_plm = _round_rub(_safe_float(ozon_fin.get("partner_last_mile")))
 
         # Если эквайринг еще не отражен в cash-flow Ozon при положительных продажах,
         # учитываем эталонный эквайринг 1.5% (settings.ACQUIRING_RATE) без двойного списания.
-        oz_fbo = _round_rub(_safe_nonneg(ozon_fin.get("fbo_storage")))
-        oz_cpo = _round_rub(_safe_nonneg(ozon_fin.get("promo_cpo")))
-        oz_cpc = _round_rub(_safe_nonneg(ozon_fin.get("promo_cpc")))
+        oz_fbo = _round_rub(_safe_float(ozon_fin.get("fbo_storage")))
+        oz_cpo = _round_rub(_safe_float(ozon_fin.get("promo_cpo")))
+        oz_cpc = _round_rub(_safe_float(ozon_fin.get("promo_cpc")))
         oz_ads = (
-            _round_rub(_safe_nonneg(ozon_fin.get("ads_total")))
+            _round_rub(_safe_float(ozon_fin.get("ads_total")))
             if ozon_fin.get("ads_total") is not None
             else _round_rub(_to_dec(oz_cpo) + _to_dec(oz_cpc))
         )
-        oz_fines = _round_rub(_safe_nonneg(ozon_fin.get("other_fines")))
-        oz_decomp = _round_rub(_safe_nonneg(ozon_fin.get("decompensations")))
-        oz_mutual = _round_rub(_safe_nonneg(ozon_fin.get("mutual_settlements")))
+        oz_fines = _round_rub(_safe_float(ozon_fin.get("other_fines")))
+        oz_decomp = _round_rub(_safe_float(ozon_fin.get("decompensations")))
+        oz_mutual = _round_rub(_safe_float(ozon_fin.get("mutual_settlements")))
 
         oz_part_no_acq = (
-            _round_rub(_safe_nonneg(ozon_fin.get("partners_total")))
+            _round_rub(_safe_float(ozon_fin.get("partners_total")))
             if ozon_fin.get("partners_total") is not None
             else _round_rub(
                 _to_dec(oz_dropoff)
@@ -447,7 +446,7 @@ async def sync_and_generate_orders_report(
         )
 
         oz_acq_estimated = False
-        if raw_oz_acq > 0.0:
+        if raw_oz_acq != 0.0 or ozon_fin.get("acquiring_reported"):
             oz_acq = raw_oz_acq
             oz_acq_delta = 0.0
         elif oz_sales > 0.0 and acq_rate > 0.0:
@@ -456,7 +455,7 @@ async def sync_and_generate_orders_report(
             lump_sum_already_covers_acq = (
                 "acquiring" not in ozon_fin
                 and raw_tot_ded is not None
-                and _safe_nonneg(raw_tot_ded) >= known_oz_ded_no_acq + est_oz_acq - 0.05
+                and _safe_float(raw_tot_ded) >= known_oz_ded_no_acq + est_oz_acq - 0.05
             )
             oz_acq = est_oz_acq
             oz_acq_delta = 0.0 if lump_sum_already_covers_acq else est_oz_acq
@@ -488,7 +487,7 @@ async def sync_and_generate_orders_report(
             + _to_dec(oz_mutual)
         )
         if ozon_fin.get("total_deductions") is not None:
-            oz_ded_tot = _round_rub(_to_dec(_safe_nonneg(ozon_fin.get("total_deductions"))) + _to_dec(oz_acq_delta))
+            oz_ded_tot = _round_rub(_to_dec(_safe_float(ozon_fin.get("total_deductions"))) + _to_dec(oz_acq_delta))
         else:
             oz_ded_tot = computed_oz_ded
 
@@ -516,7 +515,7 @@ async def sync_and_generate_orders_report(
 
         ozon_block = (
             f"🔵 <b>OZON ({oz_source}):</b>\n"
-            f"• Заказано единиц: <b>{oz_count} шт.</b>\n"
+            f"• Реализовано заказов (отправлений): <b>{oz_count}</b>\n"
             f"• <b>Продажи и возвраты: {_fmt_money(oz_sales)} ₽</b> ({oz_sales_share})\n"
             f"• <b>Начисления МП (всего): {_fmt_expense(oz_ded_tot)}</b> ({_pct(oz_ded_tot, oz_sales)})\n\n"
             f"<b>Детализация расходов Ozon:</b>\n"
@@ -569,27 +568,27 @@ async def sync_and_generate_orders_report(
             else wb_rev_s
         )
         wb_ret = round(_safe_nonneg(wb_fin.get("returns_amount")), 2)
-        wb_comm = round(_safe_nonneg(wb_fin.get("commission")), 2)
+        wb_comm = round(_safe_float(wb_fin.get("commission")), 2)
 
-        raw_wb_acq = _round_rub(_safe_nonneg(wb_fin.get("acquiring")))
+        raw_wb_acq = _round_rub(_safe_float(wb_fin.get("acquiring")))
         wb_acq_base = max(wb_rev_b, wb_rev_s, 0.0)
 
-        wb_log_ret = _round_rub(_safe_nonneg(wb_fin.get("logistics_return")))
+        wb_log_ret = _round_rub(_safe_float(wb_fin.get("logistics_return")))
         if wb_fin.get("logistics") is not None:
-            wb_log = _round_rub(_safe_nonneg(wb_fin.get("logistics")))
+            wb_log = _round_rub(_safe_float(wb_fin.get("logistics")))
             wb_log_dir = (
-                _round_rub(_safe_nonneg(wb_fin.get("logistics_direct")))
+                _round_rub(_safe_float(wb_fin.get("logistics_direct")))
                 if wb_fin.get("logistics_direct") is not None
                 else _round_rub(max(_to_dec(wb_log) - _to_dec(wb_log_ret), Decimal("0")))
             )
         else:
-            wb_log_dir = _round_rub(_safe_nonneg(wb_fin.get("logistics_direct")))
+            wb_log_dir = _round_rub(_safe_float(wb_fin.get("logistics_direct")))
             wb_log = _round_rub(_to_dec(wb_log_dir) + _to_dec(wb_log_ret))
 
-        wb_stor = _round_rub(_safe_nonneg(wb_fin.get("storage")))
-        wb_acc = _round_rub(_safe_nonneg(wb_fin.get("acceptance")))
-        wb_ads = _round_rub(_safe_nonneg(wb_fin.get("ads")))
-        wb_other = _round_rub(_safe_nonneg(wb_fin.get("other_services")))
+        wb_stor = _round_rub(_safe_float(wb_fin.get("storage")))
+        wb_acc = _round_rub(_safe_float(wb_fin.get("acceptance")))
+        wb_ads = _round_rub(_safe_float(wb_fin.get("ads")))
+        wb_other = _round_rub(_safe_float(wb_fin.get("other_services")))
 
         known_wb_ded_no_acq = _round_rub(
             _to_dec(wb_comm)
@@ -600,8 +599,8 @@ async def sync_and_generate_orders_report(
             + _to_dec(wb_other)
         )
 
-        wb_acq_estimated = False
-        if raw_wb_acq > 0.0:
+        wb_acq_estimated = bool(wb_fin.get("acquiring_estimated"))
+        if wb_fin.get("acquiring") is not None:
             wb_acq = raw_wb_acq
             wb_acq_delta = 0.0
         elif wb_acq_base > 0.0 and acq_rate > 0.0:
@@ -610,7 +609,7 @@ async def sync_and_generate_orders_report(
             wb_lump_covers_acq = (
                 "acquiring" not in wb_fin
                 and raw_wb_tot_ded is not None
-                and _safe_nonneg(raw_wb_tot_ded) >= known_wb_ded_no_acq + est_wb_acq - 0.05
+                and _safe_float(raw_wb_tot_ded) >= known_wb_ded_no_acq + est_wb_acq - 0.05
             )
             wb_acq = est_wb_acq
             wb_acq_delta = 0.0 if wb_lump_covers_acq else est_wb_acq
@@ -621,7 +620,7 @@ async def sync_and_generate_orders_report(
 
         computed_wb_ded = _round_rub(_to_dec(known_wb_ded_no_acq) + _to_dec(wb_acq))
         if wb_fin.get("total_deductions") is not None:
-            wb_ded_tot = _round_rub(_to_dec(_safe_nonneg(wb_fin.get("total_deductions"))) + _to_dec(wb_acq_delta))
+            wb_ded_tot = _round_rub(_to_dec(wb_fin.get("total_deductions")) + _to_dec(wb_acq_delta))
         else:
             wb_ded_tot = computed_wb_ded
 
@@ -649,7 +648,7 @@ async def sync_and_generate_orders_report(
 
         wb_block = (
             f"🟣 <b>WILDBERRIES ({wb_source}):</b>\n"
-            f"• Заказано единиц: <b>{wb_count} шт.</b> (Отмены/возвраты: {_fmt_money(wb_ret)} ₽)\n"
+            f"• Строк реализации: <b>{wb_count}</b> (Отмены/возвраты: {_fmt_money(wb_ret)} ₽)\n"
             f"• <b>Продажи в ценах ЛК (priceWithDisc): {_fmt_money(wb_rev_s)} ₽</b> ({wb_sales_share})\n"
             f"• <b>Цена для покупателя с СПП (база УСН): {_fmt_money(wb_rev_b)} ₽</b>\n"
             f"• <b>Удержания WB (всего): {_fmt_expense(wb_ded_tot)}</b> ({_pct(wb_ded_tot, wb_rev_s)})\n\n"
@@ -699,7 +698,7 @@ async def sync_and_generate_orders_report(
         f"{wb_block}"
         f"➖➖➖➖➖➖➖➖➖➖\n"
         f"🏁 <b>СВОДНЫЙ ИТОГ (Ozon + WB):</b>\n"
-        f"• Всего единиц: <b>{tot_count} шт.</b>\n"
+        f"• Заказы Ozon + реализации WB: <b>{tot_count}</b>\n"
         f"• Общий оборот (в ценах ЛК): <b>{_fmt_money(tot_sales)} ₽</b>\n"
         f"• Все удержания маркетплейсов: <b>{_fmt_expense(tot_ded)}</b> ({_pct(tot_ded, tot_sales)}), в т.ч. эквайринг <b>{_fmt_expense(tot_acq)}</b>\n"
         f"• Себестоимость, упаковка и первая миля: <b>{_fmt_expense(tot_cogs)}</b> ({_pct(tot_cogs, tot_sales)})\n"

@@ -1,14 +1,10 @@
 """Контрактные тесты этапа 2 без обращений к реальным маркетплейсам."""
-import os
-import tempfile
 import unittest
-from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
-_tmp = tempfile.TemporaryDirectory()
-os.environ.update(TG_BOT_TOKEN='123456:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi', TG_ADMIN_ID='123',
-                  OZON_CLIENT_ID='test', OZON_API_KEY='test', WB_API_TOKEN='test',
-                  GEMINI_API_KEY='test', DB_URL='sqlite+aiosqlite:///' + str(Path(_tmp.name) / 'test.db'))
+from tests import offline
+
+offline.require_isolation()  # before importing application settings
 
 from database.models import init_db, close_db
 from database.crud import create_pending_action, get_pending_action, claim_price_action, finish_price_action
@@ -66,7 +62,7 @@ class TestAsync(unittest.IsolatedAsyncioTestCase):
 
     async def test_wb_inventory(self):
         wb=WBStatisticsAPI(); wb._read_disk_cache=lambda *args, **kwargs: None; wb._write_disk_cache=lambda *args: None
-        wb.fetch_wb_tariffs=AsyncMock(return_value={'commission_rate':.25,'logistics_rub':55})
+        wb.fetch_wb_tariffs=AsyncMock(return_value={'subjects':{}, 'warehouses':{}})
         async def request(method,url,params=None,json_data=None):
             if '/list/goods/filter' in url:
                 return {'data':{'listGoods':[{'nmID':123,'vendorCode':'1001','sizes':[{'discountedPrice':299}]}]}}
@@ -74,6 +70,9 @@ class TestAsync(unittest.IsolatedAsyncioTestCase):
                 return {'cards':[{'nmID':123,'sizes':[{'skus':['abc']}]}], 'cursor':{'total':1}}
             if '/warehouses' in url: return [{'id':1},{'id':1},{'id':2}]
             if '/stocks/' in url: return {'stocks':[{'sku':'abc','amount':2},{'sku':'abc','amount':2}]}
+            if url.endswith('/supplier/stocks'):
+                from services.common.market_api import APIStatusError
+                raise APIStatusError(404, 'use analytics')
             if url.endswith('/warehouse_remains'): return {'data':{'taskId':'test'}}
             if url.endswith('/status'): return {'data':{'status':'done'}}
             if url.endswith('/download'): return [{'nmId':123,'barcode':'abc','techSize':'0','warehouses':[{'warehouseName':'Всего находится на складах','quantity':5}]}]
@@ -87,7 +86,7 @@ class TestAsync(unittest.IsolatedAsyncioTestCase):
         oz=OzonSellerAPI(); oz._request=AsyncMock(return_value={'result':[{'offer_id':'1001','updated':True}]})
         await oz.update_price('123','1001',299)
         item=oz._request.await_args.args[2]['prices'][0]
-        self.assertNotIn('old_price',item); self.assertNotIn('min_price',item)
+        self.assertEqual(item, {'product_id':123, 'offer_id':'1001', 'price':'299.00', 'auto_action_enabled':'UNKNOWN'})
 
     async def test_unauthorized(self):
         from types import SimpleNamespace

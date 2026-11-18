@@ -1,6 +1,8 @@
 import asyncio
+import html
 import json
 import os
+import re
 import socket
 import sys
 import time
@@ -10,7 +12,8 @@ from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.session.aiohttp import AiohttpSession
-from aiogram.exceptions import TelegramConflictError
+from aiogram.exceptions import TelegramAPIError, TelegramConflictError
+from aiogram.methods import GetUpdates
 from aiogram.filters import Command, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.types import BotCommand, FSInputFile, Message
@@ -18,8 +21,10 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
-from config import LOGS_DIR, settings
-from database.crud import bulk_update_product_market_state
+from config import LOGS_DIR, prepare_runtime_dirs, settings
+from services.common.routes import proxy_routes, remember_route
+from maintenance.supervisor import apply_code_patch, queue_if_supervised
+from database.crud import bulk_update_product_market_state, recover_interrupted_actions
 from database.models import close_db, init_db
 from maintenance.api_inspector import run_monthly_api_audit
 from maintenance.self_healer import run_full_self_check_and_heal
@@ -36,7 +41,8 @@ from services.ozon.browser_reviews import (
     auto_reply_unanswered_questions,
     auto_reply_unanswered_reviews,
 )
-from services.ozon.seller_api import CircuitBreakerOpenError, OzonSellerAPI
+from services.common.market_api import CircuitBreakerOpenError
+from services.ozon.seller_api import OzonSellerAPI
 from services.wb.statistics_api import WBStatisticsAPI
 
 from bot.handlers.callbacks import callbacks_router
@@ -57,10 +63,6 @@ def _ensure_stdio_streams() -> None:
         sys.stderr = open(log_path, "a", encoding="utf-8", buffering=1)
 
 
-_ensure_stdio_streams()
-
-PATCH_REQUEST_FILE = LOGS_DIR / "patch_request.json"
-TG_ROUTE_CACHE_FILE = LOGS_DIR / "tg_route_cache.json"
 MSK_TZ = ZoneInfo(settings.TIMEZONE)
 
 _WORKER_LOCK_SOCKET: Optional[socket.socket] = None
@@ -68,38 +70,7 @@ _BROWSER_JOB_LOCK = asyncio.Lock()
 _PRICE_AUDIT_LOCK = asyncio.Lock()
 
 
-def _load_cached_tg_proxy() -> Optional[str]:
-    """Читает последний проверенный рабочий маршрут к Telegram API."""
-    if TG_ROUTE_CACHE_FILE.exists():
-        try:
-            data = json.loads(TG_ROUTE_CACHE_FILE.read_text(encoding="utf-8"))
-            if "proxy" in data:
-                val = data["proxy"]
-                if val and str(val).strip() == settings.LOCAL_PROXY_URL:
-                    return str(val).strip()
-        except Exception:
-            pass
-    return settings.LOCAL_PROXY_URL or None
-
-
-def _save_cached_tg_proxy(proxy_url: Optional[str]) -> None:
-    try:
-        TG_ROUTE_CACHE_FILE.write_text(
-            json.dumps({"proxy": proxy_url, "updated_at": time.time()}, ensure_ascii=False),
-            encoding="utf-8",
-        )
-    except Exception:
-        pass
-
-
-def _make_tg_session(proxy_url: Optional[str], timeout: float = 60.0) -> AiohttpSession:
-    if not proxy_url:
-        raise ValueError("Для Telegram необходим LOCAL_PROXY_URL")
-    return AiohttpSession(proxy=proxy_url, timeout=timeout)
-
-
-_initial_proxy = _load_cached_tg_proxy()
-bot = Bot(token=settings.TG_BOT_TOKEN, session=_make_tg_session(_initial_proxy))
+bot: Optional[Bot] = None  # initialized after acquiring the process lock
 dp = Dispatcher()
 
 dp.include_router(costs_router)
@@ -111,56 +82,49 @@ dp.include_router(questions_router)
 
 
 async def ensure_working_telegram_route() -> None:
-    """Проверяет соединение с Telegram через локальный прокси с кэшированием рабочего маршрута и закрытием тестовых сессий."""
     global bot
-    try:
-        await bot.get_me()
-        _save_cached_tg_proxy(_initial_proxy)
-        return
-    except Exception as first_exc:
-        print(f"[Worker] Первичный маршрут TG ({_initial_proxy or 'direct'}) недоступен: {first_exc}", flush=True)
-
-    candidate_proxies: List[Optional[str]] = []
-    for cand in (settings.LOCAL_PROXY_URL,):
-        if cand != _initial_proxy and cand not in candidate_proxies:
-            candidate_proxies.append(cand)
-
-    for cand_proxy in candidate_proxies:
-        test_session = _make_tg_session(cand_proxy, timeout=15.0)
-        test_bot = Bot(token=settings.TG_BOT_TOKEN, session=test_session)
+    for proxy in proxy_routes('telegram'):
+        candidate = Bot(token=settings.TG_BOT_TOKEN, session=AiohttpSession(proxy=proxy, timeout=45))
         try:
-            await test_bot.get_me()
-        except Exception:
-            await test_bot.session.close()
+            await candidate.get_me()
+            remember_route('telegram', proxy)
+        except (TelegramAPIError, asyncio.TimeoutError, OSError):
+            await candidate.session.close()
             continue
-        else:
-            await test_bot.session.close()
-            old_session = bot.session
-            bot = Bot(token=settings.TG_BOT_TOKEN, session=_make_tg_session(cand_proxy))
-            await old_session.close()
-            _save_cached_tg_proxy(cand_proxy)
-            print(f"[Worker] Активирован и закэширован маршрут TG: {cand_proxy or 'direct'}", flush=True)
-            return
-
-    raise RuntimeError("Telegram недоступен через настроенный локальный прокси")
+        except BaseException:
+            await candidate.session.close()
+            raise
+        bot = candidate
+        return
+    raise RuntimeError('Telegram недоступен через настроенный локальный прокси')
 
 
 def _split_html_chunks(text: str, limit: int = 3900) -> List[str]:
-    if len(text) <= limit:
+    """Keep entities and formatting intact, even across one long AI-generated line."""
+    if len(text.encode('utf-16-le')) // 2 <= limit:
         return [text]
-    chunks: List[str] = []
-    current_lines: List[str] = []
-    current_len = 0
-    for line in text.splitlines(keepends=True):
-        if current_len + len(line) > limit and current_lines:
-            chunks.append("".join(current_lines))
-            current_lines = [line]
-            current_len = len(line)
-        else:
-            current_lines.append(line)
-            current_len += len(line)
-    if current_lines:
-        chunks.append("".join(current_lines))
+    chunks, parts, tags = [], [], []
+    used = 0
+    for match in re.finditer(r"</?[a-zA-Z][^<>]*>|&(?:#\d+|#x[0-9a-fA-F]+|[a-zA-Z]+);|.", text, re.S):
+        token = match[0]
+        tag = re.fullmatch(r"<(/?)([a-zA-Z][\w-]*)[^<>]*>", token)
+        if tag:
+            parts.append(token)
+            if tag[1]:
+                if tags and tag[2] == tags[-1][0]:
+                    tags.pop()
+            elif not token.endswith('/>'):
+                tags.append((tag[2], token))
+            continue
+        size = len(html.unescape(token).encode('utf-16-le')) // 2
+        if used and used + size > limit:
+            chunks.append(''.join(parts) + ''.join(f'</{name}>' for name, _ in reversed(tags)))
+            parts = [opening for _, opening in tags]
+            used = 0
+        parts.append(token)
+        used += size
+    if used:
+        chunks.append(''.join(parts))
     return chunks
 
 
@@ -206,7 +170,9 @@ async def write_heartbeat() -> None:
         print(f"[Worker] Ошибка записи heartbeat: {exc}", flush=True)
 
 
-async def _heartbeat_loop() -> None:
+async def _heartbeat_loop(polling_ready: asyncio.Event) -> None:
+    # A running heartbeat is a readiness signal, not just proof the event loop exists.
+    await polling_ready.wait()
     while True:
         await write_heartbeat()
         await asyncio.sleep(10)
@@ -227,9 +193,10 @@ def acquire_worker_single_instance_lock() -> bool:
 
     _WORKER_LOCK_SOCKET = sock
     try:
-        settings.WORKER_PID_FILE.write_text(str(os.getpid()), encoding="utf-8")
-    except Exception:
-        pass
+        settings.WORKER_PID_FILE.write_text(str(os.getpid()), encoding='utf-8')
+    except OSError:
+        release_worker_single_instance_lock()
+        raise
     return True
 
 
@@ -237,15 +204,10 @@ def release_worker_single_instance_lock() -> None:
     global _WORKER_LOCK_SOCKET
     if _WORKER_LOCK_SOCKET is not None:
         try:
-            _WORKER_LOCK_SOCKET.close()
-        except Exception:
-            pass
-        _WORKER_LOCK_SOCKET = None
-    try:
-        if settings.WORKER_PID_FILE.exists():
             settings.WORKER_PID_FILE.unlink(missing_ok=True)
-    except Exception:
-        pass
+        finally:
+            _WORKER_LOCK_SOCKET.close()
+            _WORKER_LOCK_SOCKET = None
 
 
 async def sync_marketplace_silent(mp_name: str) -> List[Dict[str, Any]]:
@@ -277,21 +239,19 @@ async def scheduled_marketplaces_poll() -> None:
 
 
 async def scheduled_reviews_and_questions_job() -> None:
-    """Запуск при старте и каждые 30 минут. До проверки фильтра даты — только dry-run."""
+    """Запуск при старте и каждые 30 минут, один persistent-контекст за раз."""
     if _BROWSER_JOB_LOCK.locked():
         print("[Worker] Предыдущий цикл Playwright еще выполняется, пропуск дублирующего запуска.", flush=True)
         return
 
     async with _BROWSER_JOB_LOCK:
-        try:
-            await auto_reply_unanswered_questions(headless=True, dry_run=True, max_per_run=15)
-        except Exception as exc:
-            print(f"[Worker] Ошибка автоответчика на вопросы Ozon: {exc}", flush=True)
-
-        try:
-            await auto_reply_unanswered_reviews(headless=True, dry_run=True, max_per_run=15)
-        except Exception as exc:
-            print(f"[Worker] Ошибка автоответчика на отзывы Ozon: {exc}", flush=True)
+        for job in (auto_reply_unanswered_reviews, auto_reply_unanswered_questions):
+            try:
+                result = await job(headless=True, dry_run=settings.OZON_REPLY_DRY_RUN, max_per_run=15)
+                if result['status'] not in {'success', 'limit_reached'}:
+                    await notify_admin(html.escape(str(result['message'])))
+            except Exception as exc:
+                await notify_admin(f'Ozon {job.__name__}: {html.escape(str(exc))}')
 
 
 async def scheduled_daily_price_audit_job() -> None:
@@ -346,6 +306,8 @@ async def scheduled_monthly_audit() -> None:
 
 async def scheduled_night_self_heal() -> None:
     """Тихая ночная самопроверка в 04:30. Присылает алерт только если были проблемы."""
+    if queue_if_supervised("night"):
+        return
     res = await run_full_self_check_and_heal()
     if res["total_issues"] > 0:
         details_txt = "\n".join(res["details"])
@@ -361,9 +323,10 @@ async def scheduled_night_self_heal() -> None:
 
 
 @dp.message(F.text.in_({"/start", "/menu"}))
-async def cmd_start_menu(message: Message) -> None:
+async def cmd_start_menu(message: Message, state: FSMContext) -> None:
     if not message.from_user or message.from_user.id != settings.TG_ADMIN_ID:
         return
+    await state.clear()
     await message.answer(
         "👋 Панель управления магазинами Ozon и Wildberries активна.\n"
         "Используйте кнопки меню внизу экрана для быстрого доступа:",
@@ -383,7 +346,7 @@ async def cmd_manual_pnl(message: Message) -> None:
         for chunk in _split_html_chunks(report):
             await message.answer(chunk, parse_mode="HTML")
     except Exception as exc:
-        await status_msg.edit_text(f"❌ Ошибка P&L отчета:\n<code>{exc}</code>", parse_mode="HTML")
+        await status_msg.edit_text(f"❌ Ошибка P&L отчета:\n<code>{html.escape(str(exc))}</code>", parse_mode="HTML")
 
 
 @dp.message(F.text == "🏆 ТОП-5 и Убыточные")
@@ -398,7 +361,7 @@ async def cmd_top5_report(message: Message) -> None:
         for chunk in _split_html_chunks(report):
             await message.answer(chunk, parse_mode="HTML")
     except Exception as exc:
-        await status_msg.edit_text(f"❌ Ошибка расчета ТОП-5:\n<code>{exc}</code>", parse_mode="HTML")
+        await status_msg.edit_text(f"❌ Ошибка расчета ТОП-5:\n<code>{html.escape(str(exc))}</code>", parse_mode="HTML")
 
 
 @dp.message(F.text == "🧠 ИИ-Советник (Разбор)")
@@ -420,7 +383,7 @@ async def cmd_ai_board(message: Message) -> None:
             caption="📎 Полный стратегический отчет Совета ИИ-специалистов (откройте в браузере)",
         )
     except Exception as exc:
-        await status_msg.edit_text(f"❌ Ошибка ИИ-Советника:\n<code>{exc}</code>", parse_mode="HTML")
+        await status_msg.edit_text(f"❌ Ошибка ИИ-Советника:\n<code>{html.escape(str(exc))}</code>", parse_mode="HTML")
 
 
 @dp.message(F.text == "📦 Отчет по заказам")
@@ -436,7 +399,7 @@ async def cmd_orders_report(message: Message) -> None:
             await message.answer(chunk, parse_mode="HTML")
     except Exception as exc:
         await status_msg.edit_text(
-            f"❌ <b>Ошибка при формировании отчета:</b>\n<code>{type(exc).__name__}: {exc}</code>",
+            f"❌ <b>Ошибка при формировании отчета:</b>\n<code>{type(exc).__name__}: {html.escape(str(exc))}</code>",
             parse_mode="HTML",
         )
 
@@ -485,15 +448,11 @@ async def cmd_patch_cli(message: Message, command: CommandObject) -> None:
         )
         return
 
-    PATCH_REQUEST_FILE.write_text(
-        json.dumps({"instruction": command.args.strip()}, ensure_ascii=False),
-        encoding="utf-8",
-    )
-    await message.answer(
-        "🛠 Запрос передан в <code>supervisor.py</code>. "
-        "Создается резервная копия, генерируется код и проверяется синтаксис...",
-        parse_mode="HTML",
-    )
+    if queue_if_supervised('patch', command.args):
+        await message.answer('Запрос принят супервизором. Результат придёт отдельным сообщением.')
+        return
+    ok, detail = await apply_code_patch(command.args)
+    await message.answer(('✅ ' if ok else '❌ ') + detail)
 
 
 @dp.message(F.text == "🔎 Пробив конкурентов")
@@ -514,7 +473,7 @@ async def cmd_competitors_audit(message: Message) -> None:
         for chunk in _split_html_chunks(report_text):
             await message.answer(chunk, parse_mode="HTML")
     except Exception as exc:
-        await wait_msg.edit_text(f"❌ Ошибка парсинга конкурентов: <code>{exc}</code>", parse_mode="HTML")
+        await wait_msg.edit_text(f"❌ Ошибка парсинга конкурентов: <code>{html.escape(str(exc))}</code>", parse_mode="HTML")
 
 
 @dp.message(F.text == "🛠 Самопроверка и автопочинка")
@@ -522,11 +481,14 @@ async def cmd_competitors_audit(message: Message) -> None:
 async def cmd_manual_self_heal(message: Message) -> None:
     if not message.from_user or message.from_user.id != settings.TG_ADMIN_ID:
         return
+    if queue_if_supervised('heal'):
+        await message.answer('Самопроверка передана супервизору; отчёт придёт сюда.')
+        return
     wait_msg = await message.answer("🔍 Запущена комплексная самопроверка всех модулей системы...")
     try:
         res = await run_full_self_check_and_heal()
     except Exception as exc:
-        await wait_msg.edit_text(f"❌ Ошибка самодиагностики: <code>{exc}</code>", parse_mode="HTML")
+        await wait_msg.edit_text(f"❌ Ошибка самодиагностики: <code>{html.escape(str(exc))}</code>", parse_mode="HTML")
         return
 
     await wait_msg.delete()
@@ -586,7 +548,7 @@ def configure_scheduler() -> AsyncIOScheduler:
         replace_existing=True,
     )
 
-    # 2. Автоответчик Ozon: при старте и каждые 30 минут, только dry-run до проверки фильтра даты
+    # 2. Автоответчик Ozon: при старте и каждые 30 минут, с проверкой даты публикации
     scheduler.add_job(
         scheduled_reviews_and_questions_job,
         IntervalTrigger(minutes=30, timezone=MSK_TZ),
@@ -662,32 +624,44 @@ def configure_scheduler() -> AsyncIOScheduler:
     return scheduler
 
 
-async def _run_polling_with_conflict_guard() -> None:
-    """Запускает long-polling с защитой от транзиентного TelegramConflictError при быстром перезапуске."""
-    max_conflict_retries = 3
-    for attempt in range(1, max_conflict_retries + 1):
+async def _run_polling_with_conflict_guard(polling_ready: asyncio.Event) -> None:
+    # aiogram 3 catches API errors inside _listen_updates. Observe the 409 in request middleware,
+    # stop this poller, and tell the watchdog not to start a competing getUpdates loop.
+    conflict = asyncio.Event()
+
+    async def observe(make_request, bot, method):
         try:
-            await bot.delete_webhook(drop_pending_updates=False)
-            await dp.start_polling(
-                bot,
-                handle_signals=False,
-                close_bot_session=False,
-                allowed_updates=dp.resolve_used_update_types(),
-            )
-            return
-        except TelegramConflictError as conflict_err:
-            if attempt >= max_conflict_retries:
-                raise
-            wait_sec = 4 * attempt
-            print(
-                f"[Worker] TelegramConflictError (попытка {attempt}/{max_conflict_retries}): {conflict_err}. "
-                f"Ожидание закрытия предыдущей сессии {wait_sec} сек...",
-                flush=True,
-            )
-            await asyncio.sleep(wait_sec)
+            result = await make_request(bot, method)
+            if isinstance(method, GetUpdates):
+                polling_ready.set()
+            return result
+        except TelegramConflictError:
+            if isinstance(method, GetUpdates):
+                conflict.set()
+            raise
+
+    bot.session.middleware(observe)
+    await bot.delete_webhook(drop_pending_updates=False)
+    polling = asyncio.create_task(dp.start_polling(bot, close_bot_session=False,
+                                  allowed_updates=dp.resolve_used_update_types()))
+    waiter = asyncio.create_task(conflict.wait())
+    try:
+        await asyncio.wait((polling, waiter), return_when=asyncio.FIRST_COMPLETED)
+        if conflict.is_set():
+            await dp.stop_polling()
+            await notify_admin('Получен Telegram 409. Остановите другой polling-процесс перед перезапуском.')
+            raise SystemExit(75)
+        await polling
+    finally:
+        waiter.cancel()
+        if not polling.done():
+            polling.cancel()
+        await asyncio.gather(waiter, polling, return_exceptions=True)
 
 
 async def main() -> None:
+    prepare_runtime_dirs()
+    _ensure_stdio_streams()
     if not acquire_worker_single_instance_lock():
         print(
             f"[Worker] Другой экземпляр worker.py уже удерживает порт {settings.WORKER_LOCK_PORT}. "
@@ -701,9 +675,11 @@ async def main() -> None:
 
     try:
         await init_db()
-        heartbeat_task = asyncio.create_task(_heartbeat_loop())
+        interrupted = await recover_interrupted_actions()
 
         await ensure_working_telegram_route()
+        if interrupted:
+            await notify_admin(f"Прерванные ценовые действия: {interrupted}. Сверьте результат в кабинете; повтор отключён.")
         try:
             await setup_bot_commands(bot)
         except Exception as exc:
@@ -711,26 +687,24 @@ async def main() -> None:
 
         scheduler = configure_scheduler()
         scheduler.start()
+        polling_ready = asyncio.Event()
+        heartbeat_task = asyncio.create_task(_heartbeat_loop(polling_ready))
 
-        await _run_polling_with_conflict_guard()
+        await _run_polling_with_conflict_guard(polling_ready)
     finally:
-        if heartbeat_task is not None:
-            heartbeat_task.cancel()
+        try:
+            if heartbeat_task is not None:
+                heartbeat_task.cancel()
+                await asyncio.gather(heartbeat_task, return_exceptions=True)
+            if scheduler is not None and scheduler.running:
+                scheduler.shutdown(wait=False)
+            if bot is not None:
+                await bot.session.close()
+        finally:
             try:
-                await heartbeat_task
-            except asyncio.CancelledError:
-                pass
-        if scheduler is not None and scheduler.running:
-            scheduler.shutdown(wait=False)
-        try:
-            await bot.session.close()
-        except Exception:
-            pass
-        try:
-            await close_db()
-        except Exception:
-            pass
-        release_worker_single_instance_lock()
+                await close_db()
+            finally:
+                release_worker_single_instance_lock()
 
 
 if __name__ == "__main__":

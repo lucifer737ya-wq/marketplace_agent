@@ -416,10 +416,10 @@ def get_catalog_product(identifier: str) -> Optional[Dict[str, Any]]:
 
 def resolve_catalog_external_id(sku: str, marketplace: str) -> str:
     """Возвращает известный nmID WB; Ozon SKU не является product_id."""
-    meta = get_catalog_product(sku)
-    if not meta:
-        return ""
-    mp = str(marketplace or "").strip().lower()
-    if mp == "wb" and meta.get("wb_sku"):
-        return str(meta["wb_sku"])
-    return ""
+    if str(marketplace).strip().lower() != 'wb':
+        return ''
+    # Never promote an Ozon SKU to a WB nmID by crossing marketplace namespaces.
+    key = str(sku).strip()
+    art = WB_SKU_TO_ART.get(key, key)
+    meta = PRODUCTS_CATALOG.get(art)
+    return str(meta['wb_sku']) if meta and meta.get('wb_sku') else ''

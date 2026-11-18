@@ -1,3 +1,5 @@
+from contextlib import suppress
+from aiogram.exceptions import TelegramAPIError
 import html
 
 from aiogram import F, Router
@@ -66,10 +68,8 @@ async def process_question_text(message: Message, state: FSMContext) -> None:
     try:
         answer_text = await generate_buyer_question_answer(user_text, sku=sku)
     except Exception as exc:
-        try:
+        with suppress(TelegramAPIError):
             await wait_msg.delete()
-        except Exception:
-            pass
         await state.clear()
         await message.answer(
             f"❌ Ошибка генерации ответа: <code>{html.escape(str(exc))}</code>",
@@ -78,10 +78,8 @@ async def process_question_text(message: Message, state: FSMContext) -> None:
         )
         return
 
-    try:
+    with suppress(TelegramAPIError):
         await wait_msg.delete()
-    except Exception:
-        pass
 
     await state.clear()
     await message.answer(

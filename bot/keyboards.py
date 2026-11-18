@@ -35,5 +35,5 @@ def get_main_menu_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=kb,
         resize_keyboard=True,
-        persistent=True,
+        is_persistent=True,
     )

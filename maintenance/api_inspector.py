@@ -17,7 +17,7 @@ async def run_monthly_api_audit() -> str:
     try:
         oz_items = await ozon.fetch_stocks_and_prices()
         oz_ms = int((time.perf_counter() - t0) * 1000)
-        oz_status = f"🟢 <b>OK</b> ({oz_ms} мс) — получено {len(oz_items)} SKU"
+        oz_status = f"🟢 <b>OK</b> ({oz_ms} мс) — срез с учётом кэша: {len(oz_items)} SKU"
     except Exception as exc:
         oz_status = f"🔴 <b>СБОЙ:</b> <code>{html.escape(str(exc)[:120])}</code>"
 
@@ -27,12 +27,8 @@ async def run_monthly_api_audit() -> str:
         wb_items = await wb.fetch_stocks_and_prices()
         wb_tariffs = await wb.fetch_wb_tariffs()
         wb_ms = int((time.perf_counter() - t1) * 1000)
-        comm_pct = float((wb_tariffs or {}).get("commission_rate", 0.0)) * 100.0
-        log_rub = float((wb_tariffs or {}).get("logistics_rub", 0.0))
-        wb_status = (
-            f"🟢 <b>OK</b> ({wb_ms} мс) — получено {len(wb_items)} SKU, "
-            f"комиссия {comm_pct:.1f}%, логистика {log_rub:.0f} ₽"
-        )
+        wb_status = (f"🟢 <b>OK</b> ({wb_ms} мс) — срез с учётом кэша: {len(wb_items)} SKU, "
+                     f"тарифы: {len(wb_tariffs['subjects'])} категорий, {len(wb_tariffs['warehouses'])} складов")
     except Exception as exc:
         wb_status = f"🔴 <b>СБОЙ:</b> <code>{html.escape(str(exc)[:120])}</code>"
 
