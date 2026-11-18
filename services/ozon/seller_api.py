@@ -1,20 +1,40 @@
 import asyncio
 import math
-from collections import Counter, defaultdict
+from collections import defaultdict
+from datetime import date, datetime, timedelta
 from decimal import Decimal
-from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 from config import settings
 from products_catalog import PRODUCTS_CATALOG
 from services.ozon.finance import (
+    accrual_category,
+    amount,
     book_statement,
-    book_transaction,
-    category,
     complete_statement,
     totals,
+    walk_fees,
 )
 from services.common.market_api import APIStatusError, MarketplaceClient, read_versions
+
+
+def _amount(node) -> float:
+    return amount(node)
+
+
+def _to_decimal(value) -> Decimal:
+    return Decimal(str(value or 0))
+
+
+def _date_range(start: date, end: date):
+    current = start
+    while current <= end:
+        yield current
+        current += timedelta(days=1)
+
+
+def _accrual_category(types, type_id, unknown: set, _money) -> str:
+    return accrual_category(types, type_id, unknown)
 
 
 class OzonSellerAPI(MarketplaceClient):
@@ -433,6 +453,42 @@ class OzonSellerAPI(MarketplaceClient):
         self._write_disk_cache(key, results)
         return results
 
+    async def _accrual_types(self) -> Dict[int, str]:
+        """Справочник типов начислений Ozon. Статичен: кэш на 7 дней + в памяти."""
+        cached = self._read_disk_cache("accrual_types", 7 * 86400)
+        if isinstance(cached, dict) and cached:
+            return {int(k): str(v) for k, v in cached.items()}
+        try:
+            data = await self._request("POST", "/v1/finance/accrual/types", {})
+        except (APIStatusError, RuntimeError):
+            # Справочник — удобство, а не условие: без него типы разбираются по имени.
+            return {}
+        rows = (data or {}).get("accrual_types") or []
+        types = {
+            int(row["id"]): str(row.get("name") or row.get("description") or row["id"])
+            for row in rows
+            if isinstance(row, dict) and row.get("id") is not None
+        }
+        if types:
+            self._write_disk_cache("accrual_types", types)
+        return types
+
+    async def _accruals_for_day(self, day: datetime) -> List[Dict[str, Any]]:
+        """Все начисления одного дня (/v1/finance/accrual/by-day, курсор last_id)."""
+        rows: List[Dict[str, Any]] = []
+        last_id = ""
+        for _ in range(200):  # предохранитель от бесконечной пагинации
+            body: Dict[str, Any] = {"date": day.strftime("%Y-%m-%d")}
+            if last_id:
+                body["last_id"] = last_id
+            data = await self._request("POST", "/v1/finance/accrual/by-day", body)
+            page = (data or {}).get("accruals") or []
+            rows.extend(row for row in page if isinstance(row, dict))
+            last_id = str((data or {}).get("last_id") or "")
+            if not last_id or not page:
+                return rows
+        raise RuntimeError("Ozon: пагинация начислений за день не завершена")
+
     async def fetch_real_finance_breakdown(
         self,
         days: int = 7,
@@ -440,8 +496,11 @@ class OzonSellerAPI(MarketplaceClient):
         custom_date_to: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
-        Разбирает точные статьи расходов и начислений из /v1/finance/cash-flow-statement/list (with_details=True)
-        с кэшированием /v1/analytics/data на 15 минут для предотвращения ошибки Ozon HTTP 429.
+        Финансы Ozon из действующего API начислений.
+
+        /v3/finance/transaction/list отключён Ozon 08.09.2026, поэтому источник —
+        /v1/finance/accrual/by-day (обход по суткам, курсор last_id), и при
+        доступности /v1/finance/cash-flow-statement/list для сверки периодов.
         """
         now_utc = datetime.utcnow()
         if custom_date_from and custom_date_to:
@@ -461,89 +520,96 @@ class OzonSellerAPI(MarketplaceClient):
             cached = self._read_disk_cache(cache_key, 900)
             if cached is not None:
                 return cached
-            # Transactions are limited to one calendar month per request.
-            orders_list, postings, billed_skus, operations = [], set(), set(), set()
-            ledger = defaultdict(Decimal)
-            posting_units = Counter()
-            current = start_dt.date()
-            while current <= end_dt.date():
-                next_month = (current.replace(day=28) + timedelta(days=4)).replace(
-                    day=1
-                )
-                last = min(end_dt.date(), next_month - timedelta(days=1))
-                page = 1
-                while True:
-                    tx = await self._request(
-                        "POST",
-                        "/v3/finance/transaction/list",
-                        {
-                            "filter": {
-                                "date": {
-                                    "from": f"{current}T00:00:00.000Z",
-                                    "to": f"{last}T23:59:59.999Z",
-                                },
-                                "transaction_type": "all",
-                            },
-                            "page": page,
-                            "page_size": 1000,
-                        },
+
+            types = await self._accrual_types()
+            orders_list: List[Dict[str, Any]] = []
+            postings: set[str] = set()
+            billed_skus: set[str] = set()
+            seen_accruals: set[str] = set()
+            operations = 0
+            unmapped: set[int] = set()
+            ledger: Dict[str, Decimal] = defaultdict(Decimal)
+
+            for day in _date_range(start_dt.date(), end_dt.date()):
+                for accrual in await self._accruals_for_day(datetime.combine(day, datetime.min.time())):
+                    accrual_id = str(
+                        accrual.get("accrual_id") or accrual.get("unit_number") or ""
                     )
-                    result = tx["result"]
-                    for op in result["operations"]:
-                        op_id = str(op["operation_id"])
-                        if op_id in operations:
-                            continue
-                        operations.add(op_id)
-                        book_transaction(ledger, op)
-                        items = Counter(
-                            str(i["sku"]) for i in op.get("items", []) if i.get("sku")
-                        )
-                        codes = [
-                            op.get("operation_type", ""),
-                            *(s.get("name", "") for s in op.get("services", [])),
-                        ]
-                        if any(
-                            category(c, "") in {"promo_cpc", "promo_cpo"} for c in codes
-                        ):
-                            billed_skus.update(items)
-                        accrual = float(op.get("accruals_for_sale") or 0)
-                        posting = (op.get("posting") or {}).get("posting_number")
-                        if (
-                            not posting
-                            or accrual <= 0
-                            or not items
-                            or op.get("type") != "orders"
-                        ):
-                            continue
-                        postings.add(posting)
-                        posting_units[posting] += sum(items.values())
-                        for sku, qty in items.items():
-                            # A mixed posting does not disclose the split of its sale price by SKU.
+                    if accrual_id and accrual_id in seen_accruals:
+                        continue
+                    if accrual_id:
+                        seen_accruals.add(accrual_id)
+                    operations += 1
+                    posting_number = str(accrual.get("unit_number") or "").strip()
+                    operation_date = str(accrual.get("date") or day.isoformat())
+                    units = 0
+                    for product in (accrual.get("posting") or {}).get("products") or []:
+                        units += 1
+                        commission = product.get("commission") or {}
+                        seller_price = _amount(commission.get("seller_price"))
+                        sale_commission = _amount(commission.get("sale_commission"))
+                        sale_amount = _amount(commission.get("sale_amount"))
+                        ledger["sales_total"] += _to_decimal(sale_amount or seller_price)
+                        ledger["commission"] -= _to_decimal(sale_commission)
+
+                        payload = walk_fees(product.get("delivery"), unmapped)
+                        for type_id, value in payload:
+                            # Начисления услуг приходят со знаком минус, а книга
+                            # расходов (как и в cash-flow) ведётся положительными.
+                            ledger[
+                                _accrual_category(types, type_id, unmapped, None)
+                            ] -= value
+                        sku = str(product.get("sku") or "").strip()
+                        if sku and posting_number:
                             orders_list.append(
                                 {
-                                    "order_id": f"oz:{op_id}:{sku}",
+                                    "order_id": f"oz:{accrual_id or posting_number}:{sku}",
                                     "marketplace": "ozon",
-                                    "posting": posting,
-                                    "commission": -float(op["sale_commission"]) / qty
-                                    if len(items) == 1
-                                    and op.get("sale_commission") is not None
-                                    else None,
+                                    "posting": posting_number,
                                     "sku": sku,
-                                    "created_at": op["operation_date"],
-                                    "quantity": qty,
+                                    "created_at": operation_date,
+                                    "quantity": 1,
                                     "status": "sold",
-                                    "price": accrual / qty if len(items) == 1 else None,
+                                    "price": round(
+                                        _amount(commission.get("seller_price"))
+                                        or _amount(commission.get("sale_price")),
+                                        2,
+                                    ),
+                                    "commission": round(-sale_commission, 2)
+                                    if sale_commission
+                                    else None,
                                 }
                             )
-                    if page >= int(result["page_count"]):
-                        break
-                    page += 1
-                current = next_month
 
-            for order in orders_list:
-                order["posting_units"] = posting_units[order["posting"]]
+                    for group in (accrual.get("item_fees") or {}).get("fees") or []:
+                        sku = str(group.get("sku") or "").strip()
+                        for fee in group.get("fees") or []:
+                            type_id = fee.get("type_id")
+                            value = _to_decimal(_amount(fee.get("accrued")))
+                            key = _accrual_category(types, type_id, unmapped, None)
+                            ledger[key] -= value
+                            if value < 0 and key in {"promo_cpc", "promo_cpo"} and sku:
+                                billed_skus.add(sku)
+
+                    non_item = accrual.get("non_item_fee")
+                    if isinstance(non_item, dict):
+                        type_id = non_item.get("type_id")
+                        ledger[
+                            _accrual_category(types, type_id, unmapped, None)
+                        ] -= _to_decimal(_amount(non_item.get("accrued")))
+
+                    if posting_number and units:
+                        postings.add(posting_number)
+
             report_totals = totals(ledger)
-            source = "транзакции"
+            source = f"начисления by-day ({period_label})"
+            if unmapped:
+                source += "; неизвестные типы начислений: " + ", ".join(
+                    f"{tid}({types.get(tid, '?')})" for tid in sorted(unmapped)[:6]
+                )
+            if operations == 0:
+                source += "; за период начислений нет"
+
             cash_flows, details_list = [], []
             page = 1
             try:
@@ -577,21 +643,24 @@ class OzonSellerAPI(MarketplaceClient):
                         for k in ("sales_total", "total_payout")
                     ):
                         report_totals = statement
-                        source = "cash-flow, сверено с транзакциями"
+                        source = f"cash-flow, сверено с начислениями ({period_label})"
                     else:
                         source += "; расхождение с cash-flow"
                 else:
                     source += "; cash-flow не покрывает период"
-            except APIStatusError as exc:
-                if exc.status not in {400, 404, 410, 429}:
-                    raise
-                source += f"; cash-flow недоступен (HTTP {exc.status})"
+            except (APIStatusError, RuntimeError) as exc:
+                status = getattr(exc, "status", None)
+                source += (
+                    f"; cash-flow недоступен (HTTP {status})"
+                    if status
+                    else "; cash-flow недоступен"
+                )
             report = dict(
                 report_totals,
                 orders=orders_list,
                 orders_count=len(postings),
                 billed_skus=sorted(billed_skus),
-                source=f"Ozon {source} ({period_label})",
+                source=f"Ozon {source}",
             )
             self._write_disk_cache(cache_key, report)
             return report

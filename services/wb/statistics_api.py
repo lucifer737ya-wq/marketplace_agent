@@ -7,8 +7,43 @@ from config import settings
 from services.common.market_api import APIStatusError, MarketplaceClient, read_versions
 
 
+def _latin(value: str) -> int | float | str | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+
+def _num(value) -> float:
+    """Суммы нового finance-api WB приходят строками, иногда с пробелами."""
+    if value is None or isinstance(value, bool):
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    cleaned = str(value).strip().replace("\u00a0", "").replace(" ", "").replace(",", ".")
+    parsed = _latin(cleaned)
+    return float(parsed) if isinstance(parsed, (int, float)) else 0.0
+
+
+def _pick(row: dict, *keys, default=None):
+    """Первое непустое поле из перечисленных имён (camelCase и snake_case)."""
+    for key in keys:
+        if row.get(key) is not None:
+            return row[key]
+    return default
+
+
+def _rrd(row: dict) -> int:
+    value = _latin(_pick(row, "rrdId", "rrd_id", default=0))
+    return int(value) if isinstance(value, (int, float)) else 0
+
+
 class WBStatisticsAPI(MarketplaceClient):
     STATS_URL = "https://statistics-api.wildberries.ru"
+    FINANCE_URL = "https://finance-api.wildberries.ru"
     PRICES_URL = "https://discounts-prices-api.wildberries.ru"
     COMMON_URL = "https://common-api.wildberries.ru"
     ADVERT_URL = "https://advert-api.wildberries.ru"
@@ -258,13 +293,7 @@ class WBStatisticsAPI(MarketplaceClient):
         date_7d = (end - timedelta(days=6)).isoformat()
 
         try:
-            raw_orders = await self._request(
-                "GET",
-                f"{self.STATS_URL}/api/v1/supplier/orders",
-                params={"dateFrom": date_7d, "flag": 0},
-            )
-            if not isinstance(raw_orders, list):
-                raise RuntimeError("WB: неизвестный формат заказов")
+            raw_orders = await self._fetch_orders_7d(date_7d, end_date)
             for o in raw_orders:
                 if (
                     o.get("isCancel")
@@ -277,7 +306,7 @@ class WBStatisticsAPI(MarketplaceClient):
                     sales_count_7d[nm] = sales_count_7d.get(nm, 0) + 1
                     if bp > 0:
                         buyer_price_map[nm] = bp
-        except RuntimeError:
+        except (RuntimeError, APIStatusError):
             sales_count_7d = None
 
         dedup_results: Dict[int, Dict[str, Any]] = {}
@@ -482,12 +511,137 @@ class WBStatisticsAPI(MarketplaceClient):
         self._write_disk_cache(key, result)
         return result
 
+    async def _fetch_report_details(
+        self, date_from: str, date_to: str, period: str = "weekly"
+    ) -> list:
+        """Детализации отчётов реализации через актуальный finance-api (camelCase)."""
+        rows: list = []
+        cursor = 0
+        for _ in range(500):
+            payload = {
+                "dateFrom": date_from,
+                "dateTo": date_to,
+                "rrdId": cursor,
+                "limit": 100000,
+                "period": period,
+            }
+            page = await self._request(
+                "POST",
+                f"{self.FINANCE_URL}/api/finance/v1/sales-reports/detailed",
+                json_data=payload,
+            )
+            if page is None or page == []:
+                return rows
+            if not isinstance(page, list):
+                raise RuntimeError("WB: неверный формат детализации отчёта")
+            fresh = [r for r in page if _rrd(r) > cursor]
+            rows.extend(fresh)
+            nxt = max(_rrd(r) for r in page)
+            if nxt <= cursor:
+                raise RuntimeError("WB: курсор rrdId не продвигается")
+            cursor = nxt
+            # Протокол WB: повторять, пока не вернётся пустой ответ (204).
+        raise RuntimeError("WB: пагинация детализации не завершена")
+
+    async def _fetch_report_positions(
+        self, date_from: str, date_to: str, period: str
+    ) -> list:
+        """Поиск в справочнике отчётов: закрытые отчёты могут не попасть в детализацию."""
+        positions: list = []
+        offset = 0
+        for _ in range(50):
+            page = await self._request(
+                "POST",
+                f"{self.FINANCE_URL}/api/finance/v1/sales-reports/list",
+                json_data={
+                    "dateFrom": date_from,
+                    "dateTo": date_to,
+                    "limit": 1000,
+                    "offset": offset,
+                    "period": period,
+                },
+            )
+            if page is None or page == []:
+                return positions
+            if not isinstance(page, list):
+                raise RuntimeError("WB: неверный формат списка отчётов")
+            positions.extend(r for r in page if isinstance(r, dict))
+            if len(page) < 1000:
+                return positions
+            offset += len(page)
+        return positions
+
+    async def _fetch_orders_7d(self, date_from: str, date_to: str) -> List[Dict[str, Any]]:
+        """Заказы за 7 дней: лента заказов (текущий метод), затем legacy-статистика.
+
+        GET /api/v1/supplier/orders закрыт WB в 2026 году, поэтому основным
+        источником стала «Лента заказов» POST /api/analytics/v1/order-feed.
+        Оба ответа приводятся к одному виду (nmId/date/finishedPrice/isCancel).
+        """
+
+        async def order_feed(_version):
+            rows: List[Dict[str, Any]] = []
+            snapshot, offset = None, 0
+            for _ in range(50):
+                body: Dict[str, Any] = {
+                    "selectedPeriod": {
+                        "start": f"{date_from}T00:00:00+03:00",
+                        "end": f"{date_to}T23:59:59+03:00",
+                    },
+                    "pagination": {"offset": offset, "limit": 10000},
+                }
+                if snapshot:
+                    body["pagination"]["snapshotTime"] = snapshot
+                data = await self._request(
+                    "POST", f"{self.ANALYTICS_URL}/api/analytics/v1/order-feed",
+                    json_data=body,
+                )
+                page = (data or {}).get("orders") or []
+                snapshot = snapshot or (data or {}).get("snapshotTime")
+                for row in page:
+                    rows.append(
+                        {
+                            "nmId": row.get("nmId"),
+                            "date": row.get("createdAt") or row.get("updatedAt"),
+                            "finishedPrice": row.get("sellerPrice"),
+                            "priceWithDisc": row.get("sellerPrice"),
+                            "isCancel": str(row.get("status") or "") in {"cancel"},
+                        }
+                    )
+                if len(page) < body["pagination"]["limit"]:
+                    return rows
+                offset += len(page)
+            return rows
+
+        async def legacy(_version):
+            data = await self._request(
+                "GET",
+                f"{self.STATS_URL}/api/v1/supplier/orders",
+                params={"dateFrom": date_from, "flag": 0},
+            )
+            if not isinstance(data, list):
+                raise RuntimeError("WB: неизвестный формат заказов")
+            return data
+
+        try:
+            return await order_feed(None)
+        except (RuntimeError, APIStatusError):
+            return await legacy(None)
+
     async def fetch_real_finance_breakdown(
         self,
         days: int = 7,
         custom_date_from: Optional[str] = None,
         custom_date_to: Optional[str] = None,
     ) -> dict:
+        """
+        Финансы Wildberries из действующего finance-api.
+
+        GET /api/v5/supplier/reportDetailByPeriod отключён WB (HTTP 404) — вместо
+        него POST /api/finance/v1/sales-reports/detailed на finance-api.wildberries.ru.
+        Если детализация за период пуста (отчёт ещё не сформирован), берутся
+        итоги закрытых отчётов из /sales-reports/list с явной пометкой источника.
+        """
         end = datetime.utcnow().date()
         date_from = custom_date_from or (end - timedelta(days=days - 1)).isoformat()
         date_to = custom_date_to or end.isoformat()
@@ -497,92 +651,129 @@ class WBStatisticsAPI(MarketplaceClient):
             if cached is not None:
                 return cached
 
-            async def read_report(version):
-                rows, cursor = [], 0
-                while True:
-                    params = {
-                        "dateFrom": date_from,
-                        "dateTo": date_to,
-                        "rrdid": cursor,
-                        "limit": 100000,
-                    }
-                    url = (
-                        f"{self.STATS_URL}/api/{version}/supplier/reportDetailByPeriod"
-                    )
-                    try:
-                        page = await self._request("GET", url, params=params)
-                    except APIStatusError as exc:
-                        if not cursor or exc.status != 429 or exc.retry_after > 60:
-                            raise
-                        # A working version can throttle the next page. Keep its cursor before
-                        # considering a complete restart on another version.
-                        await asyncio.sleep(exc.retry_after or 60)
-                        page = await self._request("GET", url, params=params)
-                    if page is None or page == []:
-                        return rows
-                    if not isinstance(page, list):
-                        raise RuntimeError("WB: неверный формат финансового отчёта")
-                    for r in page:
-                        if int(r["rrd_id"]) > cursor:
-                            rows.append(r)
-                    nxt = int(page[-1]["rrd_id"])
-                    if nxt <= cursor:
-                        raise RuntimeError("WB: курсор rrd_id не продвигается")
-                    cursor = nxt
+            rows = await self._fetch_report_details(date_from, date_to, "weekly")
+            if not rows:
+                rows = await self._fetch_report_details(date_from, date_to, "daily")
 
-            rows = await read_versions(("v5", "v3", "v1"), read_report)
-            ads = await self.fetch_wb_ad_spend(date_from, date_to)
-            report = self._finance_rows(rows, ads, date_from, date_to)
+            if rows:
+                ads = await self.fetch_wb_ad_spend(date_from, date_to)
+                report = self._finance_rows(rows, ads, date_from, date_to)
+                report["source"] = (
+                    f"finance-api WB, отчёт реализации ({date_from}..{date_to})"
+                )
+            else:
+                report = await self._finance_from_summaries(
+                    date_from, date_to, level="weekly"
+                )
             self._write_disk_cache(key, report)
             return report
 
+    async def _finance_from_summaries(
+        self, date_from: str, date_to: str, level: str
+    ) -> dict:
+        """Итоги закрытых отчётов: продажи, к перечислению, удержания, штрафы."""
+        reports = await self._fetch_report_positions(date_from, date_to, level)
+        if not reports:
+            reports = await self._fetch_report_positions(date_from, date_to, "daily")
+            level = "daily"
+        ads = await self.fetch_wb_ad_spend(date_from, date_to)
+        retail = for_pay = delivery = storage = acceptance = other = penalty = 0.0
+        cashback = 0.0
+        periods = []
+        for rep in reports:
+            retail += _num(rep.get("retailAmountSum"))
+            for_pay += _num(rep.get("forPaySum"))
+            delivery += _num(rep.get("deliveryServiceSum"))
+            storage += _num(rep.get("paidStorageSum"))
+            acceptance += _num(rep.get("paidAcceptanceSum"))
+            other += _num(rep.get("deductionSum"))
+            penalty += _num(rep.get("penaltySum"))
+            cashback += _num(rep.get("cashbackCommissionChangeSum"))
+            if rep.get("dateFrom") and rep.get("dateTo"):
+                periods.append(f"{rep['dateFrom']}..{rep['dateTo']}")
+        deductions = delivery + storage + acceptance + other + penalty + cashback + ads
+        commission = retail - for_pay - (delivery + storage + acceptance + other + penalty)
+        return {
+            "source": (
+                f"finance-api WB, закрытые {level} отчёты ({date_from}..{date_to})"
+                + ("; периодов: " + ", ".join(periods[:4]) if periods else "")
+            ),
+            "orders": [],
+            "orders_count": 0,
+            "revenue_seller": round(retail, 2),
+            "revenue_buyer": round(retail, 2),
+            "returns_amount": 0.0,
+            "for_pay": round(for_pay, 2),
+            "commission": round(commission, 2),
+            "acquiring": 0.0,
+            "acquiring_estimated": True,
+            "logistics": round(delivery, 2),
+            "logistics_direct": round(delivery, 2),
+            "logistics_return": 0.0,
+            "storage": round(storage, 2),
+            "acceptance": round(acceptance, 2),
+            "ads": round(ads, 2),
+            "other_services": round(other + penalty + cashback, 2),
+            "total_deductions": round(deductions, 2),
+            "total_payout": round(for_pay - ads, 2),
+            "summary_only": True,
+        }
+
     @staticmethod
     def _finance_rows(rows: list, ads: float, start: str, end: str) -> dict:
+        """
+        Разбор детализации отчёта реализации.
+
+        Понимает и новый finance-api (camelCase, суммы строками), и прежний
+        reportDetailByPeriod (snake_case) — на случай откатов на стороне WB.
+        """
         orders = []
         seller = buyer = payout = commission = acquiring = returns = 0.0
         delivery = reverse = storage = acceptance = other = 0.0
         estimated = False
         seen = set()
         for r in rows:
-            rid = r["rrd_id"]
+            if not isinstance(r, dict):
+                continue
+            rid = _rrd(r)
             if rid in seen:
                 continue
             seen.add(rid)
-            operation = str(r.get("supplier_oper_name") or "").lower()
-            logistics = float(r.get("delivery_rub") or 0)
-            if r.get("return_amount") or "возврат" in operation:
+            operation = str(_pick(r, "supplierOperName", "supplier_oper_name") or "").lower()
+            logistics = _num(_pick(r, "deliveryService", "delivery_rub"))
+            returned = _num(_pick(r, "returnAmount", "return_amount"))
+            if returned or "возврат" in operation:
                 reverse += logistics
             else:
                 delivery += logistics
-            storage += float(r.get("storage_fee") or 0)
-            acceptance += float(r.get("acceptance") or r.get("acceptance_fee") or 0)
-            # Identifiable advertising deductions are already reported by /upd.
-            reason = str(r.get("bonus_type_name") or "").lower()
-            other += float(r.get("penalty") or 0)
-            if not any(word in reason for word in ("реклам", "продвижен")):
-                other += float(r.get("deduction") or 0)
+            storage += _num(_pick(r, "paidStorage", "storage_fee"))
+            acceptance += _num(_pick(r, "paidAcceptance", "acceptance", "acceptance_fee"))
+            penalty = _num(_pick(r, "penalty", "penalty_sum"))
+            deduction = _num(_pick(r, "deduction", "deduction_sum"))
+            # Идентифицируемые рекламные удержания приходят отдельно из /upd.
+            other += penalty + deduction
             if operation not in {"продажа", "возврат"}:
                 continue
-            qty = int(r.get("quantity", 1))
+            qty = int(_num(_pick(r, "quantity")) or 1)
             if qty <= 0:
                 continue
-            unit = float(r["retail_price_withdisc_rub"])
+            unit = _num(_pick(r, "retailPriceWithDisc", "retail_price_withdisc_rub"))
             gross = unit * qty
-            paid = float(
-                r.get("retail_amount") if r.get("retail_amount") is not None else gross
-            )
-            transfer = float(r["ppvz_for_pay"])
-            if r.get("acquiring_fee") is None:
+            paid_raw = _pick(r, "retailAmount", "retail_amount")
+            paid = _num(paid_raw) if paid_raw is not None else gross
+            transfer = _num(_pick(r, "forPay", "ppvz_for_pay"))
+            fee_raw = _pick(r, "acquiringFee", "acquiring_fee")
+            if fee_raw is None:
                 fee = round(paid * settings.ACQUIRING_RATE, 2)
                 estimated = True
             else:
-                fee = float(r["acquiring_fee"])  # acquiring_bank is a bank NAME
+                fee = _num(fee_raw)  # acquiring_bank is a bank NAME
             sign = -1 if operation == "возврат" else 1
             seller += sign * gross
             buyer += sign * paid
             payout += sign * transfer
             acquiring += sign * fee
-            comm = gross - transfer - fee  # fee is already deducted from ppvz_for_pay
+            comm = gross - transfer - fee  # fee is already deducted from for_pay
             commission += sign * comm
             if sign < 0:
                 returns += gross
@@ -591,8 +782,12 @@ class WBStatisticsAPI(MarketplaceClient):
                 {
                     "order_id": f"wbf_{rid}",
                     "marketplace": "wb",
-                    "sku": str(r.get("sa_name") or r["nm_id"]),
-                    "created_at": r.get("sale_dt") or r["rr_dt"],
+                    "sku": str(
+                        _pick(r, "vendorCode", "sa_name", "nmId", "nm_id") or ""
+                    ),
+                    "created_at": str(
+                        _pick(r, "saleDt", "rrDate", "sale_dt", "rr_dt") or ""
+                    )[:10],
                     "quantity": qty,
                     "price": unit,
                     "buyer_price": paid / qty,

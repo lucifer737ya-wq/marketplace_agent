@@ -116,34 +116,60 @@ class Adapters(unittest.IsolatedAsyncioTestCase):
         second._request = AsyncMock(side_effect=AssertionError("should use disk"))
         self.assertEqual(await second.fetch_stocks_and_prices(), rows)
 
-    async def test_ozon_transactions_statement_reconcile_not_sum(self):
+    async def test_ozon_accrual_by_day_reconcile_with_cash_flow(self):
+        """Финансы Ozon из /v1/finance/accrual/by-day (+сверка с cash-flow)."""
         period = {"begin": "2026-11-18", "end": "2026-11-18"}
-        sale = {
-            "operation_id": 11,
-            "operation_type": "OperationAgentDeliveredToCustomer",
-            "operation_date": "2026-11-18",
-            "sale_commission": -66,
-            "accruals_for_sale": 300,
-            "amount": 195,
-            "type": "orders",
-            "items": [{"sku": 123}],
-            "posting": {"posting_number": "123-1"},
-            "services": [
-                {"name": "MarketplaceServiceItemDirectFlowLogisticSum", "price": -39}
-            ],
+        accrual = {
+            "accrual_id": "11",
+            "date": "2026-11-18",
+            "accrued_category": "POSTING",
+            "unit_number": "123-1",
+            "posting": {
+                "products": [
+                    {
+                        "sku": 123,
+                        "commission": {
+                            "seller_price": {"amount": "300", "currency": "RUB"},
+                            "sale_price": {"amount": "330", "currency": "RUB"},
+                            "sale_commission": {"amount": "-66", "currency": "RUB"},
+                        },
+                        "delivery": {
+                            "total_accrued": {"amount": "-39", "currency": "RUB"},
+                            "services": [
+                                {"type_id": 32, "accrued": {"amount": "-39"}}
+                            ],
+                        },
+                    }
+                ]
+            },
         }
         ad = {
-            "operation_id": 12,
-            "operation_type": "MarketplaceServiceCostPerClick",
-            "amount": -6,
-            "items": [{"sku": 123}],
+            "accrual_id": "12",
+            "date": "2026-11-18",
+            "accrued_category": "ITEM",
+            "item_fees": {
+                "fees": [
+                    {
+                        "sku": 123,
+                        "fees": [
+                            {"type_id": 41, "accrued": {"amount": "-6"}},
+                            {"type_id": 1, "accrued": {"amount": "-2.1"}},
+                        ],
+                    }
+                ]
+            },
         }
         details = {
             "period": period,
-            "delivery": {"delivery_services": {"items": sale["services"]}},
+            "delivery": {
+                "delivery_services": {
+                    "items": [{"name": "MarketplaceServiceItemDelivToCustomer", "price": -39}]
+                }
+            },
             "services": {
                 "items": [{"name": "MarketplaceServiceCostPerClick", "price": -6}]
             },
+            "others": {"items": [{"name": "Acquiring", "price": -2.1}]},
         }
         flow = {
             "period": period,
@@ -153,13 +179,17 @@ class Adapters(unittest.IsolatedAsyncioTestCase):
         }
 
         async def request(method, path, payload):
-            if path.endswith("transaction/list"):
+            if path == "/v1/finance/accrual/types":
                 return {
-                    "result": {
-                        "operations": [sale] if payload["page"] == 1 else [ad],
-                        "page_count": 2,
-                    }
+                    "accrual_types": [
+                        {"id": 32, "name": "Logistic"},
+                        {"id": 41, "name": "PayPerClick"},
+                        {"id": 1, "name": "Acquiring"},
+                    ]
                 }
+            if path == "/v1/finance/accrual/by-day":
+                self.assertEqual(payload["date"], "2026-11-18")
+                return {"accruals": [accrual, ad], "last_id": ""}
             self.assertEqual(path, "/v1/finance/cash-flow-statement/list")
             self.assertIs(payload["with_details"], True)
             return {
@@ -168,19 +198,64 @@ class Adapters(unittest.IsolatedAsyncioTestCase):
             }
 
         self.oz._request = AsyncMock(side_effect=request)
-        for start, source in [
-            ("2026-11-18", "cash-flow"),
-            ("2026-11-17", "транзакции"),
-        ]:
-            result = await self.oz.fetch_real_finance_breakdown(
-                custom_date_from=start, custom_date_to="2026-11-18"
-            )
-            self.assertIn(source, result["source"])
-            self.assertEqual(result["deliv_total"] / result["orders_count"], 39)
-            self.assertEqual(
-                (result["ads_total"], result["billed_skus"], result["total_payout"]),
-                (6, ["123"], 189),
-            )
+        result = await self.oz.fetch_real_finance_breakdown(
+            custom_date_from="2026-11-18", custom_date_to="2026-11-18"
+        )
+        self.assertIn("cash-flow", result["source"])
+        self.assertNotIn("transaction/list", result["source"])
+        self.assertEqual((result["orders_count"], result["deliv_total"]), (1, 39))
+        self.assertEqual((result["ads_total"], result["billed_skus"]), (6, ["123"]))
+        self.assertEqual(result["acquiring"], 2.1)
+        self.assertEqual(result["total_payout"], 300 - 66 - 39 - 6 - 2.1)
+
+    async def test_ozon_accrual_pagination_and_unknown_types(self):
+        """Курсор last_id прокручивается, незнакомый type_id не теряет деньги."""
+        seen = []
+
+        async def request(method, path, payload):
+            if path == "/v1/finance/accrual/types":
+                raise APIStatusError(400, "types unavailable")
+            if path == "/v1/finance/accrual/by-day":
+                seen.append(payload.get("last_id", ""))
+                if not payload.get("last_id"):
+                    return {
+                        "accruals": [
+                            {
+                                "accrual_id": "1",
+                                "date": "2026-11-18",
+                                "non_item_fee": {
+                                    "type_id": 777,
+                                    "accrued": {"amount": "-10"},
+                                },
+                            }
+                        ],
+                        "last_id": "page-2",
+                    }
+                return {
+                    "accruals": [
+                        {
+                            "accrual_id": "2",
+                            "date": "2026-11-18",
+                            "non_item_fee": {
+                                "type_id": 41,
+                                "accrued": {"amount": "-5"},
+                            },
+                        }
+                    ],
+                    "last_id": "",
+                }
+            raise APIStatusError(400, "cash-flow window")
+
+        self.oz._request = AsyncMock(side_effect=request)
+        result = await self.oz.fetch_real_finance_breakdown(
+            custom_date_from="2026-11-18", custom_date_to="2026-11-18"
+        )
+        self.assertEqual(seen, ["", "page-2"])
+        self.assertEqual(result["ads_total"], 5)
+        # Книга расходов ведётся положительными суммами (как в cash-flow)
+        self.assertEqual(result["other_fines"], 10)
+        self.assertIn("777", result["source"])
+        self.assertIn("HTTP 400", result["source"])
 
     async def test_performance_campaigns_real_membership_billing_not_organic(self):
         self.oz._perf_token = AsyncMock(return_value="test")
@@ -272,8 +347,11 @@ class Adapters(unittest.IsolatedAsyncioTestCase):
                         "quantity": 3,
                     }
                 ] * 2
-            self.assertTrue(url.endswith("/supplier/orders"))
-            return []
+            self.assertTrue(
+                url.endswith("/analytics/v1/order-feed")
+                or url.endswith("/supplier/orders")
+            )
+            return [] if url.endswith("/supplier/orders") else {"orders": [], "snapshotTime": "t"}
 
         self.wb._request = AsyncMock(side_effect=request)
         rows = await self.wb.fetch_stocks_and_prices()
@@ -286,33 +364,33 @@ class Adapters(unittest.IsolatedAsyncioTestCase):
             [99, 3, 4, 53.2],
         )
 
-    async def test_wb_report_rrdid_fallback_returns_and_acquiring(self):
+    async def test_wb_finance_api_details_returns_and_acquiring(self):
+        """finance-api WB: суммы строками, camelCase, пагинация по rrdId."""
         sale = {
-            "rrd_id": 19,
-            "supplier_oper_name": "Продажа",
+            "rrdId": 19,
+            "supplierOperName": "Продажа",
             "quantity": 1,
-            "retail_price_withdisc_rub": 300,
-            "retail_amount": 280,
-            "ppvz_for_pay": 215.8,
-            "acquiring_bank": "Bank",
-            "sa_name": "1001",
-            "sale_dt": "2026-11-17",
+            "retailPriceWithDisc": "300",
+            "retailAmount": "280",
+            "forPay": "215.8",
+            "acquiringBank": "Bank",
+            "vendorCode": "1001",
+            "saleDt": "2026-11-17T00:00:00Z",
         }
         ret = dict(
             sale,
-            rrd_id=20,
-            supplier_oper_name="Возврат",
-            delivery_rub=30,
-            return_amount=1,
+            rrdId=20,
+            supplierOperName="Возврат",
+            deliveryService="30",
+            returnAmount=1,
         )
 
-        async def request(method, url, params=None):
-            if "/v5/" in url or "/v3/" in url:
-                raise APIStatusError(404, "version")
+        async def request(method, url, params=None, json_data=None):
             if "/upd" in url:
                 return []
-            self.assertTrue(url.endswith("/v1/supplier/reportDetailByPeriod"))
-            return {0: [sale], 19: [ret], 20: None}[params["rrdid"]]
+            self.assertTrue(url.endswith("/api/finance/v1/sales-reports/detailed"))
+            self.assertNotIn("reportDetailByPeriod", url)
+            return {0: [sale], 19: [ret], 20: [], 999: []}[json_data["rrdId"]]
 
         self.wb._request = AsyncMock(side_effect=request)
         report = await self.wb.fetch_real_finance_breakdown()
@@ -322,6 +400,44 @@ class Adapters(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(report["acquiring_estimated"])
         self.assertEqual(report["orders"][0]["acquiring"], 4.2)
         self.assertEqual(report["orders"][0]["created_at"], "2026-11-17")
+        self.assertIn("finance-api", report["source"])
+
+    async def test_wb_finance_defaults_to_closed_report_summaries(self):
+        """Если детализации нет, берутся итоги закрытых отчётов из /sales-reports/list."""
+        summary = {
+            "reportId": 1,
+            "dateFrom": "2026-11-10",
+            "dateTo": "2026-11-16",
+            "retailAmountSum": "1000",
+            "forPaySum": "700",
+            "deliveryServiceSum": "100",
+            "paidStorageSum": "20",
+            "paidAcceptanceSum": "5",
+            "deductionSum": "10",
+            "penaltySum": "15",
+            "cashbackCommissionChangeSum": "0",
+        }
+
+        async def request(method, url, params=None, json_data=None):
+            if "/upd" in url:
+                return []
+            if url.endswith("/sales-reports/detailed"):
+                return []
+            self.assertTrue(url.endswith("/sales-reports/list"))
+            return [summary]
+
+        self.wb._request = AsyncMock(side_effect=request)
+        report = await self.wb.fetch_real_finance_breakdown(
+            custom_date_from="2026-11-10", custom_date_to="2026-11-16"
+        )
+        self.assertTrue(report["summary_only"])
+        self.assertEqual(report["revenue_seller"], 1000)
+        self.assertEqual(report["for_pay"], 700)
+        self.assertEqual(report["total_payout"], 700)
+        self.assertEqual(
+            report["total_deductions"], 100 + 20 + 5 + 10 + 15
+        )
+        self.assertIn("закрытые", report["source"])
 
     async def test_wb_campaign_sequence_and_join_by_id(self):
         self.wb._request = AsyncMock(
@@ -388,34 +504,35 @@ class Adapters(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(report["organic_items"], [])
         self.assertEqual([r["sku"] for r in report["unclassified_items"]], ["gel"])
 
-    async def test_transactions_when_statement_rejects_window_and_zero_acquiring_is_explicit(
-        self,
-    ):
-        operations = [
-            {
-                "operation_id": 1,
-                "operation_type": "OperationAgentDeliveredToCustomer",
-                "type": "orders",
-                "items": [{"sku": 123}] * 2,
-                "posting": {"posting_number": "P1"},
-                "operation_date": "2026-11-15",
-                "sale_commission": -66,
-                "accruals_for_sale": 300,
-                "amount": 195,
-                "services": [
-                    {"name": "MarketplaceServiceItemDelivToCustomer", "price": -39}
-                ],
+    async def test_accrual_orders_feed_pnl_once(self):
+        """Начисления → P&L: комиссия, логистика, эквайринг, COGS и налог считаются один раз."""
+        accrual = {
+            "accrual_id": "11",
+            "date": "2026-11-15",
+            "unit_number": "P1",
+            "posting": {
+                "products": [
+                    {
+                        "sku": 123,
+                        "commission": {
+                            "seller_price": {"amount": "300"},
+                            "sale_price": {"amount": "330"},
+                            "sale_commission": {"amount": "-66"},
+                        },
+                        "delivery": {
+                            "total_accrued": {"amount": "-39"},
+                            "services": [{"type_id": 32, "accrued": {"amount": "-39"}}],
+                        },
+                    }
+                ]
             },
-            {
-                "operation_id": 2,
-                "operation_type": "MarketplaceRedistributionOfAcquiringOperation",
-                "amount": 0,
-            },
-        ]
+        }
 
-        async def request(method, path, body):
-            if path.endswith("/transaction/list"):
-                return {"result": {"operations": operations, "page_count": 1}}
+        async def request(method, path, payload):
+            if path == "/v1/finance/accrual/types":
+                return {"accrual_types": [{"id": 32, "name": "Logistic"}]}
+            if path == "/v1/finance/accrual/by-day":
+                return {"accruals": [accrual], "last_id": ""}
             raise APIStatusError(400, "statement window")
 
         self.oz._request = request
@@ -426,8 +543,6 @@ class Adapters(unittest.IsolatedAsyncioTestCase):
             (result["orders_count"], result["deliv_total"], result["total_payout"]),
             (1, 39, 195),
         )
-        self.assertTrue(result["acquiring_reported"])
-        self.assertEqual(result["orders"][0]["posting_units"], 2)
         self.assertIn("HTTP 400", result["source"])
         await init_db()
         self.addAsyncCleanup(close_db)
@@ -438,22 +553,22 @@ class Adapters(unittest.IsolatedAsyncioTestCase):
         oz.fetch_stocks_and_prices.return_value = (
             wb.fetch_stocks_and_prices.return_value
         ) = []
-        # 300 - 66 - 39 - 2*10 - 18 = 157. No second delivery on the two-unit posting.
         monthly = await sync_and_generate_orders_report(oz, wb)
         weekly = await generate_weekly_top_and_unprofitable_report(oz, wb)
-        self.assertIn("157 ₽", monthly)
-        self.assertIn("157 ₽", weekly)
+        # 300 − 66 − 39 − эквайринг 1.5% (4.50) − себестоимость 10 − налог 18 = 162.50
+        self.assertIn("162.50 ₽", monthly)
+        self.assertIn("162.50 ₽", weekly)
 
     async def test_signed_wb_adjustments_and_explicit_zero_acquiring(self):
         row = {
-            "rrd_id": 1,
-            "supplier_oper_name": "Продажа",
+            "rrdId": 1,
+            "supplierOperName": "Продажа",
             "quantity": 1,
-            "retail_price_withdisc_rub": 100,
-            "ppvz_for_pay": 105,
-            "acquiring_fee": 0,
-            "sa_name": "1001",
-            "sale_dt": "2026-11-13",
+            "retailPriceWithDisc": "100",
+            "forPay": "105",
+            "acquiringFee": "0",
+            "vendorCode": "1001",
+            "saleDt": "2026-11-13T00:00:00Z",
         }
         wb_fin = self.wb._finance_rows([row], 0, "2026-11-13", "2026-11-13")
         self.assertEqual(
@@ -476,23 +591,25 @@ class Adapters(unittest.IsolatedAsyncioTestCase):
         self.assertIn("89 ₽", monthly)
         self.assertIn("89 ₽", weekly)
 
-    async def test_wb_throttled_continuation_keeps_rrdid(self):
+    async def test_wb_finance_deduplicates_repeated_rows(self):
+        row = {
+            "rrdId": 39,
+            "supplierOperName": "Доставка",
+            "deliveryService": "40",
+        }
         self.wb._request = AsyncMock(
-            side_effect=[
-                [{"rrd_id": 39, "operation": "Доставка", "delivery_rub": 40}],
-                APIStatusError(429, "wait", 2),
-                None,
-                [],
-            ]
+            side_effect=[[row, row], [], []]
         )
-        with patch("services.wb.statistics_api.asyncio.sleep", AsyncMock()) as wait:
-            report = await self.wb.fetch_real_finance_breakdown()
-        wait.assert_awaited_once_with(2)
-        self.assertEqual(
-            [c.kwargs["params"]["rrdid"] for c in self.wb._request.await_args_list[:3]],
-            [0, 39, 39],
-        )
+        report = await self.wb.fetch_real_finance_breakdown()
         self.assertEqual(report["logistics_direct"], 40)
+        detail_calls = [
+            c
+            for c in self.wb._request.await_args_list
+            if c.args and str(c.args[1]).endswith("/sales-reports/detailed")
+        ]
+        self.assertEqual(
+            [c.kwargs["json_data"]["rrdId"] for c in detail_calls], [0, 39]
+        )
 
 
 class ApprovalChain(unittest.IsolatedAsyncioTestCase):

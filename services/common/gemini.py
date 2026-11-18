@@ -1,16 +1,66 @@
-"""Shared asynchronous REST client. Keys are headers, not query strings in errors."""
+"""Gemini client: direct Google endpoint first, local proxies only as fallback.
+
+Keys travel in the ``x-goog-api-key`` header, never in a query string, so error
+texts stay clean. Any route failure (transport or anti-bot) automatically moves
+to the next route — this is what makes the module survive a dead proxy.
+"""
 
 import asyncio
+import logging
 import re
 from typing import Any
 
 import aiohttp
 
 from config import settings
-from services.common.routes import proxy_routes, remember_route
+from services.common.routes import (
+    DIRECT,
+    mark_route_failed,
+    mark_route_ok,
+    request_routes,
+)
 
-BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
-FALLBACK_MODELS = ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.0-flash"]
+logger = logging.getLogger(__name__)
+
+# Актуальные текстовые модели Google (проверено по документации 11.2026).
+# Старые gemini-2.5-* автоматически переадресуются Google с 01.12.2026,
+# поэтому фолбэк-цепочка начинается с текущего поколения.
+FALLBACK_MODELS = [
+    "gemini-3.8-flash",
+    "gemini-3.5-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.6-flash",
+    "gemini-2.5-flash",
+]
+FAST_MODELS = [
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite",
+    "gemini-2.5-flash-lite",
+    "gemini-3.8-flash",
+]
+_NON_TEXT_TAGS = (
+    "tts",
+    "audio",
+    "imagen",
+    "embedding",
+    "vision",
+    "robotics",
+    "computer-use",
+    "image",
+    "video",
+    "live",
+    "native-audio",
+)
+
+
+BASE_URL = (
+    str(settings.GEMINI_DIRECT_URL or "https://generativelanguage.googleapis.com").rstrip("/")
+    + "/v1beta/models"
+)
+
+
+def base_url() -> str:
+    return str(settings.GEMINI_DIRECT_URL or "").rstrip("/") + "/v1beta/models"
 
 
 def _extract_model_name(item: Any) -> str:
@@ -19,41 +69,49 @@ def _extract_model_name(item: Any) -> str:
 
 
 def _is_supported_text_model(name: str) -> bool:
-    return bool(re.fullmatch(r"gemini-[\w.-]+", name)) and not any(
-        tag in name.lower()
-        for tag in (
-            "tts",
-            "audio",
-            "imagen",
-            "embedding",
-            "vision",
-            "robotics",
-            "computer-use",
-            "image",
-        )
-    )
+    if not re.fullmatch(r"gemini-[\w.-]+", name or ""):
+        return False
+    lowered = name.lower()
+    return not any(tag in lowered for tag in _NON_TEXT_TAGS)
 
 
-async def _get_available_models(session, proxy: str) -> list[str]:
-    names = [_extract_model_name(settings.GEMINI_MODEL)]
-    async with session.get(BASE_URL, proxy=proxy, allow_redirects=False) as resp:
-        if resp.status in (401, 403):
-            raise RuntimeError(f"Gemini HTTP {resp.status}")
-        if resp.status == 200:
-            data = await resp.json()
-            names.extend(
-                _extract_model_name(item)
-                for item in data.get("models", [])
-                if isinstance(item, dict)
-                and "generateContent" in item.get("supportedGenerationMethods", [])
+def _model_chain(fast: bool) -> list[str]:
+    preferred = settings.GEMINI_FAST_MODEL if fast else settings.GEMINI_MODEL
+    extra = FAST_MODELS if fast else FALLBACK_MODELS
+    names = [_extract_model_name(preferred), *extra, *FALLBACK_MODELS, *FAST_MODELS]
+    return list(dict.fromkeys(n for n in names if _is_supported_text_model(n)))
+
+
+async def _get_available_models(session, route: str = DIRECT) -> list[str]:
+    """Server-reported models; a failure here must not kill generation."""
+    try:
+        async with (
+            await session.get(
+                BASE_URL, **({} if route == DIRECT else {"proxy": route})
             )
-    return list(
-        dict.fromkeys(
-            name
-            for name in [*names, *FALLBACK_MODELS]
-            if _is_supported_text_model(name)
-        )
-    )
+        ) as resp:
+            if resp.status != 200:
+                return []
+            data = await resp.json()
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, OSError):
+        return []
+    return [
+        _extract_model_name(item)
+        for item in data.get("models", [])
+        if isinstance(item, dict)
+        and "generateContent" in item.get("supportedGenerationMethods", [])
+        and _is_supported_text_model(_extract_model_name(item))
+    ]
+
+
+def _text_from_candidate(candidate: dict) -> str:
+    if candidate.get("finishReason") not in (None, "STOP"):
+        # In particular, never return truncated MAX_TOKENS output as a report.
+        return ""
+    parts = candidate.get("content", {}).get("parts", []) or []
+    return "".join(
+        part.get("text", "") for part in parts if not part.get("thought")
+    ).strip()
 
 
 async def generate(
@@ -62,57 +120,80 @@ async def generate(
     max_tokens: int,
     temperature: float = 0.2,
     fast: bool = False,
-    timeout: int = 90,
+    timeout: int | None = None,
 ) -> tuple[str, str]:
     if not settings.GEMINI_API_KEY:
         raise RuntimeError("Не задан ключ Gemini")
+
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"temperature": temperature, "maxOutputTokens": max_tokens},
     }
+    total = timeout or settings.GEMINI_TIMEOUT
+    headers = {
+        "x-goog-api-key": settings.GEMINI_API_KEY,
+        "Content-Type": "application/json",
+    }
     try:
-        proxies = proxy_routes("gemini")
+        routes = request_routes("gemini")
     except ValueError as exc:
         raise RuntimeError(str(exc)) from exc
-    error = "Нет доступной текстовой модели"
-    async with aiohttp.ClientSession(
-        trust_env=False,
-        timeout=aiohttp.ClientTimeout(total=timeout, connect=10),
-        headers={"x-goog-api-key": settings.GEMINI_API_KEY},
-    ) as session:
-        for proxy in proxies:
-            try:
-                models = await _get_available_models(session, proxy)
+
+    errors: list[str] = []
+    for route in routes:
+        proxy = {} if route == DIRECT else {"proxy": route}
+        route_label = "напрямую" if route == DIRECT else route
+        route_broken = False
+        try:
+            async with aiohttp.ClientSession(
+                trust_env=False,
+                timeout=aiohttp.ClientTimeout(total=total, connect=15),
+                headers=headers,
+            ) as session:
+                models = await _get_available_models(session, route)
+                chain = list(
+                    dict.fromkeys(models + _model_chain(fast))
+                )
                 if fast:
-                    models.sort(key=lambda name: "flash" not in name)
-                for name in models[:5]:
+                    chain.sort(key=lambda n: ("lite" not in n, "flash" not in n))
+                for name in chain[:6]:
                     url = f"{BASE_URL}/{name}:generateContent"
-                    async with session.post(
-                        url, proxy=proxy, json=payload, allow_redirects=False
-                    ) as resp:
-                        if resp.status != 200:
-                            error = f"{name}: HTTP {resp.status}"
-                            if resp.status in (401, 403):
-                                raise RuntimeError(error)
-                            continue
-                        data = await resp.json()
-                        for c in data.get("candidates") or []:
-                            if c.get("finishReason") != "STOP":
-                                continue  # in particular, never install MAX_TOKENS output
-                            text = "".join(
-                                part.get("text", "")
-                                for part in c.get("content", {}).get("parts", [])
-                                if not part.get("thought")
-                            ).strip()
-                            if text:
-                                remember_route("gemini", proxy)
-                                return text, name
-                        error = f"{name}: пустой или незавершённый ответ"
-            except (
-                aiohttp.ClientError,
-                asyncio.TimeoutError,
-                OSError,
-                ValueError,
-            ) as exc:
-                error = type(exc).__name__
-    raise RuntimeError(f"Gemini недоступен через локальный прокси: {error}")
+                    try:
+                        async with session.post(url, json=payload, **proxy) as resp:
+                            if resp.status != 200:
+                                errors.append(f"{name}: HTTP {resp.status}")
+                                if resp.status in (400, 401, 403, 404):
+                                    continue  # model/permission problem, next model
+                                route_broken = resp.status in (408, 425, 429, 498, 500, 502, 503, 504)
+                                break  # route problem, next route
+                            data = await resp.json()
+                    except (
+                        aiohttp.ClientError,
+                        asyncio.TimeoutError,
+                        OSError,
+                        ValueError,
+                    ) as exc:
+                        errors.append(f"{route_label}: {type(exc).__name__}")
+                        route_broken = True
+                        break
+                    for candidate in data.get("candidates") or []:
+                        text = _text_from_candidate(candidate)
+                        if text:
+                            mark_route_ok("gemini", route)
+                            return text, name
+                    errors.append(f"{name}: пустой или незавершённый ответ")
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+            mark_route_failed("gemini", route, type(exc).__name__)
+            errors.append(f"{route_label}: {type(exc).__name__}")
+            continue
+        if route_broken:
+            # Транспорт или шлюз маршрута: карантин, следующий маршрут.
+            mark_route_failed("gemini", route, errors[-1] if errors else "route")
+            continue
+        # Route answered; a model-level failure here is not a route failure but
+        # the next route may still have a different model catalogue.
+        logger.warning("Gemini через %s не дал ответа: %s", route_label, errors[-3:])
+
+    raise RuntimeError(
+        "Gemini недоступен ни по одному маршруту: " + ("; ".join(errors[-4:]) or "нет ответа")
+    )

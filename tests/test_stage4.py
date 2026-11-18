@@ -136,7 +136,10 @@ class TestStage4BrowserReviews(unittest.IsolatedAsyncioTestCase):
 
 class TestStage4GeminiAndAdvisory(unittest.IsolatedAsyncioTestCase):
     def test_model_filtering_excludes_non_text_and_invalid_fallbacks(self) -> None:
-        self.assertNotIn("gemini-3.8-flash", gemini.FALLBACK_MODELS)
+        # fолбэк обязан начинаться с актуального поколения моделей Google
+        self.assertIn("gemini-3.8-flash", gemini.FALLBACK_MODELS)
+        self.assertNotIn("gemini-2.5-pro", gemini.FAST_MODELS)
+        self.assertTrue(gemini._is_supported_text_model("gemini-3.8-flash"))
         self.assertTrue(gemini._is_supported_text_model("gemini-2.5-flash"))
         self.assertFalse(gemini._is_supported_text_model("gemini-2.5-flash-tts"))
         self.assertFalse(gemini._is_supported_text_model("imagen-3.0-generate-002"))
@@ -150,8 +153,8 @@ class TestStage4GeminiAndAdvisory(unittest.IsolatedAsyncioTestCase):
             return web.json_response(
                 {
                     "models": [
-                        {"name": "models/gemini-2.5-flash-tts", "supportedGenerationMethods": ["generateContent"]},
-                        {"name": "models/gemini-2.5-flash", "supportedGenerationMethods": ["generateContent"]},
+                        {"name": "models/gemini-3.8-flash-tts", "supportedGenerationMethods": ["generateContent"]},
+                        {"name": "models/gemini-3.8-flash", "supportedGenerationMethods": ["generateContent"]},
                     ]
                 }
             )
@@ -169,7 +172,7 @@ class TestStage4GeminiAndAdvisory(unittest.IsolatedAsyncioTestCase):
                                     {"text": "internal thought", "thought": True},
                                     {"text": "OK", "thought": False},
                                 ]
-                            }
+                            },
                         }
                     ]
                 }
@@ -184,16 +187,23 @@ class TestStage4GeminiAndAdvisory(unittest.IsolatedAsyncioTestCase):
         await site.start()
         port = site._server.sockets[0].getsockname()[1]
 
-        # This HTTP server is a loopback forward-proxy fixture: no request reaches Google.
-        with patch.object(gemini, 'BASE_URL', 'http://model.invalid/v1beta/models'), \
-             patch.object(gemini.settings, 'LOCAL_PROXY_URL', f'http://127.0.0.1:{port}'):
+        # Прямой маршрут по умолчанию идёт на локальный фикстур-сервер,
+        # локальный прокси остаётся резервом. Ни один запрос не уходит в Google.
+        with patch.object(gemini, 'BASE_URL', f'http://127.0.0.1:{port}/v1beta/models'), \
+             patch.object(gemini.settings, 'LOCAL_PROXY_URL', ''), \
+             patch.object(gemini.settings, 'LOCAL_PROXY_FALLBACK_URL', ''), \
+             patch.object(gemini.settings, 'LOCAL_PROXY_LIST', ''):
             try:
                 self.assertTrue((await advisory_mod.check_gemini_api_health())['ok'])
                 self.assertEqual(await buyer_questions_mod.call_fast_gemini('вопрос', True), 'OK')
                 self.assertEqual(len(captured_payloads), 2)
             finally:
                 await runner.cleanup()
-        with patch.object(gemini.settings, 'LOCAL_PROXY_URL', ''):
+        with patch.object(gemini, 'BASE_URL', 'http://127.0.0.1:1/v1beta/models'), \
+             patch.object(gemini.settings, 'ALLOW_DIRECT_CONNECTIONS', False), \
+             patch.object(gemini.settings, 'LOCAL_PROXY_URL', ''), \
+             patch.object(gemini.settings, 'LOCAL_PROXY_FALLBACK_URL', ''), \
+             patch.object(gemini.settings, 'LOCAL_PROXY_LIST', ''):
             with self.assertRaises(RuntimeError):
                 await buyer_questions_mod.call_fast_gemini('test', raise_on_error=True)
             self.assertIn('товар скоро поступит', (await buyer_questions_mod.call_fast_gemini('test')).lower())

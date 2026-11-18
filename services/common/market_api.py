@@ -1,4 +1,4 @@
-"""Direct marketplace transport. Version negotiation is for read operations only."""
+"""Direct marketplace transport with route failover. Read-only version negotiation."""
 
 import asyncio
 import logging
@@ -12,6 +12,13 @@ from urllib.parse import urlsplit
 import aiohttp
 
 from config import LOGS_DIR
+from services.common.routes import (
+    DIRECT,
+    request_routes,
+    route_available,
+    mark_route_failed,
+    mark_route_ok,
+)
 from services.common.storage import DiskCache
 
 T = TypeVar("T")
@@ -45,7 +52,7 @@ async def read_versions(
         try:
             return await read(version)
         except APIStatusError as exc:
-            if i + 1 == len(versions) or exc.status not in {400, 404, 410, 429}:
+            if i + 1 == len(versions) or exc.status not in {400, 404, 410, 425, 429}:
                 raise
             if exc.status == 429:
                 if exc.retry_after > 60:
@@ -55,6 +62,12 @@ async def read_versions(
 
 
 class MarketplaceClient:
+    """Base for Ozon/WB: retries each endpoint across every available route."""
+
+    # Ошибки маршрута (антибот, edge-прокси, обрыв) — повод перейти к следующему
+    # маршруту, а не считать, что площадка ответила «нет».
+    ROUTE_STATUSES = frozenset({403, 407, 408, 425, 498, 502, 503, 504})
+
     def __init__(self, service: str, account: str, notify_callback=None):
         self._cache = DiskCache(
             LOGS_DIR / "api_cache" / service / sha256(account.encode()).hexdigest()[:16]
@@ -84,65 +97,115 @@ class MarketplaceClient:
             )
         endpoint = urlsplit(url).path
         try:
-            async with aiohttp.ClientSession(
-                trust_env=False, timeout=aiohttp.ClientTimeout(total=60, connect=12)
-            ) as session:
-                async with session.request(
-                    method,
-                    url,
-                    headers=headers,
-                    json=body,
-                    params=params,
-                    allow_redirects=False,
-                ) as resp:
-                    if not 200 <= resp.status < 300:
-                        detail = endpoint
-                        try:
-                            error = await resp.json(content_type=None)
-                            if isinstance(error, dict):
-                                detail += (
-                                    ": "
-                                    + str(
-                                        error.get("errorText")
-                                        or error.get("message")
-                                        or error.get("detail")
-                                        or ""
-                                    )[:500]
-                                )
-                        except (ValueError, UnicodeError):
-                            detail += ": ответ без JSON"
-                        wait = (
-                            resp.headers.get("Retry-After")
-                            or resp.headers.get("X-Ratelimit-Retry")
-                            or "0"
-                        )
-                        logging.getLogger(__name__).warning(
-                            "%s HTTP %s %s", self._service, resp.status, endpoint
-                        )
-                        raise APIStatusError(resp.status, detail, retry_seconds(wait))
-                    self._failures = 0
-                    if resp.status == 204:
-                        return None
-                    try:
-                        return await resp.json(content_type=None)
-                    except (UnicodeError, ValueError) as exc:
-                        raise RuntimeError(
-                            f"{endpoint}: ответ не является JSON"
-                        ) from exc
-        except APIStatusError as exc:
-            if exc.status < 500:
-                raise
-            error = exc
-        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-            error = exc
+            routes = request_routes(self._service)
+        except ValueError as exc:
+            raise CircuitBreakerOpenError(str(exc)) from exc
+
+        transport_errors: list[str] = []
+        for route in routes:
+            if not route_available(self._service, route):
+                continue
+            try:
+                result = await self._request_once(
+                    method, url, headers, body, params, route
+                )
+            except aiohttp.ClientResponseError as exc:  # pragma: no cover - internal
+                mark_route_failed(self._service, route, f"HTTP {exc.status}")
+                transport_errors.append(f"{route}: HTTP {exc.status}")
+                continue
+            except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+                mark_route_failed(self._service, route, type(exc).__name__)
+                transport_errors.append(f"{route}: {type(exc).__name__}")
+                continue
+            mark_route_ok(self._service, route)
+            self._failures = 0
+            return result
+
+        if not transport_errors:
+            raise CircuitBreakerOpenError(
+                f"{self._service} {endpoint}: все маршруты в карантине"
+            )
         self._failures += 1
         if self._failures >= 4:
-            self._degraded_until = time.monotonic() + 180
+            self._degraded_until = time.monotonic() + 60
             self._failures = 0
             if self._notify_callback:
                 await self._notify_callback(
-                    f"⚠️ {self._service}: серия ошибок API, пауза 3 минуты"
+                    f"⚠️ {self._service}: серия сетевых ошибок, пауза 1 минута"
                 )
         raise CircuitBreakerOpenError(
-            f"{self._service} {endpoint}: {type(error).__name__}"
-        ) from error
+            f"{self._service} {endpoint}: все маршруты недоступны "
+            f"({'; '.join(transport_errors)})"
+        )
+
+    async def _request_once(
+        self,
+        method: str,
+        url: str,
+        headers: dict,
+        body: Any,
+        params: Any,
+        route: str,
+    ) -> Any:
+        """One attempt over one route. Route-level problems surface as ClientError."""
+        endpoint = urlsplit(url).path
+        proxy = {} if route == DIRECT else {"proxy": route}
+        async with aiohttp.ClientSession(
+            trust_env=False, timeout=aiohttp.ClientTimeout(total=60, connect=12)
+        ) as session:
+            async with session.request(
+                method,
+                url,
+                headers=headers,
+                json=body,
+                params=params,
+                allow_redirects=False,
+                **proxy,
+            ) as resp:
+                if resp.status in self.ROUTE_STATUSES:
+                    # Anti-bot / edge proxy / outage: not an answer from the API.
+                    raise aiohttp.ClientResponseError(
+                        resp.request_info,
+                        resp.history,
+                        status=resp.status,
+                        message=endpoint,
+                    )
+                if 300 <= resp.status < 400:
+                    raise APIStatusError(
+                        resp.status,
+                        f"{endpoint}: редирект {resp.headers.get('Location', '')}"[:500],
+                    )
+                if not 200 <= resp.status < 300:
+                    detail = endpoint
+                    try:
+                        error = await resp.json(content_type=None)
+                        if isinstance(error, dict):
+                            detail += (
+                                ": "
+                                + str(
+                                    error.get("errorText")
+                                    or error.get("message")
+                                    or error.get("detail")
+                                    or error.get("code")
+                                    or ""
+                                )[:500]
+                            )
+                    except (ValueError, UnicodeError):
+                        detail += ": ответ без JSON"
+                    wait = (
+                        resp.headers.get("Retry-After")
+                        or resp.headers.get("X-Ratelimit-Retry")
+                        or "0"
+                    )
+                    logging.getLogger(__name__).warning(
+                        "%s HTTP %s %s", self._service, resp.status, endpoint
+                    )
+                    raise APIStatusError(resp.status, detail, retry_seconds(wait))
+                if resp.status == 204:
+                    return None
+                try:
+                    return await resp.json(content_type=None)
+                except (UnicodeError, ValueError) as exc:
+                    raise APIStatusError(
+                        resp.status, f"{endpoint}: ответ не является JSON"
+                    ) from exc

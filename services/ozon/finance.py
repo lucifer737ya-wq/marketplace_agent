@@ -2,11 +2,122 @@
 
 from collections import defaultdict
 from datetime import date
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 
 
 def money(value) -> Decimal:
     return Decimal(str(value or 0))
+
+
+def _parse_decimal(value) -> Decimal:
+    if value is None or isinstance(value, bool):
+        return Decimal(0)
+    if isinstance(value, Decimal):
+        return value if value.is_finite() else Decimal(0)
+    try:
+        parsed = Decimal(str(value).strip().replace("\u00a0", "").replace(" ", "").replace(",", "."))
+    except (InvalidOperation, ValueError):
+        return Decimal(0)
+    return parsed if parsed.is_finite() else Decimal(0)
+
+
+def amount(node) -> float:
+    """Ozon отдаёт деньги объектом {'amount': '123.45', 'currency': 'RUB'}."""
+    if isinstance(node, dict):
+        return float(_parse_decimal(node.get("amount")))
+    return float(_parse_decimal(node))
+
+
+# type_id -> ключ книги (тот же словарь, что у cash-flow/транзакций).
+# Справочник Ozon /v1/finance/accrual/types содержит 100+ типов, поэтому
+# незнакомые значения разбираются по имени типа, а не теряются.
+ACCRUAL_TYPES = {
+    32: "deliv_direct",      # Logistic
+    29: "deliv_direct",      # LastMileCourier
+    98: "deliv_ozon_handover",  # DeliveryToHandoverPlaceByOzon
+    59: "deliv_return",      # ReturnFlowLogistic
+    45: "deliv_return",      # PickUpPointReturnAcceptance
+    6: "deliv_return",       # Cancellation
+    41: "promo_cpc",         # PayPerClick
+    54: "promo_cpo",         # Promotion
+    77: "partner_pack",      # SupplyInbound
+    84: "partner_pack",      # ItemPacking
+    39: "partner_pack",      # PackingFee
+    38: "partner_pack",      # PackageCost
+    15: "fbo_storage",       # Disposal
+    46: "fbo_storage",       # Placements
+    78: "fbo_storage",       # TemporaryPlacement
+    96: "other_fines",       # AcceleratedReviewCollection
+    48: "other_fines",       # PremiumCashbackIndividualPoints
+    12: "partner_dropoff",   # CrossDock
+    1: "acquiring",          # Acquiring
+    10: "decompensations",   # Compensation
+    25: "decompensations",   # ItemCompensation
+}
+
+_TYPE_HINTS = (
+    ("acquiring", "acquiring"),
+    ("payperclick", "promo_cpc"),
+    ("perclick", "promo_cpc"),
+    ("promotion", "promo_cpo"),
+    ("logistic", "deliv_direct"),
+    ("lastmile", "deliv_direct"),
+    ("delivery", "deliv_direct"),
+    ("return", "deliv_return"),
+    ("storage", "fbo_storage"),
+    ("placement", "fbo_storage"),
+    ("pack", "partner_pack"),
+    ("supply", "partner_pack"),
+    ("crossdock", "partner_dropoff"),
+    ("dropoff", "partner_dropoff"),
+    ("compensation", "decompensations"),
+)
+
+
+def accrual_category(types: dict, type_id, unknown: set) -> str:
+    """type_id -> категория книги. Незнакомый тип -> other_fines + сбор в unknown."""
+    try:
+        key_id = int(type_id)
+    except (TypeError, ValueError):
+        key_id = None
+    if key_id in ACCRUAL_TYPES:
+        return ACCRUAL_TYPES[key_id]
+    name = str((types or {}).get(key_id, "") or "").lower()
+    for needle, bucket in _TYPE_HINTS:
+        if needle in name:
+            return bucket
+    if key_id is not None:
+        unknown.add(key_id)
+    return "other_fines"
+
+
+def walk_fees(node, unknown: set):
+    """Собрать пары (type_id, Decimal) на любой глубине дерева начислений.
+
+    Новый API раскладывает услуги по разным ветвям (posting.products[].delivery.
+    services, item_fees.fees[].fees[], non_item_fee). Рекурсия переживает смену
+    формы ответа, чего не скажешь о жёстко прописанных путях.
+    """
+    found: list[tuple] = []
+
+    def visit(current):
+        if isinstance(current, dict):
+            if "type_id" in current and isinstance(current.get("accrued"), dict):
+                found.append((current.get("type_id"), _parse_decimal(current["accrued"].get("amount"))))
+                return
+            if "type_id" in current and current.get("accrued") is not None and not isinstance(
+                current.get("accrued"), (dict, list)
+            ):
+                found.append((current.get("type_id"), _parse_decimal(current.get("accrued"))))
+                return
+            for value in current.values():
+                visit(value)
+        elif isinstance(current, list):
+            for value in current:
+                visit(value)
+
+    visit(node)
+    return found
 
 
 def category(name: str, default: str) -> str:
