@@ -109,7 +109,7 @@ class WBStatisticsAPI:
                             return await resp.json()
                         return await resp.text()
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-                if attempt == 0:
+                if attempt == 0 and not (method.upper() == "POST" and url.endswith("/api/v2/upload/task")):
                     await asyncio.sleep(3)
                     continue
                 self._consecutive_failures += 1
@@ -191,52 +191,42 @@ class WBStatisticsAPI:
         return 0.0
 
     async def update_price_and_min_price(self, nm_id: int, recommended_price_after_discount: float) -> Dict[str, Any]:
-        target_after_discount = int(round(float(recommended_price_after_discount)))
-        
-        # Проверка кэша задач, чтобы избежать дублирования запросов в короткий промежуток
-        last_time = self._task_cache.get(nm_id, 0)
-        if time.time() - last_time < 300:
-            return {"status": "already_processed", "nm_id": nm_id, "message": "Действие было обработано недавно"}
+        """Создаёт задачу WB; отправка не означает, что цена уже применена.
 
-        min_action_price = int(round(target_after_discount * 0.92))
-        current_discount = 0
-        try:
-            filter_resp = await self._request("GET", f"{self.PRICES_URL}/api/v2/list/goods/filter", params={"limit": 1000, "offset": 0})
-            goods = filter_resp.get("data", {}).get("listGoods", []) if isinstance(filter_resp, dict) else []
-            for g in goods:
-                if int(g.get("nmID", 0)) == int(nm_id):
-                    current_discount = int(g.get("discount", 0))
-                    break
-        except Exception:
-            pass
-
-        if 0 < current_discount < 95:
-            price_before_discount = int(round(target_after_discount / (1.0 - (current_discount / 100.0))))
-        else:
-            price_before_discount = target_after_discount
-
-        payload = {
-            "data": [
-                {
-                    "nmID": int(nm_id),
-                    "price": int(price_before_discount),
-                    "discount": int(current_discount),
-                }
-            ]
-        }
-
-        res = await self._request("POST", f"{self.PRICES_URL}/api/v2/upload/task", json_data=payload)
-        self._task_cache[nm_id] = time.time()
-        
-        return {
-            "status": "success",
-            "nm_id": int(nm_id),
-            "seller_discount_pct": current_discount,
-            "price_before_discount_set": int(price_before_discount),
-            "price_after_discount_target": int(target_after_discount),
-            "min_price_for_promotions": int(min_action_price),
-            "api_response": res,
-        }
+        Публичный upload/task не содержит поля минимальной цены акции. Значение
+        92% возвращается как рекомендация, но не выдаётся за установленное.
+        """
+        import math
+        if isinstance(nm_id, bool) or not isinstance(nm_id, int) or nm_id <= 0:
+            raise ValueError("Требуется положительный числовой nmID")
+        value = float(recommended_price_after_discount)
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError("Цена должна быть положительной и конечной")
+        target = int(round(value))
+        if target < 1:
+            raise ValueError("Округлённая цена должна быть не меньше 1 ₽")
+        result = await self._request("GET", f"{self.PRICES_URL}/api/v2/list/goods/filter",
+                                     params={"limit": 100, "offset": 0, "filterNmID": nm_id})
+        goods = result.get("data", {}).get("listGoods", []) if isinstance(result, dict) else []
+        match = next((g for g in goods if int(g.get("nmID") or 0) == nm_id), None)
+        if not match or "discount" not in match:
+            raise ValueError("WB не вернул текущую скидку товара; изменение цены отменено")
+        discount = int(match["discount"])
+        if not 0 <= discount < 95:
+            raise ValueError("Неподдерживаемая скидка WB")
+        before = int(round(target / (1 - discount / 100)))
+        response = await self._request("POST", f"{self.PRICES_URL}/api/v2/upload/task",
+                                       json_data={"data": [{"nmID": nm_id, "price": before, "discount": discount}]})
+        if not isinstance(response, dict) or response.get("error") is not False:
+            raise ValueError(f"WB отклонил задачу: {response}")
+        upload_id = (response.get("data") or {}).get("id")
+        if not upload_id:
+            raise RuntimeError("WB не вернул ID загрузки; проверьте состояние вручную")
+        return {"status": "submitted", "upload_id": upload_id, "nm_id": nm_id,
+                "seller_discount_pct": discount, "price_before_discount_set": before,
+                "price_after_discount_target": target,
+                "min_price_for_promotions": int(round(target * 0.92)),
+                "min_price_set": False, "api_response": response}
 
     async def update_price(self, nm_id: str, new_price: float) -> Any:
         return await self.update_price_and_min_price(int(nm_id), float(new_price))
@@ -246,73 +236,104 @@ class WBStatisticsAPI:
         if cached is not None:
             return cached
 
-        prices_raw = await self._request("GET", f"{self.PRICES_URL}/api/v2/list/goods/filter", params={"limit": 1000, "offset": 0})
+        all_goods = []
+        for offset in range(0, 1000000, 1000):
+            prices_raw = await self._request("GET", f"{self.PRICES_URL}/api/v2/list/goods/filter", params={"limit": 1000, "offset": offset})
+            if not isinstance(prices_raw, dict) or prices_raw.get("error"):
+                raise RuntimeError("Некорректный ответ WB по ценам")
+            page = prices_raw.get("data", {}).get("listGoods", [])
+            all_goods.extend(page)
+            if len(page) < 1000:
+                break
+        else:
+            raise RuntimeError("Не завершена пагинация цен WB")
         tariffs = await self.fetch_wb_tariffs()
 
         fbo_stocks_map: Dict[int, int] = {}
         fbs_stocks_map: Dict[int, int] = {}
         barcode_to_nm: Dict[str, int] = {}
 
-        try:
-            cards_resp = await self._request(
-                "POST",
-                f"{self.CONTENT_URL}/content/v2/get/cards/list",
-                json_data={"settings": {"cursor": {"limit": 100}, "filter": {"withPhoto": -1}}},
-            )
-            for card in (cards_resp.get("cards") or []) if isinstance(cards_resp, dict) else []:
+        # Content API возвращает не более 100 карточек на страницу.
+        cursor = {"limit": 100}
+        seen_cursors = set()
+        while True:
+            cards_resp = await self._request("POST", f"{self.CONTENT_URL}/content/v2/get/cards/list",
+                json_data={"settings": {"cursor": cursor, "filter": {"withPhoto": -1}}})
+            if not isinstance(cards_resp, dict) or cards_resp.get("error"):
+                raise RuntimeError("Не удалось получить карточки WB")
+            cards = cards_resp.get("cards") or []
+            for card in cards:
                 nm = int(card.get("nmID") or 0)
-                for sz in card.get("sizes") or []:
-                    for sk in sz.get("skus") or []:
-                        if sk and nm:
-                            barcode_to_nm[str(sk).strip()] = nm
-        except Exception:
-            pass
+                for size in card.get("sizes") or []:
+                    for barcode in size.get("skus") or []:
+                        if barcode and nm:
+                            barcode = str(barcode).strip()
+                            if barcode in barcode_to_nm and barcode_to_nm[barcode] != nm:
+                                raise ValueError("Один баркод принадлежит разным nmID")
+                            barcode_to_nm[barcode] = nm
+            nxt = cards_resp.get("cursor") or {}
+            if int(nxt.get("total", len(cards))) < 100:
+                break
+            key = (nxt.get("updatedAt"), nxt.get("nmID"))
+            if not all(key) or key in seen_cursors:
+                raise RuntimeError("WB Content API: курсор не продвигается")
+            seen_cursors.add(key)
+            cursor = {"limit": 100, "updatedAt": key[0], "nmID": key[1]}
 
-        try:
-            wh_resp = await self._request("GET", f"{self.MARKETPLACE_URL}/api/v3/warehouses")
-            if isinstance(wh_resp, list) and barcode_to_nm:
-                all_skus = list(barcode_to_nm.keys())
-                for w in wh_resp:
-                    wh_id = w.get("id")
-                    if not wh_id:
+        warehouses = await self._request("GET", f"{self.MARKETPLACE_URL}/api/v3/warehouses")
+        if not isinstance(warehouses, list):
+            raise RuntimeError("Некорректный список складов WB")
+        all_skus = list(barcode_to_nm)
+        for wh_id in {w.get("id") for w in warehouses if w.get("id")}:
+            for pos in range(0, len(all_skus), 1000):
+                st = await self._request("POST", f"{self.MARKETPLACE_URL}/api/v3/stocks/{wh_id}",
+                                         json_data={"skus": all_skus[pos:pos + 1000]})
+                if not isinstance(st, dict) or "stocks" not in st:
+                    raise RuntimeError("Некорректный ответ WB FBS stocks")
+                seen = set()
+                for row in st["stocks"]:
+                    barcode = str(row.get("sku") or "").strip()
+                    if barcode in seen:
                         continue
-                    try:
-                        st_resp = await self._request(
-                            "POST",
-                            f"{self.MARKETPLACE_URL}/api/v3/stocks/{wh_id}",
-                            json_data={"skus": all_skus},
-                        )
-                        for st_row in (st_resp.get("stocks") or []) if isinstance(st_resp, dict) else []:
-                            bc = str(st_row.get("sku") or "").strip()
-                            amt = int(st_row.get("amount") or 0)
-                            nm = barcode_to_nm.get(bc)
-                            if nm and amt > 0:
-                                fbs_stocks_map[nm] = fbs_stocks_map.get(nm, 0) + amt
-                    except Exception:
-                        continue
-        except Exception:
-            pass
+                    seen.add(barcode)
+                    nm = barcode_to_nm.get(barcode)
+                    if nm:
+                        fbs_stocks_map[nm] = fbs_stocks_map.get(nm, 0) + max(0, int(row.get("amount") or 0))
 
-        try:
-            raw_stocks = await self._request("GET", f"{self.STATS_URL}/api/v1/supplier/stocks", params={"dateFrom": "2024-01-01"})
-            if isinstance(raw_stocks, list):
-                for s in raw_stocks:
-                    nm = int(s.get("nmId") or 0)
-                    qty = int(s.get("quantity") or 0)
-                    if not nm or qty <= 0:
-                        continue
-                    wh_name = str(s.get("warehouseName") or "").lower().strip()
-                    if nm in fbs_stocks_map and fbs_stocks_map[nm] > 0:
-                        if not any(k in wh_name for k in ("маркетплейс", "продавц", "fbs", "офис", "дом", "собствен")) and s.get("isSupply") is True:
-                            if any(w in wh_name for w in ("коледино", "электросталь", "казань", "подольск", "тула", "невинномысск", "краснодар", "екатеринбург")):
-                                fbo_stocks_map[nm] = fbo_stocks_map.get(nm, 0) + qty
-                    else:
-                        if any(w in wh_name for w in ("коледино", "электросталь", "казань", "подольск", "тула", "невинномысск", "краснодар", "екатеринбург")):
-                            fbo_stocks_map[nm] = fbo_stocks_map.get(nm, 0) + qty
-                        else:
-                            fbs_stocks_map[nm] = fbs_stocks_map.get(nm, 0) + qty
-        except Exception:
-            pass
+        # Актуальный асинхронный отчёт об остатках на складах WB (FBO).
+        report_url = f"{self.ANALYTICS_URL}/api/v1/warehouse_remains"
+        task_resp = await self._request("GET", report_url, params={"groupByNm": "true", "locale": "ru"})
+        task_id = (task_resp.get("data") or {}).get("taskId") if isinstance(task_resp, dict) else None
+        if not task_id:
+            raise RuntimeError("WB не вернул ID отчёта FBO")
+        for attempt in range(12):
+            state = await self._request("GET", f"{report_url}/tasks/{task_id}/status")
+            status = (state.get("data") or {}).get("status") if isinstance(state, dict) else None
+            if status == "done":
+                break
+            if status in {"error", "failed", "canceled", "cancelled"}:
+                raise RuntimeError(f"Ошибка отчёта WB FBO: {status}")
+            if attempt < 11:
+                await asyncio.sleep(5)
+        else:
+            raise RuntimeError("WB не подготовил отчёт FBO за отведённое время")
+        raw_stocks = await self._request("GET", f"{report_url}/tasks/{task_id}/download")
+        if not isinstance(raw_stocks, list):
+            raise RuntimeError("Некорректный отчёт WB FBO")
+        seen_fbo = set()
+        for row in raw_stocks:
+            nm = int(row.get("nmId") or 0)
+            if not nm:
+                continue
+            key = (nm, row.get("barcode"), row.get("techSize"))
+            if key in seen_fbo:
+                continue
+            seen_fbo.add(key)
+            totals = [w for w in row.get("warehouses") or []
+                      if str(w.get("warehouseName") or "").strip().lower() == "всего находится на складах"]
+            if len(totals) != 1:
+                raise RuntimeError(f"WB FBO: нет однозначного итога остатков для nmID {nm}")
+            fbo_stocks_map[nm] = fbo_stocks_map.get(nm, 0) + max(0, int(totals[0].get("quantity") or 0))
 
         buyer_price_map: Dict[int, float] = {}
         sales_count_7d: Dict[int, int] = {}
@@ -334,8 +355,7 @@ class WBStatisticsAPI:
             pass
 
         dedup_results: Dict[int, Dict[str, Any]] = {}
-        goods = prices_raw.get("data", {}).get("listGoods", []) if isinstance(prices_raw, dict) else []
-        for g in goods:
+        for g in all_goods:
             nm_id = int(g.get("nmID") or 0)
             if not nm_id:
                 continue

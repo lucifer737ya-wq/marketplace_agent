@@ -107,7 +107,7 @@ class OzonSellerAPI:
                         return await resp.json()
 
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-                if attempt < 2:
+                if attempt < 2 and endpoint != "/v1/product/import/prices":
                     await asyncio.sleep(3)
                     continue
                 self._consecutive_failures += 1
@@ -126,27 +126,41 @@ class OzonSellerAPI:
         if cached is not None:
             return cached
 
-        prices_items = []
-        for ep in ("/v5/product/info/prices", "/v4/product/info/prices"):
-            try:
-                p_res = await self._request("POST", ep, {"filter": {"visibility": "ALL"}, "limit": 1000})
-                prices_items = p_res.get("items") or p_res.get("result", {}).get("items") or []
-                if prices_items:
-                    break
-            except Exception:
-                continue
+        async def fetch_pages(endpoints):
+            last_error = None
+            for endpoint in endpoints:
+                collected, seen, cursor = [], set(), ""
+                try:
+                    while True:
+                        payload = {"filter": {"visibility": "ALL"}, "limit": 1000}
+                        cursor_key = "cursor" if endpoint == "/v5/product/info/prices" else "last_id"
+                        payload[cursor_key] = cursor
+                        response = await self._request("POST", endpoint, payload)
+                        root = response.get("result") if isinstance(response.get("result"), dict) else response
+                        page = root.get("items")
+                        if not isinstance(page, list):
+                            raise RuntimeError(f"Некорректный ответ {endpoint}")
+                        collected.extend(page)
+                        next_cursor = str(root.get(cursor_key) or response.get(cursor_key) or "")
+                        if not next_cursor:
+                            if len(page) >= 1000:
+                                raise RuntimeError(f"{endpoint}: возможна неполная выдача без cursor")
+                            return collected
+                        if next_cursor in seen:
+                            raise RuntimeError(f"{endpoint}: повтор cursor")
+                        seen.add(next_cursor)
+                        cursor = next_cursor
+                except RuntimeError as exc:
+                    last_error = exc
+                    # Не перебираем версии при 403, 429, сетевых сбоях или невалидной выдаче.
+                    if "HTTP 404" not in str(exc) and "HTTP 410" not in str(exc):
+                        raise
+            raise RuntimeError(f"Нет доступной версии API: {last_error}")
 
+        prices_items = await fetch_pages(("/v5/product/info/prices", "/v4/product/info/prices"))
+        stocks_items = await fetch_pages(("/v4/product/info/stocks", "/v3/product/info/stocks"))
         fbo_map: Dict[str, int] = {}
         fbs_map: Dict[str, int] = {}
-        stocks_items = []
-        for ep in ("/v4/product/info/stocks", "/v3/product/info/stocks"):
-            try:
-                s_res = await self._request("POST", ep, {"filter": {"visibility": "ALL"}, "limit": 1000})
-                stocks_items = s_res.get("items") or s_res.get("result", {}).get("items") or []
-                if stocks_items:
-                    break
-            except Exception:
-                continue
 
         for st_item in stocks_items:
             off_id = str(st_item.get("offer_id") or "").strip()
@@ -214,7 +228,7 @@ class OzonSellerAPI:
                 continue
 
             comm_block = item.get("commissions") or {}
-            raw_pct_fbo = float(comm_block.get("sales_percent_fbo") or comm_block.get("sales_percent") or 23.0)
+            raw_pct_fbo = float(comm_block.get("sales_percent_fbo") or comm_block.get("sales_percent") or 0.0)
             raw_pct_fbs = float(comm_block.get("sales_percent_fbs") or comm_block.get("sales_percent") or raw_pct_fbo)
 
             # Логистика FBO
@@ -258,7 +272,7 @@ class OzonSellerAPI:
                 actions_list = mkt_actions
 
             promo_titles = [str(a.get("title") or "Акция Ozon") for a in actions_list if isinstance(a, dict)]
-            in_promo = len(promo_titles) > 0 or bool(price_block.get("auto_action_enabled"))
+            in_promo = len(promo_titles) > 0 or str(price_block.get("auto_action_enabled") or "").upper() in {"ENABLED", "TRUE"}
 
             fbo_st = fbo_map.get(offer_id, 0)
             fbs_st = fbs_map.get(offer_id, 0)
@@ -301,8 +315,8 @@ class OzonSellerAPI:
         d_to_short = datetime.utcnow().strftime("%Y-%m-%d")
 
         # ШАГ 1: Полный запрос к Ozon Performance API (кампании + товары внутри + статистика ДРР)
-        perf_id = str(getattr(settings, "OZON_PERF_CLIENT_ID", "") or getattr(settings, "OZON_CLIENT_ID", "")).strip()
-        perf_secret = str(getattr(settings, "OZON_PERF_API_KEY", "") or getattr(settings, "OZON_API_KEY", "")).strip()
+        perf_id = str(settings.OZON_PERF_CLIENT_ID or "").strip()
+        perf_secret = str(settings.OZON_PERF_SECRET or "").strip()
         if perf_id and perf_secret:
             try:
                 async with aiohttp.ClientSession(trust_env=False, timeout=aiohttp.ClientTimeout(total=15)) as session:
@@ -378,106 +392,8 @@ class OzonSellerAPI:
         if results_campaigns:
             return results_campaigns
 
-        # ШАГ 2: Потоварный сбор рекламных списаний из /v3/finance/transaction/list + /v1/analytics/data
-        fin = await self.fetch_real_finance_breakdown(days=days)
-        stocks = await self.fetch_stocks_and_prices()
-
-        cpo_rub = round(float(fin.get("promo_cpo") or 0.0), 2)
-        cpc_rub = round(float(fin.get("promo_cpc") or 0.0), 2)
-        ads_total = round(float(fin.get("ads_total") or (cpo_rub + cpc_rub)), 2)
-
-        # Отбираем активные товары и сортируем по объему заказов
-        active_items = [i for i in stocks if (int(i.get("stock_fbo", 0)) + int(i.get("stock_fbs", 0))) > 0]
-        active_items.sort(key=lambda x: (float(x.get("daily_sales") or 0.0), int(x.get("stock_fbo", 0)) + int(x.get("stock_fbs", 0))), reverse=True)
-
-        # В рекламе участвуют строго 6 товаров:
-        # Кампания №1: 4 товара с ДРР в продвижении 6.3%
-        # Кампания №2: 2 товара с ДРР в продвижении 15.4%
-        # Остальные товары — чисто органические (0% ДРР, в РК не состоят)
-        camp1_items = active_items[:4]
-        camp2_items = active_items[4:6]
-        organic_items = active_items[6:]
-
-        # Распределяем рекламный бюджет между Кампанией №1 (ДРР 6.3%) и Кампанией №2 (ДРР 15.4%)
-        c1_drr = 6.3
-        c2_drr = 15.4
-
-        def _format_camp_items(items_list: List[Dict[str, Any]], target_drr_pct: float) -> List[Dict[str, Any]]:
-            formatted = []
-            for it in items_list:
-                daily_v = max(float(it.get("daily_sales") or 0.5), 0.5)
-                orders_7d = max(1, int(round(daily_v * 7)))
-                price_r = float(it.get("current_price") or 299.0)
-                promo_rev = round(orders_7d * price_r, 0)
-                ad_spend = round(promo_rev * (target_drr_pct / 100.0), 0)
-                cpo_share = round(ad_spend * (cpo_rub / max(ads_total, 1.0)), 0)
-                cpc_share = max(0.0, ad_spend - cpo_share)
-                formatted.append({
-                    "sku": it["sku"],
-                    "product_id": it.get("product_id"),
-                    "price_rub": price_r,
-                    "in_promo_action": it.get("in_promo", False),
-                    "stock_fbo": it.get("stock_fbo", 0),
-                    "stock_fbs": it.get("stock_fbs", 0),
-                    "orders_in_promo_7d": orders_7d,
-                    "revenue_in_promo_7d_rub": promo_rev,
-                    "ad_spend_7d_rub": ad_spend,
-                    "cpo_part_rub": cpo_share,
-                    "cpc_part_rub": cpc_share,
-                    "drr_in_promo_pct": target_drr_pct,
-                    "cac_per_order_rub": round(ad_spend / orders_7d, 1),
-                })
-            return formatted
-
-        c1_skus = _format_camp_items(camp1_items, c1_drr)
-        c2_skus = _format_camp_items(camp2_items, c2_drr)
-
-        c1_rev = sum(x["revenue_in_promo_7d_rub"] for x in c1_skus)
-        c1_spend = round(c1_rev * (c1_drr / 100.0), 2)
-
-        c2_rev = sum(x["revenue_in_promo_7d_rub"] for x in c2_skus)
-        c2_spend = round(c2_rev * (c2_drr / 100.0), 2)
-
-        results_campaigns = [
-            {
-                "campaign_name": "Кампания №1 (4 товара — Оплата за клик по целевому расходу + сниженный % за заказ)",
-                "mechanic": "CPC по целевому расходу + сниженная оплата за заказ (CPO)",
-                "status": "ACTIVE (В продвижении: 4 товара)",
-                "products_count": len(c1_skus),
-                "drr_in_promo_pct": 6.3,
-                "spend_7d_rub": c1_spend,
-                "revenue_in_promo_7d_rub": c1_rev,
-                "orders_in_promo_7d": sum(x["orders_in_promo_7d"] for x in c1_skus),
-                "skus_inside": c1_skus,
-            },
-            {
-                "campaign_name": "Кампания №2 (2 товара — Оплата за клик по целевому расходу + сниженный % за заказ)",
-                "mechanic": "CPC по целевому расходу + сниженная оплата за заказ (CPO)",
-                "status": "ACTIVE (В продвижении: 2 товара)",
-                "products_count": len(c2_skus),
-                "drr_in_promo_pct": 15.4,
-                "spend_7d_rub": c2_spend,
-                "revenue_in_promo_7d_rub": c2_rev,
-                "orders_in_promo_7d": sum(x["orders_in_promo_7d"] for x in c2_skus),
-                "skus_inside": c2_skus,
-            },
-            {
-                "campaign_name": "Товары ВНЕ рекламных кампаний (Только органические продажи)",
-                "status": "NOT_IN_ADS",
-                "products_count": len(organic_items),
-                "skus_outside_ads": [
-                    {
-                        "sku": i["sku"],
-                        "price_rub": i.get("current_price"),
-                        "stock_fbo": i.get("stock_fbo", 0),
-                        "stock_fbs": i.get("stock_fbs", 0),
-                    }
-                    for i in organic_items
-                ],
-            },
-        ]
-
-        return results_campaigns
+        # Данные о составе и затратах кампаний нельзя выводить из общих продаж.
+        raise RuntimeError("Ozon Performance API не вернул кампании; нельзя подменять данные оценками")
 
     async def fetch_real_finance_breakdown(
         self,
@@ -598,20 +514,7 @@ class OzonSellerAPI:
             sales_total += (orders_amt + returns_amt)
             commission += comm_amt
 
-        # Если /v1/analytics/data был временно недоступен, оцениваем число единиц из выручки (~260 ₽/шт.)
-        if not orders_list and sales_total > 0:
-            est_units = max(int(round(sales_total / 260.0)), 1)
-            for idx in range(est_units):
-                orders_list.append({
-                    "order_id": f"oz_est_{start_dt.strftime('%Y%m%d')}_{idx}",
-                    "marketplace": "ozon",
-                    "sku": "1001",
-                    "created_at": now_utc,
-                    "price": sales_total / est_units,
-                    "commission": 0.0,
-                    "logistics": 0.0,
-                    "status": "ordered",
-                })
+        # Не создаём вымышленные заказы и SKU при недоступной аналитике.
 
         deliv_direct = 0.0
         deliv_return = 0.0
@@ -741,60 +644,25 @@ class OzonSellerAPI:
         }
 
     async def update_price(self, product_id: str, offer_id: str, new_price: float) -> Dict[str, Any]:
-        payload = {
-            "prices": [
-                {
-                    "product_id": int(product_id),
-                    "offer_id": offer_id,
-                    "price": str(round(new_price)),
-                    "old_price": "0",
-                    "min_price": str(round(new_price * 0.95)),
-                }
-            ]
-        }
-        return await self._request("POST", "/v1/product/import/prices", payload)
+        """Отправить цену; статус каждого товара проверяет вызывающая сторона."""
+        import math
+        if not math.isfinite(new_price) or new_price <= 0:
+            raise ValueError("Цена должна быть конечной и положительной")
+        if not offer_id:
+            raise ValueError("Не задан offer_id")
+        item = {"offer_id": str(offer_id), "price": f"{new_price:.2f}"}
+        if product_id:
+            if not str(product_id).isdigit() or int(product_id) <= 0:
+                raise ValueError("Некорректный product_id Ozon")
+            item["product_id"] = int(product_id)
+        return await self._request("POST", "/v1/product/import/prices", {"prices": [item]})
 
     async def update_price_and_min_price(self, offer_id: str, recommended_price: float) -> Dict[str, Any]:
-            """
-            Устанавливает цену на Ozon:
-            - Вводит рекомендованную цену сразу в поле price (целое число).
-            - Устанавливает минимальную цену (min_price) по формуле: int(round(recommended_price * 0.92)).
-            """
-            target_price = int(round(float(recommended_price)))
-            min_price = int(round(target_price * 0.92))
-
-            url = "https://api-seller.ozon.ru/v1/product/import/prices"
-            headers = {
-                "Client-Id": str(self.client_id),
-                "Api-Key": str(self.api_key),
-                "Content-Type": "application/json",
-            }
-            payload = {
-                "prices": [
-                    {
-                        "offer_id": str(offer_id),
-                        "price": str(target_price),
-                        "min_price": str(min_price),
-                        "old_price": "0",
-                        "auto_action_enabled": "UNKNOWN",
-                    }
-                ]
-            }
-
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url, headers=headers, json=payload) as resp:
-                    res_json = await resp.json()
-                    return {
-                        "status": "success" if resp.status == 200 else "error",
-                        "offer_id": str(offer_id),
-                        "price_set": int(target_price),
-                        "min_price_set": int(min_price),
-                        "api_response": res_json,
-                    }
+        # Не меняем min_price или old_price без отдельного согласия пользователя.
+        return await self.update_price("", offer_id, recommended_price)
 
     async def deactivate_promo_product(self, action_id: str, product_id: str) -> Dict[str, Any]:
-        payload = {"action_id": int(action_id), "product_ids": [int(product_id)]}
-        return await self._request("POST", "/v1/actions/products/deactivate", payload)
+        raise NotImplementedError("Выход из акции отключён до подтверждения актуального метода Ozon")
 
     async def pause_or_reduce_campaign(self, campaign_id: str, pause: bool = True) -> bool:
         if not settings.OZON_PERF_CLIENT_ID or not settings.OZON_PERF_SECRET or not campaign_id:

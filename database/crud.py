@@ -492,3 +492,54 @@ async def bulk_upsert_costs(records: list[dict]) -> int:
 
             await session.commit()
     return count
+
+
+async def claim_price_action(action_id: int) -> Optional[PendingAction]:
+    """Атомарно резервирует действие и альтернативы его группы для одного запроса."""
+    from sqlalchemy import update
+    async with _db_write_lock:
+        async with get_db_session() as session:
+            result = await session.execute(
+                update(PendingAction).where(PendingAction.id == action_id,
+                                             PendingAction.status == "pending")
+                .values(status="processing").returning(PendingAction)
+            )
+            action = result.scalar_one_or_none()
+            if not action:
+                await session.rollback()
+                return None
+            group = action.payload.get("group_id")
+            if group:
+                await session.execute(update(PendingAction).where(
+                    PendingAction.id != action_id, PendingAction.status == "pending",
+                    func.json_extract(PendingAction.payload_json, "$.group_id") == group,
+                ).values(status="blocked"))
+            await session.commit()
+            return action
+
+
+async def finish_price_action(action_id: int, status: str, result: Optional[dict] = None) -> None:
+    """submitted/unknown не позволяют повторить потенциально выполненный запрос."""
+    from sqlalchemy import update
+    if status not in {"pending", "executed", "submitted", "unknown", "rejected"}:
+        raise ValueError("Недопустимый статус")
+    async with _db_write_lock:
+        async with get_db_session() as session:
+            action = await session.get(PendingAction, action_id)
+            if not action or action.status != "processing":
+                raise ValueError("Действие не зарезервировано")
+            group = action.payload.get("group_id")
+            action.status = status
+            if result is not None:
+                payload = action.payload
+                payload["result"] = result
+                action.payload_json = json.dumps(payload, ensure_ascii=False)
+            if status in {"executed", "submitted", "rejected"}:
+                action.executed_at = utcnow_naive()
+            if group:
+                sibling_status = "pending" if status == "pending" else ("rejected" if status in {"executed", "submitted", "rejected"} else "unknown")
+                await session.execute(update(PendingAction).where(
+                    PendingAction.id != action_id, PendingAction.status == "blocked",
+                    func.json_extract(PendingAction.payload_json, "$.group_id") == group,
+                ).values(status=sibling_status))
+            await session.commit()

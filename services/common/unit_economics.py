@@ -41,7 +41,9 @@ def calculate_floor_price(
         + target_profit
     )
     total_rate = commission_rate + acquiring_rate + tax_rate + drr_rate
-    denominator = max(1.0 - total_rate, 0.05)  # Защита от деления на <= 0
+    denominator = 1.0 - total_rate
+    if denominator <= 0:
+        raise ValueError("Суммарные удержания >= 100%: прибыльная цена недостижима")
     return round(numerator / denominator, 2)
 
 
@@ -79,7 +81,12 @@ def evaluate_product_decision(
     days_of_stock = round(stock_fbo / max(avg_daily_sales, 0.1), 1)
     stock_critical = days_of_stock < 2.0
 
-    in_trap = marketplace.lower() == "ozon" and (301.0 <= floor_price <= 450.0)
+    in_trap = marketplace.lower() == "ozon" and floor_price > 300.0
+    if marketplace.lower() == "ozon" and floor_price > 300.0:
+        floor_price = calculate_floor_price(cost_price, packaging_cost, fbo_logistics_cost,
+            first_mile_unit_cost, target_profit, settings.OZON_HIGH_COMMISSION_RATE,
+            settings.ACQUIRING_RATE, settings.TAX_RATE, drr_rate)
+        floor_price = max(301.0, floor_price)
     locked_by_promo = in_promo and (promo_max_price > 0) and (floor_price > promo_max_price)
 
     alternatives: List[Dict[str, Any]] = []
@@ -99,7 +106,7 @@ def evaluate_product_decision(
 
     # 2. Проверка блокировки акцией с верхним порогом
     if locked_by_promo:
-        target_after_exit = 490.0 if in_trap else round(floor_price)
+        target_after_exit = round(floor_price)
         alternatives.append(
             {
                 "label": f"🔓 Исключить из акции (порог {promo_max_price:.0f} ₽) и поставить {target_after_exit:.0f} ₽",
@@ -122,9 +129,9 @@ def evaluate_product_decision(
                     "payload": {"external_id": external_id, "new_price": 299.0},
                 },
                 {
-                    "label": "Прыжок на 490 ₽ (компенсация полной комиссии)",
+                    "label": f"Расчетная цена {floor_price:.0f} ₽ (комиссия 52%)",
                     "action_type": "SET_PRICE",
-                    "payload": {"external_id": external_id, "new_price": 490.0},
+                    "payload": {"external_id": external_id, "new_price": round(floor_price)},
                 },
                 {
                     "label": "Снизить ставку рекламы (удержать цену <= 300 ₽)",
