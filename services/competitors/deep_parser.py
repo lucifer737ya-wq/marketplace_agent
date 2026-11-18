@@ -141,6 +141,36 @@ def _extract_wb_product_price(product: Dict[str, Any]) -> float:
     return 0.0
 
 
+async def _wb_browser_fallback(
+    query: str, limit: int
+) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    """Ярус 2 для WB: перехват выдачи реальным браузером. Не роняет парсер."""
+    try:
+        from services.competitors.browser_listings import wb_search_via_browser
+
+        return await wb_search_via_browser(query, limit)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — браузерный ярус всегда опционален
+        logger.warning("[Competitors WB] browser tier failed: %s", exc)
+        return [], f"браузерный разбор WB недоступен: {exc}"
+
+
+async def _ozon_browser_fallback(
+    query: str, limit: int
+) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    """Ярус 2 для Ozon: in-page fetch из ozon.ru и разбор widgetStates."""
+    try:
+        from services.competitors.browser_listings import ozon_search_via_browser
+
+        return await ozon_search_via_browser(query, limit)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[Competitors Ozon] browser tier failed: %s", exc)
+        return [], f"браузерный разбор Ozon недоступен: {exc}"
+
+
 async def _parse_wb_competitors_with_status(
     query: str,
     count: int = 15,
@@ -197,10 +227,18 @@ async def _parse_wb_competitors_with_status(
         if is_transport_err:
             await asyncio.sleep(0.4)
     if not raw_products:
+        # Ярус 2: реальный браузер. С октября 2026 прямой HTTP к search.wb.ru
+        # отдаёт 403/498, а токен x_wbaas_token привязан к браузеру, который
+        # решил JVO1, поэтому воспроизведение из httpx не работает.
         err_msg = (
             "витрина WB не отдала карточки (антибот-защита поиска): "
             + "; ".join(errors[-2:])
         )
+        browser_items, browser_err = await _wb_browser_fallback(clean_query, safe_count)
+        if browser_items:
+            return browser_items, None
+        if browser_err:
+            err_msg = f"{err_msg}; {browser_err}"
 
     items: List[Dict[str, Any]] = []
     seen_skus: set[str] = set()
@@ -378,11 +416,19 @@ async def _parse_ozon_competitors_with_status(
             return items, None
         errors.append("в JSON-выдаче нет товарных карточек")
 
+    # Ярус 2: браузер. Один Chromium открывает главную ozon.ru и остаётся
+    # открытым; fetch выполняется из контекста этой страницы, иначе 403/CORS.
+    browser_items, browser_err = await _ozon_browser_fallback(clean_query, safe_count)
+    if browser_items:
+        return browser_items, None
+    if browser_err:
+        errors.append(browser_err)
+
     if any("307" in e or "302" in e for e in errors):
         return [], (
-            "витрина Ozon закрыта антибот-проверкой (HTTP 307): "
-            "публичный поиск доступен только из прогретого браузера; "
-            "используйте официальный Seller API"
+            "витрина Ozon закрыта антибот-проверкой: "
+            "публичный поиск недоступен ни по HTTP, ни из браузера; "
+            "используйте официальный Seller API или повторите позже"
         )
     return [], "; ".join(dict.fromkeys(errors)) or "витрина Ozon недоступна"
 

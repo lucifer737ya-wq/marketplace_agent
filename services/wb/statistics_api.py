@@ -628,6 +628,77 @@ class WBStatisticsAPI(MarketplaceClient):
         except (RuntimeError, APIStatusError):
             return await legacy(None)
 
+    async def fetch_sales_by_sku(self, days: int = 7) -> tuple[List[Dict[str, Any]], str]:
+        """Продажи в разрезе артикулов — резервный источник для ТОП-5.
+
+        Детализация отчёта реализации (реальные комиссии/логистика) — основной
+        путь; при пустой детализации берётся «Лента заказов», где есть только
+        цена и количество. Возвращает (строки заказов, подпись источника).
+        """
+        end = datetime.utcnow().date()
+        date_from = (end - timedelta(days=max(int(days), 1) - 1)).isoformat()
+        date_to = end.isoformat()
+        key = f"sales_by_sku:{date_from}:{date_to}"
+        cached = self._read_disk_cache(key, 900)
+        if isinstance(cached, dict) and isinstance(cached.get("orders"), list):
+            return cached["orders"], str(cached.get("source") or "")
+
+        errors: List[str] = []
+        rows: list = []
+        try:
+            rows = await self._fetch_report_details(date_from, date_to, "weekly")
+            if not rows:
+                rows = await self._fetch_report_details(date_from, date_to, "daily")
+        except (RuntimeError, APIStatusError) as exc:
+            errors.append(f"детализация отчёта: {exc}")
+        if rows:
+            try:
+                report = self._finance_rows(rows, 0.0, date_from, date_to)
+                orders = [
+                    o
+                    for o in report.get("orders") or []
+                    if isinstance(o, dict) and float(o.get("price") or 0.0) > 0.0
+                ]
+                if orders:
+                    source = f"детализация отчёта реализации WB ({date_from}..{date_to})"
+                    self._write_disk_cache(key, {"orders": orders, "source": source})
+                    return orders, source
+            except (RuntimeError, ValueError, TypeError, KeyError) as exc:
+                errors.append(f"разбор детализации: {exc}")
+
+        try:
+            feed = await self._fetch_orders_7d(date_from, date_to)
+        except (RuntimeError, APIStatusError, ValueError) as exc:
+            errors.append(f"лента заказов: {exc}")
+            feed = []
+        orders = []
+        for row in feed:
+            if not isinstance(row, dict) or row.get("isCancel"):
+                continue
+            nm = int(_num(row.get("nmId")) or 0)
+            price = _num(row.get("finishedPrice")) or _num(row.get("priceWithDisc"))
+            if not nm or price <= 0.0:
+                continue
+            orders.append(
+                {
+                    "order_id": f"wbfeed_{nm}_{len(orders)}",
+                    "marketplace": "wb",
+                    "sku": str(nm),
+                    "created_at": str(row.get("date") or "")[:10],
+                    "quantity": 1,
+                    "price": price,
+                    "buyer_price": _num(row.get("priceWithDisc")) or price,
+                    "status": "sold",
+                }
+            )
+        if orders:
+            source = f"лента заказов WB ({date_from}..{date_to})"
+            self._write_disk_cache(key, {"orders": orders, "source": source})
+            return orders, source
+
+        detail = ("; ".join(errors)) if errors else "за период нет продаж"
+        return [], f"WB: артикулы недоступны ({detail})"
+
     async def fetch_real_finance_breakdown(
         self,
         days: int = 7,

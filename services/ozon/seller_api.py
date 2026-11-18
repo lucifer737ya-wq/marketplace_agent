@@ -37,6 +37,29 @@ def _accrual_category(types, type_id, unknown: set, _money) -> str:
     return accrual_category(types, type_id, unknown)
 
 
+def _metric_number(value: Any) -> float:
+    """Число из метрики Ozon: бывает числом, строкой или объектом {value, amount}."""
+    if isinstance(value, dict):
+        for key in ("value", "amount", "rub", "total", "count"):
+            if value.get(key) is not None:
+                return _metric_number(value[key])
+        return 0.0
+    if value is None or isinstance(value, bool):
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value) if math.isfinite(float(value)) else 0.0
+    cleaned = str(value).strip().replace("\u00a0", "").replace(" ", "").replace(",", ".")
+    try:
+        parsed = float(cleaned)
+    except (TypeError, ValueError):
+        return 0.0
+    return parsed if math.isfinite(parsed) else 0.0
+
+
+def _safe_count(value: Any) -> int:
+    return int(round(_metric_number(value)))
+
+
 class OzonSellerAPI(MarketplaceClient):
     BASE_URL = "https://api-seller.ozon.ru"
     PERF_URL = "https://api-performance.ozon.ru"
@@ -452,6 +475,149 @@ class OzonSellerAPI(MarketplaceClient):
             )
         self._write_disk_cache(key, results)
         return results
+
+    async def fetch_sales_by_sku(self, days: int = 7) -> tuple[List[Dict[str, Any]], str]:
+        """Продажи Ozon в разрезе SKU — резервный источник для ТОП-5.
+
+        Начисления by-day содержат детализацию по позициям, однако за свежие
+        сутки начисления часто ещё не сформированы. Тогда берём агрегаты
+        `/v1/analytics/data` по измерению `sku`: количество и выручка.
+        Возвращает (строки заказов, подпись источника).
+        """
+        end = datetime.utcnow().date()
+        start = end - timedelta(days=max(int(days), 1) - 1)
+        key = f"sales_by_sku:{start.isoformat()}:{end.isoformat()}"
+        cached = self._read_disk_cache(key, 1800)
+        if isinstance(cached, dict) and isinstance(cached.get("orders"), list):
+            return cached["orders"], str(cached.get("source") or "")
+
+        metric_sets = [
+            ["ordered_units", "revenue"],
+            ["ordered_units"],
+        ]
+        errors: List[str] = []
+        priced: List[Dict[str, Any]] = []
+        units_only: Dict[str, int] = {}
+        for metrics in metric_sets:
+            rows: List[Dict[str, Any]] = []
+            offset = 0
+            try:
+                for _ in range(50):
+                    analytics = await self._request(
+                        "POST",
+                        "/v1/analytics/data",
+                        {
+                            "date_from": start.isoformat(),
+                            "date_to": end.isoformat(),
+                            "metrics": metrics,
+                            "dimension": ["sku"],
+                            "limit": 1000,
+                            "offset": offset,
+                        },
+                    )
+                    page = ((analytics or {}).get("result") or {}).get("data") or []
+                    if not isinstance(page, list):
+                        raise RuntimeError("Ozon: неверный формат аналитики по SKU")
+                    rows.extend(page)
+                    if len(page) < 1000:
+                        break
+                    offset += len(page)
+            except (RuntimeError, APIStatusError, KeyError, TypeError, ValueError) as exc:
+                errors.append(f"{'+'.join(metrics)}: {exc}")
+                continue
+
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                dims = row.get("dimensions") or []
+                if not dims or not isinstance(dims[0], dict):
+                    continue
+                sku = str(dims[0].get("id") or "").strip()
+                if not sku:
+                    continue
+                units = 0
+                revenue = 0.0
+                for name, value in zip(metrics, row.get("metrics") or []):
+                    if name == "ordered_units":
+                        units = max(_safe_count(value), 0)
+                    elif name == "revenue":
+                        revenue = max(_metric_number(value), 0.0)
+                if units <= 0:
+                    continue
+                units_only[sku] = max(units_only.get(sku, 0), units)
+                unit_price = round(revenue / units, 2) if revenue > 0.0 else 0.0
+                if unit_price <= 0.0:
+                    continue
+                priced.append(
+                    {
+                        "order_id": f"ozana_{sku}_{len(priced)}",
+                        "marketplace": "ozon",
+                        "sku": sku,
+                        "created_at": end.isoformat(),
+                        "quantity": units,
+                        "price": unit_price,
+                        "status": "sold",
+                    }
+                )
+            if priced:
+                source = (
+                    f"аналитика Ozon по SKU ({start.isoformat()}..{end.isoformat()}, "
+                    f"{'+'.join(metrics)})"
+                )
+                self._write_disk_cache(key, {"orders": priced, "source": source})
+                return priced, source
+
+        # Последний резерв: количество пришло, а выручка — нет. Берём текущую
+        # цену продавца из ЛК (это оценка, а не факт сделки — подписано в отчёте).
+        if units_only:
+            price_map: Dict[str, float] = {}
+            try:
+                inventory = await self.fetch_stocks_and_prices()
+            except Exception:  # noqa: BLE001 — оценка цены не должна ронять отчёт
+                inventory = []
+            for item in inventory if isinstance(inventory, list) else []:
+                if not isinstance(item, dict):
+                    continue
+                price = max(
+                    _metric_number(item.get("current_price")),
+                    _metric_number(item.get("buyer_price")),
+                )
+                if price <= 0.0:
+                    continue
+                for ident in (
+                    str(item.get("sku") or "").strip(),
+                    str(item.get("offer_id") or "").strip(),
+                    str(item.get("product_id") or "").strip(),
+                ):
+                    if ident:
+                        price_map[ident] = price
+            estimated: List[Dict[str, Any]] = []
+            for sku, units in units_only.items():
+                price = price_map.get(sku, 0.0)
+                if price <= 0.0:
+                    continue
+                estimated.append(
+                    {
+                        "order_id": f"ozest_{sku}_{len(estimated)}",
+                        "marketplace": "ozon",
+                        "sku": sku,
+                        "created_at": end.isoformat(),
+                        "quantity": units,
+                        "price": round(price, 2),
+                        "status": "sold",
+                    }
+                )
+            if estimated:
+                source = (
+                    f"аналитика Ozon по SKU ({start.isoformat()}..{end.isoformat()}, "
+                    "количество факт; цены — текущие из ЛК, оценка)"
+                )
+                self._write_disk_cache(key, {"orders": estimated, "source": source})
+                return estimated, source
+            errors.append("выручка по SKU недоступна и цены из ЛК не подтянулись")
+
+        detail = "; ".join(dict.fromkeys(errors)) if errors else "за период нет продаж"
+        return [], f"Ozon: артикулы недоступны ({detail})"
 
     async def _accrual_types(self) -> Dict[int, str]:
         """Справочник типов начислений Ozon. Статичен: кэш на 7 дней + в памяти."""

@@ -79,6 +79,11 @@ class Settings(BaseSettings):
         default=120, description="Карантин недоступного маршрута, сек"
     )
     OZON_REPLY_DRY_RUN: bool = False
+    # Бюджет браузерного разбора витрин (сек): WB/Ozon отвечают медленно,
+    # но отчёт не должен ждать браузер дольше этого значения.
+    LISTINGS_BROWSER_BUDGET_SEC: int = Field(
+        default=90, description="Бюджет времени на браузерный разбор витрины, сек"
+    )
     # Устаревшие финансовые методы Ozon отключены 08.09.2026, оставлены как
     # последняя попытка только при явном включении.
     OZON_LEGACY_FINANCE: bool = Field(
