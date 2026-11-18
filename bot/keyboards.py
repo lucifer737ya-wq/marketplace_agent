@@ -1,4 +1,4 @@
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import KeyboardButton, ReplyKeyboardMarkup
 
 
 def get_main_menu_keyboard() -> ReplyKeyboardMarkup:
@@ -28,6 +28,7 @@ def get_main_menu_keyboard() -> ReplyKeyboardMarkup:
             KeyboardButton(text="🚚 Первая миля"),
         ],
         [
+            KeyboardButton(text="📑 Массовая загрузка себестоимости"),
             KeyboardButton(text="🛠 Редактировать код"),
         ],
     ]
