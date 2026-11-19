@@ -30,8 +30,10 @@ from apscheduler.triggers.interval import IntervalTrigger
 
 from config import prepare_runtime_dirs, settings
 from services.common.routes import (
+    DIRECT,
     proxy_for_route,
     remember_route,
+    request_routes,
     telegram_routes,
 )
 from maintenance.supervisor import apply_code_patch, queue_if_supervised
@@ -120,6 +122,34 @@ async def on_handler_error(event: ErrorEvent) -> bool:
             flush=True,
         )
     return True
+
+
+_ROUTE_SNAPSHOT: Dict[str, Any] = {}
+
+
+def _build_route_snapshot() -> Dict[str, Any]:
+    """Маршруты по каждому сервису — в журнал и heartbeat.
+
+    По ним сразу видно, ходят ли Ozon/WB напрямую (российский IP) или через
+    VPN-прокси, и включены ли политики из .env.
+    """
+    snapshot: Dict[str, Any] = {}
+    for service in ("telegram", "ozon", "wb", "gemini"):
+        try:
+            snapshot[service] = list(request_routes(service))
+        except ValueError as exc:
+            snapshot[service] = f"нет маршрута: {exc}"
+    return snapshot
+
+
+def _format_routes(snapshot: Dict[str, Any]) -> str:
+    parts = []
+    for service, routes in snapshot.items():
+        if isinstance(routes, list):
+            parts.append(f"{service}=" + "|".join(routes))
+        else:
+            parts.append(f"{service}={routes}")
+    return "; ".join(parts)
 
 
 async def ensure_working_telegram_route() -> None:
@@ -295,6 +325,7 @@ async def write_heartbeat(status: str = "running") -> None:
         "pid": os.getpid(),
         "ozon_degraded": ozon_service.is_degraded,
         "wb_degraded": wb_service.is_degraded,
+        "routes": _ROUTE_SNAPSHOT,
     }
     try:
         await asyncio.to_thread(_write_heartbeat_sync, json.dumps(payload))
@@ -915,6 +946,23 @@ async def main() -> None:
         f"PID={os.getpid()} ===",
         flush=True,
     )
+    global _ROUTE_SNAPSHOT
+    _ROUTE_SNAPSHOT = _build_route_snapshot()
+    print(f"[Worker] Маршруты: {_format_routes(_ROUTE_SNAPSHOT)}", flush=True)
+    if not settings.MARKETPLACES_DIRECT_ONLY:
+        proxied = [
+            name
+            for name in ("ozon", "wb")
+            if isinstance(_ROUTE_SNAPSHOT.get(name), list)
+            and any(route != DIRECT for route in _ROUTE_SNAPSHOT[name])
+        ]
+        if proxied:
+            print(
+                "[Worker] ⚠️ Ozon/WB имеют резервный прокси: при сбое direct "
+                "площадки увидят зарубежный IP. Включите "
+                "MARKETPLACES_DIRECT_ONLY=true в .env.",
+                flush=True,
+            )
     if not acquire_worker_single_instance_lock():
         print(
             f"[Worker] Другой экземпляр worker.py уже удерживает порт {settings.WORKER_LOCK_PORT}. "
