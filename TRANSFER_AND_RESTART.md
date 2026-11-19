@@ -298,6 +298,16 @@ tasklist | findstr /I "pythonw python"
 `"status": "running"` — polling подтверждён; `"starting"` — процесс жив, но
 Telegram ещё не ответил на `getUpdates` (проверьте прокси/интернет, перезапуска не будет).
 
+Поле `routes` показывает фактическую политику выхода:
+
+```text
+"routes": {"telegram": ["http://127.0.0.1:3066"], "ozon": ["direct"], "wb": ["direct"], "gemini": ["direct", "http://127.0.0.1:3066"]}
+```
+
+Если у `ozon` или `wb` в списке есть прокси — добавьте в `.env`
+`MARKETPLACES_DIRECT_ONLY=true` и перезапустите. Та же строка есть в журнале:
+`[Worker] Маршруты: …`.
+
 Если процесс есть, а heartbeat старый — смотрите логи:
 
 ```cmd

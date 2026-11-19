@@ -417,6 +417,42 @@ class SchedulerBudget(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any("остановлен" in text for text in messages), messages)
 
 
+class RouteDiagnostics(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        routes.reset_routes()
+
+    def tearDown(self):
+        routes.reset_routes()
+
+    def test_snapshot_shows_direct_marketplaces_and_proxy_telegram(self):
+        import worker
+
+        with patch.object(settings, "MARKETPLACES_DIRECT_ONLY", True), \
+             patch.object(settings, "TELEGRAM_PROXY_ONLY", True), \
+             patch.object(settings, "LOCAL_PROXY_URL", "http://127.0.0.1:3066"):
+            snapshot = worker._build_route_snapshot()
+        self.assertEqual(snapshot["ozon"], ["direct"])
+        self.assertEqual(snapshot["wb"], ["direct"])
+        self.assertEqual(snapshot["telegram"], ["http://127.0.0.1:3066"])
+        text = worker._format_routes(snapshot)
+        self.assertIn("ozon=direct", text)
+        self.assertIn("telegram=http://127.0.0.1:3066", text)
+
+    async def test_heartbeat_carries_route_snapshot(self):
+        import json
+        import worker
+
+        captured = []
+        heartbeat = {"routes": {"ozon": ["direct"], "wb": ["direct"]}}
+        with patch.object(worker, "_ROUTE_SNAPSHOT", heartbeat["routes"]), \
+             patch.object(worker, "_write_heartbeat_sync", captured.append):
+            await worker.write_heartbeat()
+
+        self.assertTrue(captured)
+        payload = json.loads(captured[-1])
+        self.assertEqual(payload["routes"], heartbeat["routes"])
+
+
 class HeartbeatReadiness(unittest.IsolatedAsyncioTestCase):
     async def test_heartbeat_stays_fresh_while_telegram_is_unreachable(self):
         """Живой воркер без getUpdates не должен выглядеть «зависшим»."""
