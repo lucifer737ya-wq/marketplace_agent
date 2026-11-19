@@ -419,34 +419,22 @@ async def scheduled_reviews_and_questions_job() -> None:
         return
 
     async with _BROWSER_JOB_LOCK:
-        try:
-            async with asyncio.timeout(BROWSER_JOB_BUDGET_SEC):
-                for job in (auto_reply_unanswered_reviews, auto_reply_unanswered_questions):
-                    try:
-                        result = await job(
-                            headless=True,
-                            dry_run=settings.OZON_REPLY_DRY_RUN,
-                            max_per_run=5,
-                        )
-                        if result['status'] not in {'success', 'limit_reached'}:
-                            await notify_admin(html.escape(str(result['message'])))
-                    except Exception as exc:
-                        await notify_admin(
-                            f'Ozon {job.__name__}: {html.escape(str(exc))}'
-                        )
-        except TimeoutError:
-            # Один цикл не должен занимать полчаса: иначе следующий запуск
-            # планировщика отменяется как «maximum number of running instances».
-            print(
-                f"[Worker] Автоответы Ozon: цикл превысил "
-                f"{BROWSER_JOB_BUDGET_SEC // 60} минут и остановлен.",
-                flush=True,
-            )
-            await notify_admin(
-                f"⚠️ Автоответы Ozon: цикл занял больше "
-                f"{BROWSER_JOB_BUDGET_SEC // 60} мин и был остановлен. "
-                "Обработанные ответы сохранены, остальные — в следующем цикле."
-            )
+        # Половина общего бюджета отведена каждому модулю: зависший обход
+        # отзывов не лишает вопросы их запуска в этом же цикле.
+        job_budget = BROWSER_JOB_BUDGET_SEC / 2
+        for job in (auto_reply_unanswered_reviews, auto_reply_unanswered_questions):
+            try:
+                async with asyncio.timeout(job_budget):
+                    result = await job(headless=True, dry_run=settings.OZON_REPLY_DRY_RUN, max_per_run=5)
+                if result['status'] not in {'success', 'limit_reached'}:
+                    await notify_admin(html.escape(str(result.get('message') or result['status'])))
+            except TimeoutError:
+                await notify_admin(
+                    f"⚠️ Ozon {job.__name__}: остановлен, превышен бюджет {int(job_budget // 60)} мин. "
+                    "Не все записи могли быть проверены; состояние публикации проверьте в ЛК."
+                )
+            except Exception as exc:
+                await notify_admin(f'Ozon {job.__name__}: {html.escape(str(exc))}')
 
 
 async def scheduled_daily_price_audit_job() -> None:

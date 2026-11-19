@@ -206,7 +206,8 @@ class TestStage4GeminiAndAdvisory(unittest.IsolatedAsyncioTestCase):
              patch.object(gemini.settings, 'LOCAL_PROXY_LIST', ''):
             with self.assertRaises(RuntimeError):
                 await buyer_questions_mod.call_fast_gemini('test', raise_on_error=True)
-            self.assertIn('товар скоро поступит', (await buyer_questions_mod.call_fast_gemini('test')).lower())
+            with self.assertRaises(RuntimeError):
+                await buyer_questions_mod.call_fast_gemini('test')
         with patch.object(buyer_questions_mod, 'call_fast_gemini', AsyncMock(side_effect=RuntimeError('down'))) as call, \
              patch.object(buyer_questions_mod.asyncio, 'sleep', AsyncMock()):
             with self.assertRaises(RuntimeError):

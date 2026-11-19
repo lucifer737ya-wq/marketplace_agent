@@ -110,6 +110,18 @@ class SkuSalesFallback(unittest.IsolatedAsyncioTestCase):
         self.assertIn("+102.0 ₽/шт.", report)
         self.assertIn("2,550 ₽", report)
 
+    async def test_wb_fallback_used_when_ozon_has_detail(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            oz, wb = self._services(tmp)
+            oz.fetch_real_finance_breakdown.return_value["orders"] = [
+                {"order_id": "z1", "marketplace": "ozon", "sku": "1010", "price": 350,
+                 "quantity": 1, "status": "sold"}
+            ]
+            result = await generate_weekly_top_and_unprofitable_report(oz, wb)
+            wb.fetch_sales_by_sku.assert_awaited_once()
+            self.assertIn("WB", result)
+            self.assertIn("Часть рейтинга построена по резервному источнику", result)
+
     async def test_no_fallback_data_keeps_honest_empty_message(self) -> None:
         oz, wb = self._services(tempfile.mkdtemp())
         oz.fetch_sales_by_sku.return_value = ([], "Ozon: артикулы недоступны (HTTP 403)")
@@ -225,10 +237,10 @@ class BrowserListingParsers(unittest.TestCase):
 
     def test_ozon_dom_cards_extract_sku_and_price(self) -> None:
         items = parse_ozon_dom_cards(
-            [{"href": "https://www.ozon.ru/product/gel-777/", "text": "Гель\n350 ₽"}],
+            [{"href": "https://www.ozon.ru/product/gel-777777/", "text": "Гель\n350 ₽"}],
             limit=5,
         )
-        self.assertEqual(items[0]["sku"], "777")
+        self.assertEqual(items[0]["sku"], "777777")
         self.assertEqual(items[0]["buyer_price"], 350.0)
 
 

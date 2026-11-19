@@ -125,7 +125,7 @@ class GeminiFailover(unittest.IsolatedAsyncioTestCase):
             text, model = await gemini.generate("привет", max_tokens=64)
 
         self.assertEqual(text, "ответ")
-        self.assertEqual(model, "gemini-3.8-flash")
+        self.assertEqual(model, "gemini-3.1-flash-lite")
         # Первый маршрут (direct) упал, второй (локальный прокси) ответил.
         states = {r["route"]: r["state"] for r in routes.route_diagnostics("gemini")}
         self.assertEqual(states[routes.DIRECT], "карантин")

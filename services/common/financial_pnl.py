@@ -139,14 +139,14 @@ async def generate_monthly_pnl_report(
             custom_date_from=str(bounds["date_from"]),
             custom_date_to=str(bounds["date_to"]),
             report_title=(
-                f"📅 ИТОГОВЫЙ P&L ОТЧЕТ ЗА ПРОШЛЫЙ МЕСЯЦ: "
+                f"📅 P&L ОТЧЕТ ЗА ПРОШЛЫЙ МЕСЯЦ (ПРЕДВАРИТЕЛЬНЫЙ): "
                 f"{str(bounds['title']).upper()} ({bounds['date_from']} .. {bounds['date_to']})"
             ),
         )
     except Exception as exc:  # noqa: BLE001 — отчёт по кнопке не должен падать молча
         detail = html.escape(str(exc)[:900])
         report_body = (
-            f"📅 <b>ИТОГОВЫЙ P&L ОТЧЕТ ЗА ПРОШЛЫЙ МЕСЯЦ: "
+            f"📅 <b>P&L ОТЧЕТ ЗА ПРОШЛЫЙ МЕСЯЦ (ПРЕДВАРИТЕЛЬНЫЙ): "
             f"{html.escape(str(bounds['title']).upper())}</b> "
             f"({bounds['date_from']} .. {bounds['date_to']})\n\n"
             f"❌ Финансовая детализация недоступна: <code>{detail}</code>\n"
@@ -339,6 +339,8 @@ async def generate_weekly_top_and_unprofitable_report(
     api_warnings: List[str] = []
     if isinstance(oz_fin, Exception):
         api_warnings.append(f"⚠️ Ozon финансы недоступны: <code>{html.escape(str(oz_fin))}</code>")
+    if isinstance(wb_fin, dict) and wb_fin.get("summary_only"):
+        api_warnings.append("⚠️ WB: нет построчной реализации, рейтинг по WB неполон.")
     if isinstance(wb_fin, Exception):
         api_warnings.append(f"⚠️ WB финансы недоступны: <code>{html.escape(str(wb_fin))}</code>")
 
@@ -643,15 +645,16 @@ async def generate_weekly_top_and_unprofitable_report(
     # --- Резерв: агрегаты продаж по SKU, когда финансовая детализация пуста ---
     # Начисления Ozon и закрытые отчёты WB за последние дни формируются с
     # задержкой, поэтому ТОП-5 без этого яруса показывал «заказов не найдено».
-    if not sku_stats:
+    missing_markets = {mp for mp in ("ozon", "wb") if not any(key[0] == mp for key in sku_stats)}
+    if missing_markets:
         fallback_orders: List[Tuple[str, Dict[str, Any]]] = []
         fallback_sources: List[str] = []
+        fallback_markets = sorted(missing_markets)
         fallback_results = await asyncio.gather(
-            _fetch_sku_sales(oz_api, safe_days),
-            _fetch_sku_sales(wb_api, safe_days),
+            *(_fetch_sku_sales(oz_api if mp == "ozon" else wb_api, safe_days) for mp in fallback_markets),
             return_exceptions=True,
         )
-        for mp_key, result in zip(("ozon", "wb"), fallback_results):
+        for mp_key, result in zip(fallback_markets, fallback_results):
             if isinstance(result, Exception):
                 api_warnings.append(
                     f"⚠️ {mp_key.upper()}: резервный источник артикулов недоступен — "
@@ -684,7 +687,7 @@ async def generate_weekly_top_and_unprofitable_report(
                     _wb_fallback_delivery = _round_rub(sum(_rates) / len(_rates))
 
         if fallback_orders:
-            sku_stats, fallback_stats = _build_stats_from_sku_sales(
+            fallback_sku_stats, fallback_stats = _build_stats_from_sku_sales(
                 fallback_orders,
                 by_mp_sku,
                 by_mp_ext,
@@ -699,8 +702,9 @@ async def generate_weekly_top_and_unprofitable_report(
                 wb_overhead_per_order=wb_overhead_per_order,
                 wb_deliv_per_order=_wb_fallback_delivery,
             )
+            sku_stats.update(fallback_sku_stats)
             api_warnings.append(
-                "ℹ️ <i>Рейтинг построен по резервному источнику (начисления/детализация "
+                "ℹ️ <i>Часть рейтинга построена по резервному источнику (начисления/детализация "
                 "ещё не сформированы): " + html.escape("; ".join(fallback_sources)) + "</i>"
             )
             if fallback_stats.get("excluded"):

@@ -337,7 +337,7 @@ def _format_missing_cogs_note(missing_units: int, missing_skus: List[str]) -> st
     sku_part = f" (арт.: <code>{sample}</code>)" if sample else ""
     return (
         f"⚠️ <i>Не задана себестоимость для <b>{missing_units} шт.</b>{sku_part} — "
-        f"чистая прибыль не учитывает их закупочную стоимость.</i>\n"
+        f"чистая прибыль не рассчитана.</i>\n"
     )
 
 
@@ -347,7 +347,7 @@ async def sync_and_generate_orders_report(
     days: int = 7,
     custom_date_from: Optional[str] = None,
     custom_date_to: Optional[str] = None,
-    report_title: str = "📊 Точный финансовый отчет (Данные ЛК Ozon и WB)",
+    report_title: str = "📊 Финансовый отчет (по доступным данным Ozon и WB)",
 ) -> str:
     safe_days = max(_safe_int(days, 7), 1)
     tax_rate = _safe_nonneg(getattr(settings, "TAX_RATE", 0.06), 0.06)
@@ -370,6 +370,8 @@ async def sync_and_generate_orders_report(
     by_mp_sku, by_mp_ext = _index_products_by_marketplace(all_prods)
 
     api_errors_count = 0
+    oz_profit_known = False
+    wb_profit_known = False
 
     # --- БЛОК OZON ---
     if not isinstance(ozon_fin, dict):
@@ -503,6 +505,17 @@ async def sync_and_generate_orders_report(
         oz_tax = _mul_rub(oz_tax_base, tax_rate)
         oz_net_profit = _round_rub(_to_dec(oz_payout) - _to_dec(oz_cogs) - _to_dec(oz_tax))
 
+        oz_profit_known = (
+            oz_missing_cogs == 0
+            and (oz_sales == 0 or bool(oz_orders))
+            and not any(str(o.get("status") or "").lower() in {"return", "returned", "возврат"} for o in oz_orders if isinstance(o, dict))
+            and not any(mark in str(ozon_fin.get("source") or "").lower()
+                        for mark in ("незнакомые типы", "неполное покрытие", "cash-flow пуст", "cash-flow http", "accrual http", "accrual runtimeerror"))
+            and (oz_sales == 0 or all(k in ozon_fin for k in ("total_deductions", "total_payout")))
+            and all(o.get("price") is not None for o in oz_orders if isinstance(o, dict))
+        )
+        oz_profit_line = (f"<code>{_fmt_money(oz_net_profit)} ₽</code> (<b>{_pct(oz_net_profit, oz_sales)}</b>)"
+                          if oz_profit_known else "<b>н/д — требуется себестоимость и сверка начислений/возвратов</b>")
         oz_source = html.escape(str(ozon_fin.get("source") or "ЛК Ozon Финансы"))
         oz_sales_share = "100.0%" if oz_sales > 0.0 else "0.0%"
         oz_deliv_unit_str = (
@@ -539,10 +552,10 @@ async def sync_and_generate_orders_report(
             f"• <b>Компенсации и декомпенсации: {_fmt_expense(oz_decomp)}</b>\n"
             f"• <b>Взаимозачет между договорами: {_fmt_expense(oz_mutual)}</b>\n\n"
             f"💳 <b>Всего к выплате Ozon: {_fmt_money(oz_payout)} ₽</b>\n"
-            f"📦 Себестоимость + Упаковка + Первая миля: <b>{_fmt_expense(oz_cogs)}</b> ({_pct(oz_cogs, oz_sales)})\n"
+            f"📦 Учтённая себестоимость + упаковка + первая миля: <b>{_fmt_expense(oz_cogs)}</b> ({_pct(oz_cogs, oz_sales)})\n"
             f"{oz_missing_note}"
             f"🏛 Налог УСН ({tax_pct_label}): <b>{_fmt_expense(oz_tax)}</b> ({_pct(oz_tax, oz_sales)})\n"
-            f"👉 <b>Чистая прибыль Ozon:</b> <code>{_fmt_money(oz_net_profit)} ₽</code> (<b>{_pct(oz_net_profit, oz_sales)}</b>)\n\n"
+            f"👉 <b>Чистая прибыль Ozon:</b> {oz_profit_line}\n\n"
         )
 
     # --- БЛОК WILDBERRIES ---
@@ -552,6 +565,23 @@ async def sync_and_generate_orders_report(
         wb_block = f"🟣 <b>WILDBERRIES:</b>\n❌ Ошибка API WB: <code>{err_text}</code>\n\n"
         wb_rev_s = wb_net_profit = wb_cogs = wb_ded_tot = wb_tax = wb_acq = 0.0
         wb_count = wb_missing_cogs = 0
+    elif wb_fin.get("summary_only"):
+        api_errors_count += 1
+        wb_rev_s = wb_net_profit = wb_cogs = wb_ded_tot = wb_tax = wb_acq = 0.0
+        wb_count = wb_missing_cogs = 0
+        rows = wb_fin.get("summary_reports") or []
+        report_rows = "\n".join(
+            f"• №{html.escape(str(r.get('id')))} ({html.escape(str(r.get('date_from')))}..{html.escape(str(r.get('date_to')))}): "
+            f"retailAmountSum {_fmt_money(r.get('retail_amount_sum'))} ₽; forPaySum {_fmt_money(r.get('for_pay_sum'))} ₽"
+            for r in rows if isinstance(r, dict)
+        )
+        wb_block = (
+            "🟣 <b>WILDBERRIES: только сводные отчёты</b>\n"
+            f"{report_rows}\n"
+            "⚠️ Нет построчной реализации и расшифровки базы налога/комиссии. "
+            "Прибыль, количество, налог и общий итог WB не рассчитаны; "
+            "значения отчёта не включены в сводные итоги.\n\n"
+        )
     else:
         wb_orders = wb_fin.get("orders") if isinstance(wb_fin.get("orders"), list) else []
         raw_wb_count = wb_fin.get("orders_count")
@@ -636,6 +666,12 @@ async def sync_and_generate_orders_report(
         wb_tax = _mul_rub(wb_tax_base, tax_rate)
         wb_net_profit = _round_rub(_to_dec(wb_payout) - _to_dec(wb_cogs) - _to_dec(wb_tax))
 
+        wb_profit_known = (wb_missing_cogs == 0 and (wb_rev_s == 0 or bool(wb_orders))
+                           and not _safe_nonneg(wb_fin.get("returns_amount"))
+                           and (wb_rev_s == 0 or all(k in wb_fin for k in ("total_deductions", "total_payout", "revenue_buyer")))
+                           and all(o.get("price") is not None for o in wb_orders if isinstance(o, dict)))
+        wb_profit_line = (f"<code>{_fmt_money(wb_net_profit)} ₽</code> (<b>{_pct(wb_net_profit, wb_rev_s)}</b>)"
+                          if wb_profit_known else "<b>н/д — требуется детализация продаж, себестоимости и возвратов</b>")
         wb_source = html.escape(str(wb_fin.get("source") or "ЛК Wildberries"))
         wb_sales_share = "100.0%" if wb_rev_s > 0.0 else "0.0%"
         wb_acq_title = (
@@ -663,10 +699,10 @@ async def sync_and_generate_orders_report(
             f"• <b>ВБ.Продвижение (Реклама): {_fmt_expense(wb_ads)}</b> ({_pct(wb_ads, wb_rev_s)})\n"
             f"• <b>Штрафы и прочие удержания: {_fmt_expense(wb_other)}</b> ({_pct(wb_other, wb_rev_s)})\n\n"
             f"💳 <b>Всего к перечислению WB: {_fmt_money(wb_payout)} ₽</b>\n"
-            f"📦 Себестоимость + Упаковка + Первая миля: <b>{_fmt_expense(wb_cogs)}</b> ({_pct(wb_cogs, wb_rev_s)})\n"
+            f"📦 Учтённая себестоимость + упаковка + первая миля: <b>{_fmt_expense(wb_cogs)}</b> ({_pct(wb_cogs, wb_rev_s)})\n"
             f"{wb_missing_note}"
             f"🏛 Налог УСН {tax_pct_label} (с {_fmt_money(wb_tax_base)} ₽): <b>{_fmt_expense(wb_tax)}</b>\n"
-            f"👉 <b>Чистая прибыль WB:</b> <code>{_fmt_money(wb_net_profit)} ₽</code> (<b>{_pct(wb_net_profit, wb_rev_s)}</b>)\n\n"
+            f"👉 <b>Чистая прибыль WB:</b> {wb_profit_line}\n\n"
         )
 
     tot_count = oz_count + wb_count
@@ -689,8 +725,12 @@ async def sync_and_generate_orders_report(
         summary_warnings.append(
             f"⚠️ <i>По {tot_missing_cogs} ед. товара отсутствует себестоимость в БД — внесите её через /costs.</i>"
         )
+    profit_summary = (f"<code>{_fmt_money(tot_profit)} ₽</code> (<b>{_pct(tot_profit, tot_sales)} ROS</b>)"
+                      if api_errors_count == 0 and oz_profit_known and wb_profit_known
+                      else "<b>н/д — данные для расчёта неполны</b>")
+    if oz_profit_known or wb_profit_known:
+        summary_warnings.append("ℹ️ <i>Прибыль и УСН — расчётные: налоговую базу, возвраты и удержания необходимо сверить с ЛК и учётом.</i>")
     warnings_suffix = ("\n" + "\n".join(summary_warnings)) if summary_warnings else ""
-
     safe_title = html.escape(str(report_title))
     return (
         f"<b>{safe_title}</b>\n\n"
@@ -701,8 +741,8 @@ async def sync_and_generate_orders_report(
         f"• Заказы Ozon + реализации WB: <b>{tot_count}</b>\n"
         f"• Общий оборот (в ценах ЛК): <b>{_fmt_money(tot_sales)} ₽</b>\n"
         f"• Все удержания маркетплейсов: <b>{_fmt_expense(tot_ded)}</b> ({_pct(tot_ded, tot_sales)}), в т.ч. эквайринг <b>{_fmt_expense(tot_acq)}</b>\n"
-        f"• Себестоимость, упаковка и первая миля: <b>{_fmt_expense(tot_cogs)}</b> ({_pct(tot_cogs, tot_sales)})\n"
+        f"• Учтённая себестоимость, упаковка и первая миля: <b>{_fmt_expense(tot_cogs)}</b> ({_pct(tot_cogs, tot_sales)})\n"
         f"• Налог УСН {tax_pct_label}: <b>{_fmt_expense(tot_tax)}</b>\n"
-        f"💰 <b>ИТОГОВАЯ ЧИСТАЯ ПРИБЫЛЬ:</b> <code>{_fmt_money(tot_profit)} ₽</code> (<b>{_pct(tot_profit, tot_sales)} ROS</b>)"
+        f"💰 <b>ИТОГОВАЯ ЧИСТАЯ ПРИБЫЛЬ:</b> {profit_summary}"
         f"{warnings_suffix}"
     )
