@@ -86,6 +86,46 @@ class TelegramRouting(unittest.IsolatedAsyncioTestCase):
         self.assertIn("ALLOW_DIRECT_CONNECTIONS", str(ctx.exception))
 
 
+class RoutePolicy(unittest.TestCase):
+    """Раздельный выход: площадки — с РФ IP, Telegram — через VPN-прокси."""
+
+    def setUp(self):
+        routes.reset_routes()
+
+    def tearDown(self):
+        routes.reset_routes()
+
+    def test_marketplaces_can_be_forced_direct(self):
+        from services.common.routes import DIRECT, request_routes
+
+        with patch.object(settings, "MARKETPLACES_DIRECT_ONLY", True), \
+             patch.object(settings, "LOCAL_PROXY_URL", "http://127.0.0.1:3066"):
+            self.assertEqual(request_routes("Ozon"), [DIRECT])
+            self.assertEqual(request_routes("WB"), [DIRECT])
+            # Gemini не относится к площадкам и сохраняет резервный прокси.
+            self.assertIn(DIRECT, request_routes("gemini"))
+            self.assertIn("http://127.0.0.1:3066", request_routes("gemini"))
+
+    def test_telegram_can_be_forced_through_proxy_only(self):
+        from services.common.routes import request_routes
+
+        with patch.object(settings, "TELEGRAM_PROXY_ONLY", True), \
+             patch.object(settings, "LOCAL_PROXY_URL", "http://127.0.0.1:3066"):
+            self.assertEqual(
+                request_routes("telegram"), ["http://127.0.0.1:3066"]
+            )
+
+    def test_telegram_proxy_only_without_proxy_is_explicit(self):
+        from services.common.routes import request_routes
+
+        with patch.object(settings, "TELEGRAM_PROXY_ONLY", True), \
+             patch.object(settings, "LOCAL_PROXY_URL", ""), \
+             patch.object(settings, "LOCAL_PROXY_FALLBACK_URL", ""), \
+             patch.object(settings, "LOCAL_PROXY_LIST", ""):
+            with self.assertRaises(ValueError):
+                request_routes("telegram")
+
+
 class OzonFinanceFallbacks(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

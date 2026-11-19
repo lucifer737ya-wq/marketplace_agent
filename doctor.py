@@ -225,6 +225,14 @@ def check_routes() -> None:
             continue
         labels = ["direct" if route == DIRECT else route for route in routes]
         report(OK, f"Маршруты {service}", ", ".join(labels))
+        if service in {"ozon", "wb"} and DIRECT in routes and len(routes) > 1:
+            report(
+                WARN,
+                f"Маршруты {service}",
+                "есть резервный прокси: при сбое direct площадка увидит "
+                "зарубежный IP. Для РФ-адреса включите MARKETPLACES_DIRECT_ONLY=true",
+                critical=False,
+            )
 
 
 def check_playwright() -> None:
