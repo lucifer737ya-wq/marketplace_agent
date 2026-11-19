@@ -157,7 +157,8 @@ async def ensure_working_telegram_route() -> None:
             raise
         remember_route("telegram", route)
         bot = candidate
-        print(f"[Worker] Telegram подключён через маршрут: {label}", flush=True)
+        stamp = datetime.now().strftime("%d.%m %H:%M:%S")
+        print(f"[Worker] {stamp} Telegram подключён через маршрут: {label}", flush=True)
         return
     raise RuntimeError(
         "Telegram недоступен ни по одному маршруту ("
@@ -909,6 +910,11 @@ async def _run_polling_with_conflict_guard(polling_ready: asyncio.Event) -> None
 async def main() -> None:
     prepare_runtime_dirs()
     _ensure_stdio_streams()
+    print(
+        f"[Worker] === старт {datetime.now().strftime('%d.%m.%Y %H:%M:%S')} "
+        f"PID={os.getpid()} ===",
+        flush=True,
+    )
     if not acquire_worker_single_instance_lock():
         print(
             f"[Worker] Другой экземпляр worker.py уже удерживает порт {settings.WORKER_LOCK_PORT}. "

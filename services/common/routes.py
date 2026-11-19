@@ -74,6 +74,13 @@ def _configured_proxies() -> list[str]:
     return proxies
 
 
+MARKETPLACE_SERVICES = frozenset({"ozon", "wb"})
+
+
+def _service_key(service: str) -> str:
+    return str(service or "").strip().lower()
+
+
 def proxy_routes(service: str) -> list[str]:
     """Proxy-only routes (kept for Telegram, which never has a direct route)."""
     routes = _configured_proxies()
@@ -85,11 +92,29 @@ def proxy_routes(service: str) -> list[str]:
 def request_routes(service: str) -> list[str]:
     """All routes for a service, best-known first.
 
-    ``direct`` comes first because it is both faster and independent of any
-    local proxy process, which is exactly what kept breaking Gemini.
+    Политика задаётся в ``.env``:
+
+    * ``MARKETPLACES_DIRECT_ONLY=true`` — Ozon/WB ходят только напрямую,
+      чтобы площадки видели российский IP продавца, а не выходной узел VPN;
+    * ``TELEGRAM_PROXY_ONLY=true`` — Telegram только через локальный прокси
+      (в РФ прямой доступ закрыт, и ждать 45-секундный таймаут бессмысленно);
+    * остальные сервисы (Gemini) — прямой адрес первым, локальные прокси
+      резервом.
     """
+    key = _service_key(service)
+    proxies = _configured_proxies()
+    if key in MARKETPLACE_SERVICES and settings.MARKETPLACES_DIRECT_ONLY:
+        return [DIRECT]
+    if key == "telegram" and settings.TELEGRAM_PROXY_ONLY:
+        if not proxies:
+            raise ValueError(
+                "TELEGRAM_PROXY_ONLY=true, но LOCAL_PROXY_URL не задан: "
+                "укажите локальный HTTP-прокси"
+            )
+        return _prefer_last_working(service, proxies)
+
     routes: list[str] = [DIRECT] if settings.ALLOW_DIRECT_CONNECTIONS else []
-    routes.extend(_configured_proxies())
+    routes.extend(proxies)
     if not routes:
         raise ValueError(
             "Нет ни одного маршрута: включите ALLOW_DIRECT_CONNECTIONS "

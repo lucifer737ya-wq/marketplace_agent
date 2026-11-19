@@ -74,6 +74,18 @@ class Settings(BaseSettings):
     ALLOW_DIRECT_CONNECTIONS: bool = Field(
         default=True, description="Разрешить прямые HTTPS-запросы без прокси"
     )
+    # Telegram в РФ доступен только через прокси: прямой маршрут для него
+    # отключается, чтобы не тратить 45 с на заведомо мёртвую попытку.
+    TELEGRAM_PROXY_ONLY: bool = Field(
+        default=False,
+        description="Telegram только через локальный прокси (без прямого маршрута)",
+    )
+    # Ozon и WB должны видеть российский IP продавца. При включении площадки
+    # ходят только напрямую и никогда не используют VPN/прокси.
+    MARKETPLACES_DIRECT_ONLY: bool = Field(
+        default=False,
+        description="Ozon и WB только напрямую, без прокси (российский IP)",
+    )
     # Сколько секунд держать в карантине упавший маршрут.
     ROUTE_COOLDOWN_SECONDS: int = Field(
         default=120, description="Карантин недоступного маршрута, сек"

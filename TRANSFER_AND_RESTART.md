@@ -209,6 +209,83 @@ start "" /B venv\Scripts\pythonw.exe supervisor.py
 
 ---
 
+## 6.1. Раздельный выход: Telegram через VPN, Ozon и WB — с российского IP
+
+Ozon и WB блокируют часть запросов с зарубежных адресов, поэтому площадки должны
+ходить напрямую с вашего РФ-IP, а Telegram — через VPN (Karing).
+
+### Шаг 1. Настройте Karing
+
+Выберите один из вариантов:
+
+- **TUN/VPN-режим (как сейчас).** Добавьте `pythonw.exe` в исключения
+  («Раздельное туннелирование приложений» → не направлять через VPN) **или**
+  добавьте в правила маршрутизации домены площадок как `direct`:
+  `ozon.ru`, `ozon.com`, `api-seller.ozon.ru`, `api-performance.ozon.ru`,
+  `wildberries.ru`, `wb.ru`, `wbbasket.ru`, `wbfiles.ru`,
+  `*.wildberries.ru` (api, statistics-api, finance-api, discounts-prices-api,
+  marketplace-api, content-api, analytics, advert-api, order-feed-api).
+  Telegram-домены и IP должны оставаться в `proxy`.
+- **Режим «системный прокси» (проще).** Бот игнорирует системный прокси
+  (`trust_env=False`), поэтому площадки пойдут напрямую с РФ-IP, а Telegram —
+  на локальный порт, который вы укажете в `.env`.
+
+Узнайте локальный порт Karing (mixed/HTTP, часто `2080` или `3066`) — он нужен ниже.
+
+### Шаг 2. Пропишите политику в `.env`
+
+```cmd
+cd /d C:\marketplace_agent
+notepad .env
+```
+
+Добавьте (порт замените на свой):
+
+```env
+ALLOW_DIRECT_CONNECTIONS=true
+LOCAL_PROXY_URL=http://127.0.0.1:3066
+MARKETPLACES_DIRECT_ONLY=true
+TELEGRAM_PROXY_ONLY=true
+```
+
+- `MARKETPLACES_DIRECT_ONLY=true` — Ozon и WB **никогда** не используют прокси;
+- `TELEGRAM_PROXY_ONLY=true` — Telegram идёт только через локальный порт Karing.
+
+### Шаг 3. Проверьте и перезапустите
+
+```cmd
+cd /d C:\marketplace_agent
+doctor.bat
+stop_agent.bat
+wscript.exe start_hidden.vbs
+```
+
+В выводе `doctor.bat` должно быть:
+
+```text
+Маршруты telegram: http://127.0.0.1:3066
+Маршруты ozon: direct
+Маршруты wb: direct
+```
+
+Если у Ozon/WB в списке остался прокси — проверьте, что строки добавлены в `.env`
+без `#` в начале и что `stop_agent.bat` действительно остановил старый процесс.
+
+### Шаг 4. Убедитесь, что площадки видят РФ-IP
+
+Откройте в браузере на том же ПК (при включённом Karing) `https://ipinfo.io`:
+если Karing в TUN-режиме и `pythonw.exe` не исключён, браузер покажет Норвегию —
+это нормально для браузера, но проверьте бота по журналу: в `logs\worker.log`
+не должно быть `403`/`498` от Ozon и WB. Для точной проверки самого бота:
+
+```cmd
+cd /d C:\marketplace_agent
+venv\Scripts\python.exe -c "import urllib.request;o=urllib.request.build_opener(urllib.request.ProxyHandler({}));print(o.open('https://api.ipify.org',timeout=15).read().decode())"
+```
+
+Команда должна показать российский IP. Если показывает адрес VPN — Karing всё ещё
+заворачивает процесс в туннель, вернитесь к шагу 1.
+
 ## 7. Проверить, что поднялось
 
 ```cmd
@@ -261,6 +338,7 @@ del "%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\marketplace_agent.l
 | В журнале `message to edit not found` | старая версия `worker.py` | обновите код до `main`; в актуальной версии статус отправляется заново |
 | `maximum number of running instances reached` | прежний цикл автоответов не успел за 30 минут | обновите код: добавлен бюджет 20 минут и лимит 5 ответов за цикл |
 | `WB HTTP 404 /api/v1/supplier/stocks` | WB отключил legacy-метод остатков | штатный переход на `analytics/warehouse_remains`; в новой версии повторный запрос — не чаще раза в 6 часов |
+| Ozon/WB отвечают `403`/`498` или пустыми данными | запросы уходят через зарубежный VPN-узел | `MARKETPLACES_DIRECT_ONLY=true`, исключите `pythonw.exe` из туннеля Karing |
 | `heartbeat.json`: `"status": "starting"` дольше 2 минут | Telegram не подтверждает `getUpdates` (прокси/VPN), процесс при этом жив | проверьте прокси `127.0.0.1:3066`; в новой версии перезапуска не будет, а в журнале появится строка «getUpdates не ответил за 60 с» |
 | В журнале повторяется `[Worker] Telegram подключён через маршрут: …` | старая версия перезапускала воркер каждые 150 с из-за heartbeat | обновите код до `main`; в новой версии heartbeat обновляется и при статусе `starting` |
 | В журнале `РћС€РёР±РєР°` вместо русского текста | UTF-8 журнал прочитан PowerShell в cp1251 | `powershell -NoProfile -Command "Get-Content logs\worker.log -Tail 60 -Encoding UTF8"` |

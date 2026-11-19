@@ -14,6 +14,7 @@ import socket
 import subprocess
 import sys
 import time
+from datetime import datetime
 from typing import Optional
 
 from aiogram import Bot
@@ -154,7 +155,11 @@ class WorkerSupervisor:
         )
         self._restart_failures = 0
         self._next_restart_at = 0.0
-        print(f"[Supervisor] Запущен worker.py (PID={self.process.pid})", flush=True)
+        stamp = datetime.now().strftime("%d.%m %H:%M:%S")
+        print(
+            f"[Supervisor] {stamp} Запущен worker.py (PID={self.process.pid})",
+            flush=True,
+        )
 
     def stop_worker(self) -> None:
         was_running = False
@@ -309,14 +314,16 @@ class WorkerSupervisor:
 
                 if settings.RESTART_SIGNAL_FILE.exists():
                     settings.RESTART_SIGNAL_FILE.unlink(missing_ok=True)
-                    print("[Supervisor] Получен сигнал перезапуска worker.py.", flush=True)
+                    stamp = datetime.now().strftime("%d.%m %H:%M:%S")
+                    print(f"[Supervisor] {stamp} Получен сигнал перезапуска worker.py.", flush=True)
                     try:
                         self.start_worker()
                     except Exception as exc:  # noqa: BLE001
                         self._schedule_restart_backoff(exc)
 
                 if not self.is_worker_healthy():
-                    print("[Supervisor] Воркер не отвечает или завершился. Перезапуск...", flush=True)
+                    stamp = datetime.now().strftime("%d.%m %H:%M:%S")
+                    print(f"[Supervisor] {stamp} Воркер не отвечает или завершился. Перезапуск...", flush=True)
                     self.recover_worker()
         finally:
             self.shutdown()
