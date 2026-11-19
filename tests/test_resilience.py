@@ -377,6 +377,28 @@ class SchedulerBudget(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any("остановлен" in text for text in messages), messages)
 
 
+class HeartbeatReadiness(unittest.IsolatedAsyncioTestCase):
+    async def test_heartbeat_stays_fresh_while_telegram_is_unreachable(self):
+        """Живой воркер без getUpdates не должен выглядеть «зависшим»."""
+        import worker
+
+        ready = asyncio.Event()
+        beat = AsyncMock()
+        with patch.object(worker, "write_heartbeat", beat):
+            task = asyncio.create_task(worker._heartbeat_loop(ready))
+            try:
+                await asyncio.sleep(0.05)
+                self.assertTrue(beat.await_count >= 1)
+                self.assertEqual(beat.await_args.args, ("starting",))
+
+                ready.set()
+                await asyncio.sleep(0.05)
+                self.assertEqual(beat.await_args.args, ())
+            finally:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+
 class CallbackPersistence(unittest.IsolatedAsyncioTestCase):
     async def test_action_reply_survives_database_failure(self):
         from bot.handlers import callbacks

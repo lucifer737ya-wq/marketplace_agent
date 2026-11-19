@@ -217,8 +217,9 @@ type logs\heartbeat.json
 tasklist | findstr /I "pythonw python"
 ```
 
-В `heartbeat.json` должно быть свежее `iso_time` (не старше 2 минут),
-`"status": "running"` и живой `pid`.
+В `heartbeat.json` должны быть свежие `iso_time` (не старше 2 минут) и `pid`.
+`"status": "running"` — polling подтверждён; `"starting"` — процесс жив, но
+Telegram ещё не ответил на `getUpdates` (проверьте прокси/интернет, перезапуска не будет).
 
 Если процесс есть, а heartbeat старый — смотрите логи:
 
@@ -260,6 +261,8 @@ del "%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\marketplace_agent.l
 | В журнале `message to edit not found` | старая версия `worker.py` | обновите код до `main`; в актуальной версии статус отправляется заново |
 | `maximum number of running instances reached` | прежний цикл автоответов не успел за 30 минут | обновите код: добавлен бюджет 20 минут и лимит 5 ответов за цикл |
 | `WB HTTP 404 /api/v1/supplier/stocks` | WB отключил legacy-метод остатков | штатный переход на `analytics/warehouse_remains`; в новой версии повторный запрос — не чаще раза в 6 часов |
+| `heartbeat.json`: `"status": "starting"` дольше 2 минут | Telegram не подтверждает `getUpdates` (прокси/VPN), процесс при этом жив | проверьте прокси `127.0.0.1:3066`; в новой версии перезапуска не будет, а в журнале появится строка «getUpdates не ответил за 60 с» |
+| В журнале повторяется `[Worker] Telegram подключён через маршрут: …` | старая версия перезапускала воркер каждые 150 с из-за heartbeat | обновите код до `main`; в новой версии heartbeat обновляется и при статусе `starting` |
 | В журнале `РћС€РёР±РєР°` вместо русского текста | UTF-8 журнал прочитан PowerShell в cp1251 | `powershell -NoProfile -Command "Get-Content logs\worker.log -Tail 60 -Encoding UTF8"` |
 
 ---
