@@ -286,11 +286,11 @@ def _write_heartbeat_sync(payload_str: str) -> None:
     tmp_file.replace(settings.HEARTBEAT_FILE)
 
 
-async def write_heartbeat() -> None:
+async def write_heartbeat(status: str = "running") -> None:
     payload = {
         "timestamp": time.time(),
         "iso_time": datetime.now(timezone.utc).isoformat(),
-        "status": "running",
+        "status": status,
         "pid": os.getpid(),
         "ozon_degraded": ozon_service.is_degraded,
         "wb_degraded": wb_service.is_degraded,
@@ -302,8 +302,19 @@ async def write_heartbeat() -> None:
 
 
 async def _heartbeat_loop(polling_ready: asyncio.Event) -> None:
-    # A running heartbeat is a readiness signal, not just proof the event loop exists.
-    await polling_ready.wait()
+    """Пишет heartbeat всё время жизни воркера.
+
+    Пока Telegram не подтвердил polling, статус — ``starting``, но метка
+    времени обновляется каждые 10 секунд. Иначе супервизор считал живой
+    воркер «зависшим» через 150 секунд и перезапускал его: при нестабильном
+    прокси это давало бесконечный цикл «подключился → перезапуск».
+    """
+    while not polling_ready.is_set():
+        await write_heartbeat("starting")
+        try:
+            await asyncio.wait_for(polling_ready.wait(), timeout=10)
+        except asyncio.TimeoutError:
+            pass
     while True:
         await write_heartbeat()
         await asyncio.sleep(10)
@@ -864,11 +875,22 @@ async def _run_polling_with_conflict_guard(polling_ready: asyncio.Event) -> None
                 conflict.set()
             raise
 
+    async def warn_if_polling_is_stuck() -> None:
+        await asyncio.sleep(60)
+        if not polling_ready.is_set():
+            print(
+                "[Worker] Telegram: getUpdates не ответил за 60 с. Проверьте "
+                "прокси/интернет; воркер продолжает работу, перезапуска не будет "
+                "(heartbeat остаётся в статусе starting).",
+                flush=True,
+            )
+
     bot.session.middleware(observe)
     await bot.delete_webhook(drop_pending_updates=False)
     polling = asyncio.create_task(dp.start_polling(bot, close_bot_session=False,
                                   allowed_updates=dp.resolve_used_update_types()))
     waiter = asyncio.create_task(conflict.wait())
+    slow_notice = asyncio.create_task(warn_if_polling_is_stuck())
     try:
         await asyncio.wait((polling, waiter), return_when=asyncio.FIRST_COMPLETED)
         if conflict.is_set():
@@ -878,9 +900,10 @@ async def _run_polling_with_conflict_guard(polling_ready: asyncio.Event) -> None
         await polling
     finally:
         waiter.cancel()
+        slow_notice.cancel()
         if not polling.done():
             polling.cancel()
-        await asyncio.gather(waiter, polling, return_exceptions=True)
+        await asyncio.gather(waiter, slow_notice, polling, return_exceptions=True)
 
 
 async def main() -> None:
@@ -896,8 +919,12 @@ async def main() -> None:
 
     scheduler: Optional[AsyncIOScheduler] = None
     heartbeat_task: Optional[asyncio.Task] = None
+    polling_ready = asyncio.Event()
 
     try:
+        # Heartbeat стартует до сети и БД: супервизор видит живой процесс,
+        # пока идёт подключение к Telegram (до 45 с на маршрут).
+        heartbeat_task = asyncio.create_task(_heartbeat_loop(polling_ready))
         await init_db()
         interrupted = await recover_interrupted_actions()
 
@@ -911,8 +938,6 @@ async def main() -> None:
 
         scheduler = configure_scheduler()
         scheduler.start()
-        polling_ready = asyncio.Event()
-        heartbeat_task = asyncio.create_task(_heartbeat_loop(polling_ready))
 
         await _run_polling_with_conflict_guard(polling_ready)
     finally:
