@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import math
+import time
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
@@ -8,6 +9,7 @@ from config import settings
 from services.common.market_api import APIStatusError, MarketplaceClient, read_versions
 
 logger = logging.getLogger(__name__)
+
 
 
 def _exc_label(exc: BaseException) -> str:
@@ -64,6 +66,9 @@ class WBStatisticsAPI(MarketplaceClient):
         super().__init__("WB", settings.WB_API_TOKEN, notify_callback)
         self._tariffs_lock = asyncio.Lock()
         self._orders_lock = asyncio.Lock()
+        # WB отключил legacy /api/v1/supplier/stocks: после 404 не дёргаем
+        # его 6 часов, иначе каждый цикл синхронизации пишет ту же ошибку.
+        self._fbo_legacy_retry_at = 0.0
 
     async def _request(self, method: str, url: str, params=None, json_data=None) -> Any:
         return await self.request_json(
@@ -421,8 +426,24 @@ class WBStatisticsAPI(MarketplaceClient):
     async def _fetch_fbo(self, source: str) -> tuple[dict, dict]:
         quantities, locations = {}, {}
         if source == "supplier":
+            if time.monotonic() < self._fbo_legacy_retry_at:
+                raise APIStatusError(
+                    404, "WB: legacy /api/v1/supplier/stocks отключён (пауза 6 ч)"
+                )
             url = self.STATS_URL + "/api/v1/supplier/stocks"
-            rows = await self._request("GET", url, params={"dateFrom": "2019-06-20"})
+            try:
+                rows = await self._request(
+                    "GET", url, params={"dateFrom": "2019-06-20"}
+                )
+            except APIStatusError as exc:
+                if exc.status in {404, 410}:
+                    self._fbo_legacy_retry_at = time.monotonic() + 6 * 3600
+                    logger.warning(
+                        "WB legacy /api/v1/supplier/stocks недоступен (HTTP %s): "
+                        "FBO-остатки берутся из analytics/warehouse_remains",
+                        exc.status,
+                    )
+                raise
             if not isinstance(rows, list):
                 raise RuntimeError("WB: неверный формат FBO-остатков")
             seen = set()

@@ -5,7 +5,9 @@
 недоступный диск для HTML-отчёта и сбой записи статуса действия в БД.
 """
 
+import asyncio
 import tempfile
+import time
 import unittest
 from datetime import date
 from pathlib import Path
@@ -236,6 +238,14 @@ class WildberriesDegradation(unittest.IsolatedAsyncioTestCase):
         self.assertIn("legacy", report["source"])
         self.assertIn("404", report["source"])
 
+    async def test_dead_legacy_fbo_endpoint_is_not_hammered(self):
+        """После 404 legacy-остатков WB повторный запрос не уходит в сеть 6 часов."""
+        self.wb._request = AsyncMock()
+        self.wb._fbo_legacy_retry_at = time.monotonic() + 60
+        with self.assertRaises(APIStatusError):
+            await self.wb._fetch_fbo("supplier")
+        self.wb._request.assert_not_awaited()
+
     async def test_campaign_list_survives_missing_fields(self):
         async def request(method, url, params=None, json_data=None):
             if url.endswith("/promotion/count"):
@@ -310,6 +320,61 @@ class SupervisorResilience(unittest.TestCase):
         path = runtime_bootstrap.redirect_stdio("bootstrap-test.log")
         self.assertIsNotNone(path)
         self.assertTrue(path.parent.exists())
+
+
+class StatusMessages(unittest.IsolatedAsyncioTestCase):
+    async def test_edit_of_deleted_message_falls_back_to_new_message(self):
+        """«message to edit not found» больше не скрывает исходную ошибку."""
+        import worker
+
+        status = MagicMock()
+        status.edit_text = AsyncMock(
+            side_effect=RuntimeError("Bad Request: message to edit not found")
+        )
+        status.answer = AsyncMock()
+        await worker._show_status_result(status, "<b>Ошибка P&L</b>")
+        status.answer.assert_awaited_once()
+        self.assertIn("Ошибка P&L", status.answer.await_args.args[0])
+
+    async def test_delete_of_missing_status_does_not_raise(self):
+        import worker
+
+        status = MagicMock()
+        status.delete = AsyncMock(side_effect=RuntimeError("message to delete not found"))
+        await worker._safe_delete_message(status)
+        status.delete.assert_awaited_once()
+
+    async def test_unchanged_status_is_not_duplicated(self):
+        import worker
+
+        status = MagicMock()
+        status.edit_text = AsyncMock(
+            side_effect=RuntimeError("Bad Request: message is not modified")
+        )
+        status.answer = AsyncMock()
+        await worker._show_status_result(status, "тот же текст")
+        status.answer.assert_not_awaited()
+
+
+class SchedulerBudget(unittest.IsolatedAsyncioTestCase):
+    async def test_browser_job_stops_after_budget(self):
+        """Цикл автоответов не занимает 30 минут и не блокирует следующий запуск."""
+        import worker
+
+        async def slow(*args, **kwargs):
+            await asyncio.sleep(5)
+
+        notify = AsyncMock()
+        with patch.object(worker, "auto_reply_unanswered_reviews", slow), \
+             patch.object(worker, "auto_reply_unanswered_questions", AsyncMock(
+                 return_value={"status": "success"}
+             )), \
+             patch.object(worker, "notify_admin", notify), \
+             patch.object(worker, "BROWSER_JOB_BUDGET_SEC", 0.05):
+            await worker.scheduled_reviews_and_questions_job()
+
+        messages = [str(call.args[0]) for call in notify.await_args_list if call.args]
+        self.assertTrue(any("остановлен" in text for text in messages), messages)
 
 
 class CallbackPersistence(unittest.IsolatedAsyncioTestCase):
