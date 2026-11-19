@@ -3,7 +3,7 @@ import html
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from services.common.gemini import generate
 
@@ -22,7 +22,7 @@ async def check_gemini_api_health() -> Dict[str, Any]:
         reply, model = await generate('Ответь: ОК', max_tokens=128, fast=True, timeout=20)
     except RuntimeError as exc:
         return {'ok': False, 'detail': str(exc)}
-    return {'ok': True, 'model': model, 'route': 'локальный прокси',
+    return {'ok': True, 'model': model, 'route': 'авто (прямой/прокси)',
             'latency_ms': int((time.perf_counter() - start) * 1000), 'detail': reply}
 
 
@@ -36,7 +36,7 @@ async def _call_gemini_advisory(prompt: str) -> str:
 
 async def generate_monday_ai_board_report(
     ozon_service: OzonSellerAPI, wb_service: WBStatisticsAPI
-) -> Tuple[str, Path]:
+) -> Tuple[str, Optional[Path]]:
     async def _safe(label: str, coro) -> Any:
         """Один упавший источник не должен обнулять весь разбор Совета."""
         try:
@@ -144,8 +144,10 @@ async def generate_monday_ai_board_report(
         f"<h2>📊 Приложение: ТОП-5 и финансовые срезы</h2><pre style='white-space:pre-wrap;font-family:inherit'>{html.escape(top5_text)}</pre>"
         f"</div></body></html>"
     )
+    saved_path: Optional[Path] = None
     try:
         report_file.write_text(html_doc, encoding="utf-8")
+        saved_path = report_file
     except OSError as exc:  # noqa: BLE001 — диск может быть занят или переполнен
         print(f"[AI Board] Не удалось записать HTML-отчёт: {exc}", flush=True)
 
@@ -153,4 +155,6 @@ async def generate_monday_ai_board_report(
     if len(ai_analysis) > 3800:
         tg_summary += "\n\n📎 Полный файл разбора прикреплен ниже."
 
-    return tg_summary, report_file
+    # None означает «файл не сохранён»: вызывающий код не должен пытаться
+    # отправить в Telegram несуществующий документ.
+    return tg_summary, saved_path

@@ -133,6 +133,15 @@ async def _fetch_json(
             await connector.close()
 
 
+async def _fetch_json_direct(
+    url: str,
+    headers: Dict[str, str],
+    timeout: aiohttp.ClientTimeout,
+) -> Tuple[Optional[Any], Optional[str], bool]:
+    """Прямой GET без следования редиректам (витрины отдают 307-петлю антибота)."""
+    return await _fetch_json(url, headers, timeout, allow_redirects=False)
+
+
 def _extract_wb_product_price(product: Dict[str, Any]) -> float:
     sizes = product.get("sizes")
     if isinstance(sizes, list):
@@ -286,7 +295,7 @@ async def _parse_wb_competitors_with_status(
             }
         )
 
-    return items, last_err
+    return items, err_msg
 
 
 async def parse_wb_competitors(query: str, count: int = 15) -> List[Dict[str, Any]]:

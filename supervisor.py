@@ -1,3 +1,7 @@
+import runtime_bootstrap
+
+runtime_bootstrap.install_excepthook("supervisor.log")
+
 import asyncio
 import atexit
 from collections import deque
@@ -19,15 +23,15 @@ from aiogram.exceptions import TelegramAPIError
 from config import BASE_DIR, LOGS_DIR, prepare_runtime_dirs, settings
 from maintenance.self_healer import run_full_self_check_and_heal
 from maintenance.supervisor import apply_code_patch
-from services.common.routes import proxy_routes, remember_route
+from services.common.routes import (
+    proxy_for_route,
+    remember_route,
+    telegram_routes,
+)
 
 def _ensure_stdio_streams() -> None:
-    """Перенаправляет stdout/stderr в лог-файл при скрытом запуске через pythonw.exe (start_hidden.vbs)."""
-    log_path = LOGS_DIR / "supervisor.log"
-    if sys.stdout is None:
-        sys.stdout = open(log_path, "a", encoding="utf-8", buffering=1)
-    if sys.stderr is None:
-        sys.stderr = open(log_path, "a", encoding="utf-8", buffering=1)
+    """Перенаправляет stdout/stderr в лог-файл при скрытом запуске через pythonw.exe."""
+    runtime_bootstrap.redirect_stdio("supervisor.log")
 
 
 HEARTBEAT_TIMEOUT_SEC = 150
@@ -36,15 +40,31 @@ TELEGRAM_POLLING_COOLDOWN_SEC = 2.5
 
 
 async def notify(text: str) -> None:
-    for proxy in proxy_routes('telegram'):
-        async with Bot(token=settings.TG_BOT_TOKEN, session=AiohttpSession(proxy=proxy, timeout=15)).context() as bot:
-            try:
-                await bot.send_message(settings.TG_ADMIN_ID, text, parse_mode='HTML')
-            except (TelegramAPIError, asyncio.TimeoutError, OSError) as exc:
-                print(f'[Supervisor] Telegram: {type(exc).__name__}', flush=True)
-                continue
-            remember_route('telegram', proxy)
-            return
+    """Уведомление администратору; сбой Telegram не должен ронять супервизор."""
+    try:
+        routes = telegram_routes("telegram")
+    except ValueError as exc:
+        print(f"[Supervisor] Telegram: {exc}", flush=True)
+        return
+    for route in routes:
+        proxy = proxy_for_route(route)
+        try:
+            async with Bot(
+                token=settings.TG_BOT_TOKEN,
+                session=AiohttpSession(proxy=proxy, timeout=15),
+            ).context() as bot:
+                await bot.send_message(
+                    settings.TG_ADMIN_ID, text, parse_mode="HTML"
+                )
+        except (TelegramAPIError, asyncio.TimeoutError, OSError, ValueError) as exc:
+            print(
+                f"[Supervisor] Telegram {route or 'direct'}: {type(exc).__name__}",
+                flush=True,
+            )
+            continue
+        remember_route("telegram", route)
+        return
+    print("[Supervisor] Telegram недоступен по всем маршрутам", flush=True)
 
 
 def _is_local_port_in_use(port: int) -> bool:
@@ -79,6 +99,8 @@ class WorkerSupervisor:
         self._stopping: bool = False
         self._exits = deque(maxlen=3)
         self._next_crash_check = 0.0
+        self._restart_failures = 0
+        self._next_restart_at = 0.0
 
     def acquire_single_instance_lock(self) -> bool:
         """Гарантирует единственный экземпляр supervisor.py в ОС (защита от TelegramConflictError в start_hidden.vbs)."""
@@ -130,6 +152,8 @@ class WorkerSupervisor:
             creationflags=creation_flags,
             env={**os.environ, "MARKETPLACE_SUPERVISED": "1"},
         )
+        self._restart_failures = 0
+        self._next_restart_at = 0.0
         print(f"[Supervisor] Запущен worker.py (PID={self.process.pid})", flush=True)
 
     def stop_worker(self) -> None:
@@ -201,9 +225,22 @@ class WorkerSupervisor:
             for line in result['details']:
                 await notify(line)
 
+    def _schedule_restart_backoff(self, exc: BaseException) -> None:
+        """Не молотить перезапусками при неустранимой ошибке (битый .env, занятый порт)."""
+        self._restart_failures += 1
+        delay = min(5 * (2 ** min(self._restart_failures - 1, 6)), 300)
+        self._next_restart_at = time.monotonic() + delay
+        print(
+            f"[Supervisor] Перезапуск не удался ({type(exc).__name__}: {exc}). "
+            f"Следующая попытка через {delay} с.",
+            flush=True,
+        )
+
     def recover_worker(self) -> None:
         # A syntax error in worker.py prevents even its scheduled /heal from starting.
         now = time.monotonic()
+        if now < self._next_restart_at:
+            return
         self._exits.append(now)
         if len(self._exits) == 3 and now - self._exits[0] < 600 and now >= self._next_crash_check:
             self._next_crash_check = now + 3600
@@ -211,8 +248,12 @@ class WorkerSupervisor:
                 asyncio.run(self.diagnose(silent_if_healthy=False))
             except (OSError, RuntimeError, ValueError) as exc:
                 print(f"[Supervisor] Диагностика недоступна: {type(exc).__name__}", flush=True)
-        if not self.is_worker_healthy():
+        if self.is_worker_healthy():
+            return
+        try:
             self.start_worker()
+        except Exception as exc:  # noqa: BLE001 — супервизор обязан жить дальше
+            self._schedule_restart_backoff(exc)
 
     async def process_requests(self) -> None:
         for path in sorted((LOGS_DIR / 'maintenance_queue').glob('*.json')):
@@ -269,7 +310,10 @@ class WorkerSupervisor:
                 if settings.RESTART_SIGNAL_FILE.exists():
                     settings.RESTART_SIGNAL_FILE.unlink(missing_ok=True)
                     print("[Supervisor] Получен сигнал перезапуска worker.py.", flush=True)
-                    self.start_worker()
+                    try:
+                        self.start_worker()
+                    except Exception as exc:  # noqa: BLE001
+                        self._schedule_restart_backoff(exc)
 
                 if not self.is_worker_healthy():
                     print("[Supervisor] Воркер не отвечает или завершился. Перезапуск...", flush=True)

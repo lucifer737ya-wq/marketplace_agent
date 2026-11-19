@@ -137,13 +137,42 @@ class Runtime(unittest.IsolatedAsyncioTestCase):
         from worker import _split_html_chunks
 
         text = "<b>Заголовок\n<i>" + "РК 🟢 &amp; WB" * 400 + "</i></b>"
-        chunks = _split_html_chunks(text)
-        self.assertGreater(len(chunks), 1)
-        visible = [
-            "".join(fromstring("<root>" + c + "</root>").itertext()) for c in chunks
-        ]
-        self.assertTrue(all(len(s.encode("utf-16-le")) // 2 <= 3900 for s in visible))
-        self.assertEqual("".join(visible), "".join(fromstring(text).itertext()))
+        # Отдельный случай: почти вся длина — экранированные сущности (&amp;).
+        escaped = "<b>" + "тест &amp; " * 700 + "</b>"
+        for sample in (text, escaped):
+            chunks = _split_html_chunks(sample)
+            self.assertGreater(len(chunks), 1)
+            # Telegram считает «сырую» длину вместе с тегами и &amp;.
+            self.assertTrue(
+                all(len(chunk.encode("utf-16-le")) // 2 <= 3900 for chunk in chunks)
+            )
+            visible = [
+                "".join(fromstring("<root>" + c + "</root>").itertext())
+                for c in chunks
+            ]
+            self.assertEqual(
+                "".join(visible), "".join(fromstring(sample).itertext())
+            )
+
+    async def test_handler_error_notifies_admin_and_keeps_polling(self):
+        from types import SimpleNamespace
+        import worker
+
+        fake_bot = AsyncMock()
+        event = SimpleNamespace(exception=RuntimeError("database is locked"))
+        with patch.object(worker, "bot", fake_bot), patch.object(
+            settings, "TG_ADMIN_ID", 1
+        ):
+            handled = await worker.on_handler_error(event)
+        self.assertTrue(handled)
+        self.assertIn("database is locked", fake_bot.send_message.await_args.args[1])
+
+        failing_bot = AsyncMock()
+        failing_bot.send_message.side_effect = OSError("telegram is down")
+        with patch.object(worker, "bot", failing_bot), patch.object(
+            settings, "TG_ADMIN_ID", 1
+        ):
+            self.assertTrue(await worker.on_handler_error(event))
 
     def test_routes(self):
         reset_routes()

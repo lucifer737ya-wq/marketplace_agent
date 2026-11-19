@@ -1,6 +1,6 @@
 import os
 from pathlib import Path
-from pydantic import AliasChoices, Field, field_validator
+from pydantic import AliasChoices, Field, ValidationError, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -134,4 +134,22 @@ class Settings(BaseSettings):
         return self.WB_API_TOKEN
 
 
-settings = Settings()
+try:
+    settings = Settings()
+except ValidationError as exc:
+    # Понятное сообщение важнее простыни pydantic: при скрытом запуске
+    # (pythonw.exe) traceback — единственный канал диагностики.
+    missing = sorted(
+        {
+            str(error.get("loc", ("?",))[0])
+            for error in exc.errors()
+            if error.get("type") == "missing"
+        }
+    )
+    hint = (
+        "Не заполнены обязательные параметры .env: "
+        + (", ".join(missing) if missing else "проверьте значения")
+        + f". Скопируйте {BASE_DIR / '.env.example'} в {BASE_DIR / '.env'} "
+        "и заполните ключи. Диагностика без сети: python doctor.py"
+    )
+    raise RuntimeError(hint) from exc

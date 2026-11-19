@@ -257,6 +257,74 @@ class Adapters(unittest.IsolatedAsyncioTestCase):
         self.assertIn("777", result["source"])
         self.assertIn("HTTP 400", result["source"])
 
+    async def test_ozon_legacy_type_id_inside_accrual_is_not_a_fee(self):
+        """Старая схема: type_id у самого начисления не должен считаться услугой."""
+        accrual = {
+            "type_id": 55,
+            "date": "2026-11-18",
+            "accrued": {"amount": "100"},
+            "posting": {
+                "products": [
+                    {
+                        "sku": 5,
+                        "commission": {
+                            "seller_price": {"amount": "100"},
+                            "sale_commission": {"amount": "-10"},
+                        },
+                    }
+                ]
+            },
+        }
+
+        async def request(method, path, payload):
+            if path == "/v1/finance/accrual/types":
+                return {"accrual_types": []}
+            if path == "/v1/finance/accrual/by-day":
+                return {"accruals": [accrual], "last_id": ""}
+            raise APIStatusError(400, "cash-flow window")
+
+        self.oz._request = AsyncMock(side_effect=request)
+        result = await self.oz.fetch_real_finance_breakdown(
+            custom_date_from="2026-11-18", custom_date_to="2026-11-18"
+        )
+        self.assertEqual(result["sales_total"], 100)
+        self.assertEqual(result["commission"], 10)
+        self.assertEqual(result["other_fines"], 0)
+        self.assertEqual(result["orders_count"], 1)
+
+    async def test_ozon_return_accrual_reduces_commission(self):
+        """Возврат: отрицательная продажа возвращает и комиссию."""
+        row = {
+            "accrual_id": "9",
+            "date": "2026-11-18",
+            "posting": {
+                "posting_number": "123-1",
+                "products": [
+                    {
+                        "sku": 7,
+                        "commission": {
+                            "seller_price": {"amount": "-100"},
+                            "sale_commission": {"amount": "-10"},
+                        },
+                    }
+                ],
+            },
+        }
+
+        async def request(method, path, payload):
+            if path == "/v1/finance/accrual/types":
+                return {"accrual_types": []}
+            if path == "/v1/finance/accrual/by-day":
+                return {"accruals": [row], "last_id": ""}
+            raise APIStatusError(400, "cash-flow window")
+
+        self.oz._request = AsyncMock(side_effect=request)
+        result = await self.oz.fetch_real_finance_breakdown(
+            custom_date_from="2026-11-18", custom_date_to="2026-11-18"
+        )
+        self.assertEqual(result["sales_total"], -100)
+        self.assertEqual(result["commission"], -10)
+
     async def test_performance_campaigns_real_membership_billing_not_organic(self):
         self.oz._perf_token = AsyncMock(return_value="test")
 

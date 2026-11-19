@@ -1,3 +1,9 @@
+import runtime_bootstrap
+
+# Должно выполниться до импорта config: при pythonw.exe и битом .env
+# traceback иначе некуда записать.
+runtime_bootstrap.install_excepthook("worker.log")
+
 import asyncio
 import functools
 import html
@@ -5,9 +11,9 @@ import json
 import os
 import re
 import socket
-import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
@@ -17,13 +23,17 @@ from aiogram.exceptions import TelegramAPIError, TelegramConflictError
 from aiogram.methods import GetUpdates
 from aiogram.filters import Command, CommandObject
 from aiogram.fsm.context import FSMContext
-from aiogram.types import BotCommand, FSInputFile, Message
+from aiogram.types import BotCommand, ErrorEvent, FSInputFile, Message
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
-from config import LOGS_DIR, prepare_runtime_dirs, settings
-from services.common.routes import proxy_routes, remember_route
+from config import prepare_runtime_dirs, settings
+from services.common.routes import (
+    proxy_for_route,
+    remember_route,
+    telegram_routes,
+)
 from maintenance.supervisor import apply_code_patch, queue_if_supervised
 from database.crud import bulk_update_product_market_state, recover_interrupted_actions
 from database.models import close_db, init_db
@@ -56,15 +66,17 @@ from bot.keyboards import get_main_menu_keyboard
 
 
 def _ensure_stdio_streams() -> None:
-    """Перенаправляет stdout/stderr в лог при скрытом запуске через pythonw.exe (start_hidden.vbs)."""
-    log_path = LOGS_DIR / "worker.log"
-    if sys.stdout is None:
-        sys.stdout = open(log_path, "a", encoding="utf-8", buffering=1)
-    if sys.stderr is None:
-        sys.stderr = open(log_path, "a", encoding="utf-8", buffering=1)
+    """Перенаправляет stdout/stderr в лог при скрытом запуске через pythonw.exe."""
+    runtime_bootstrap.redirect_stdio("worker.log")
 
 
-MSK_TZ = ZoneInfo(settings.TIMEZONE)
+try:
+    MSK_TZ = ZoneInfo(settings.TIMEZONE)
+except Exception:  # noqa: BLE001 — кривой TIMEZONE или отсутствие tzdata на Windows
+    try:
+        MSK_TZ = ZoneInfo("Europe/Moscow")
+    except Exception:  # noqa: BLE001
+        MSK_TZ = timezone(timedelta(hours=3))
 
 _WORKER_LOCK_SOCKET: Optional[socket.socket] = None
 _BROWSER_JOB_LOCK = asyncio.Lock()
@@ -82,49 +94,132 @@ dp.include_router(reviews_router)
 dp.include_router(questions_router)
 
 
+@dp.errors()
+async def on_handler_error(event: ErrorEvent) -> bool:
+    """Последний рубеж: ошибка обработчика не оставляет пользователя без ответа.
+
+    Раньше исключение (например, «database is locked») попадало только в лог,
+    а кнопка в боте молча «не работала». Теперь админ получает тип ошибки и
+    короткий текст, а бот продолжает polling.
+    """
+    exc = event.exception
+    print(f"[Worker] Ошибка обработчика {type(exc).__name__}: {exc}", flush=True)
+    try:
+        if bot is not None:
+            await bot.send_message(
+                settings.TG_ADMIN_ID,
+                f"⚠️ Внутренняя ошибка: {type(exc).__name__}\n"
+                f"{str(exc)[:800]}\n\nБот продолжает работу. "
+                "Подробности — в logs\\worker.log",
+            )
+    except Exception as notify_exc:  # noqa: BLE001 — не роняем polling из-за уведомления
+        print(
+            f"[Worker] Не удалось сообщить об ошибке: {type(notify_exc).__name__}",
+            flush=True,
+        )
+    return True
+
+
 async def ensure_working_telegram_route() -> None:
+    """Поднимает бота через первый рабочий маршрут.
+
+    Порядок: прямой адрес (если разрешён) → локальные прокси. Раньше Telegram
+    зависел только от локального прокси: если прокси не запущен, бот не стартовал
+    даже при полностью доступном интернете.
+    """
     global bot
-    for proxy in proxy_routes('telegram'):
-        candidate = Bot(token=settings.TG_BOT_TOKEN, session=AiohttpSession(proxy=proxy, timeout=45))
+    try:
+        routes = telegram_routes("telegram")
+    except ValueError as exc:
+        raise RuntimeError(
+            "Telegram: нет ни одного маршрута. Проверьте ALLOW_DIRECT_CONNECTIONS "
+            "и LOCAL_PROXY_URL в .env"
+        ) from exc
+
+    errors: list[str] = []
+    for route in routes:
+        proxy = proxy_for_route(route)
+        label = "напрямую" if proxy is None else proxy
+        candidate = Bot(
+            token=settings.TG_BOT_TOKEN,
+            session=AiohttpSession(proxy=proxy, timeout=45),
+        )
         try:
             await candidate.get_me()
-            remember_route('telegram', proxy)
-        except (TelegramAPIError, asyncio.TimeoutError, OSError):
+        except (TelegramAPIError, asyncio.TimeoutError, OSError) as exc:
+            errors.append(f"{label}: {type(exc).__name__}")
             await candidate.session.close()
             continue
         except BaseException:
             await candidate.session.close()
             raise
+        remember_route("telegram", route)
         bot = candidate
+        print(f"[Worker] Telegram подключён через маршрут: {label}", flush=True)
         return
-    raise RuntimeError('Telegram недоступен через настроенный локальный прокси')
+    raise RuntimeError(
+        "Telegram недоступен ни по одному маршруту ("
+        + ("; ".join(errors) or "нет маршрутов")
+        + "). Проверьте интернет, VPN/прокси и токен бота."
+    )
+
+
+def _html_units(value: str) -> int:
+    """Длина строки в единицах UTF-16 — именно её лимитирует Telegram (4096)."""
+    return len(value.encode('utf-16-le')) // 2
 
 
 def _split_html_chunks(text: str, limit: int = 3900) -> List[str]:
-    """Keep entities and formatting intact, even across one long AI-generated line."""
-    if len(text.encode('utf-16-le')) // 2 <= limit:
+    """Режет HTML на части, сохраняя сущности и парность тегов.
+
+    Бюджет считается по «сырой» длине (теги и ``&amp;`` тоже занимают место в
+    лимите Telegram), поэтому куски гарантированно укладываются в ``limit``
+    даже при тексте из одних экранированных символов.
+    """
+    if _html_units(text) <= limit:
         return [text]
-    chunks, parts, tags = [], [], []
+    chunks: List[str] = []
+    parts: List[str] = []
+    tags: List[tuple[str, str]] = []
     used = 0
-    for match in re.finditer(r"</?[a-zA-Z][^<>]*>|&(?:#\d+|#x[0-9a-fA-F]+|[a-zA-Z]+);|.", text, re.S):
+
+    def close_units() -> int:
+        return sum(_html_units(f'</{name}>') for name, _ in tags)
+
+    def reopen_units() -> int:
+        return sum(_html_units(opening) for _, opening in tags)
+
+    for match in re.finditer(
+        r"</?[a-zA-Z][^<>]*>|&(?:#\d+|#x[0-9a-fA-F]+|[a-zA-Z]+);|.",
+        text,
+        re.S,
+    ):
         token = match[0]
         tag = re.fullmatch(r"<(/?)([a-zA-Z][\w-]*)[^<>]*>", token)
         if tag:
             parts.append(token)
+            used += _html_units(token)
             if tag[1]:
                 if tags and tag[2] == tags[-1][0]:
                     tags.pop()
             elif not token.endswith('/>'):
                 tags.append((tag[2], token))
             continue
-        size = len(html.unescape(token).encode('utf-16-le')) // 2
-        if used and used + size > limit:
-            chunks.append(''.join(parts) + ''.join(f'</{name}>' for name, _ in reversed(tags)))
+
+        size = _html_units(token)
+        prefix = reopen_units()
+        # Закрывающие теги и повторное открытие тоже входят в лимит.
+        if parts and used + size + close_units() > limit and used > prefix:
+            chunks.append(
+                ''.join(parts)
+                + ''.join(f'</{name}>' for name, _ in reversed(tags))
+            )
             parts = [opening for _, opening in tags]
-            used = 0
+            used = prefix
         parts.append(token)
         used += size
-    if used:
+
+    if parts:
         chunks.append(''.join(parts))
     return chunks
 
@@ -293,11 +388,16 @@ async def scheduled_monday_top5_report() -> None:
 async def scheduled_monday_evening_ai_board() -> None:
     summary_text, file_path = await generate_monday_ai_board_report(ozon_service, wb_service)
     await bot.send_message(chat_id=settings.TG_ADMIN_ID, text=summary_text)
-    await bot.send_document(
-        chat_id=settings.TG_ADMIN_ID,
-        document=FSInputFile(str(file_path)),
-        caption="📎 Полный стратегический отчет Совета ИИ-специалистов (откройте в браузере)",
-    )
+    if file_path is not None and Path(file_path).exists():
+        await bot.send_document(
+            chat_id=settings.TG_ADMIN_ID,
+            document=FSInputFile(str(file_path)),
+            caption="📎 Полный стратегический отчет Совета ИИ-специалистов (откройте в браузере)",
+        )
+    else:
+        await notify_admin(
+            "⚠️ HTML-файл разбора не сохранился (диск/права). Краткий итог выше."
+        )
 
 
 async def scheduled_monthly_audit() -> None:
@@ -379,10 +479,15 @@ async def cmd_ai_board(message: Message) -> None:
         summary_text, file_path = await generate_monday_ai_board_report(ozon_service, wb_service)
         await status_msg.delete()
         await message.answer(summary_text)
-        await message.answer_document(
-            document=FSInputFile(str(file_path)),
-            caption="📎 Полный стратегический отчет Совета ИИ-специалистов (откройте в браузере)",
-        )
+        if file_path is not None and Path(file_path).exists():
+            await message.answer_document(
+                document=FSInputFile(str(file_path)),
+                caption="📎 Полный стратегический отчет Совета ИИ-специалистов (откройте в браузере)",
+            )
+        else:
+            await message.answer(
+                "⚠️ HTML-файл разбора не сохранился (диск/права). Краткий итог выше."
+            )
     except Exception as exc:
         await status_msg.edit_text(f"❌ Ошибка ИИ-Советника:\n<code>{html.escape(str(exc))}</code>", parse_mode="HTML")
 

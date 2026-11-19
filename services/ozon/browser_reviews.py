@@ -9,8 +9,25 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Set, Tuple
 from zoneinfo import ZoneInfo
 
-from playwright.async_api import Error as PWError
-from playwright.async_api import TimeoutError as PWTimeout
+try:  # Playwright — необязательный браузерный ярус, бот должен жить и без него
+    from playwright.async_api import Error as PWError
+    from playwright.async_api import TimeoutError as PWTimeout
+
+    PLAYWRIGHT_AVAILABLE = True
+except ImportError:  # pragma: no cover - зависит от окружения ПК
+    class PWError(Exception):
+        """Заглушка, чтобы модуль импортировался без Playwright."""
+
+    class PWTimeout(PWError):
+        """Заглушка таймаута Playwright."""
+
+    PLAYWRIGHT_AVAILABLE = False
+
+PLAYWRIGHT_MISSING_MESSAGE = (
+    "Playwright не установлен или браузер Chromium не загружен. "
+    "Выполните в cmd: venv\\Scripts\\python.exe -m pip install -r requirements.txt "
+    "и venv\\Scripts\\python.exe -m playwright install chromium"
+)
 
 from config import LOGS_DIR, settings
 from services.common.storage import write_json
@@ -429,6 +446,9 @@ async def _click_subtab(page, names: List[str]) -> bool:
 
 
 async def run_interactive_login() -> None:
+    if not PLAYWRIGHT_AVAILABLE:
+        print(f"[Ozon Browser] {PLAYWRIGHT_MISSING_MESSAGE}")
+        return
     from playwright.async_api import async_playwright
 
     print("\n[Ozon Browser] Запуск браузера без VPN для авторизации...")
@@ -1059,6 +1079,8 @@ async def auto_reply_unanswered_reviews(
     dry_run: bool = False,
     max_per_run: int = 1,
 ) -> Dict[str, Any]:
+    if not PLAYWRIGHT_AVAILABLE:
+        return {"status": "error", "replied": 0, "message": PLAYWRIGHT_MISSING_MESSAGE}
     from playwright.async_api import async_playwright
 
     tracker = _load_tracker()
@@ -1101,6 +1123,8 @@ async def auto_reply_unanswered_questions(
     dry_run: bool = False,
     max_per_run: int = 1,
 ) -> Dict[str, Any]:
+    if not PLAYWRIGHT_AVAILABLE:
+        return {"status": "error", "replied": 0, "message": PLAYWRIGHT_MISSING_MESSAGE}
     from playwright.async_api import async_playwright
     from services.common.buyer_questions import generate_buyer_question_answer
 
