@@ -8,7 +8,7 @@ to the next route — this is what makes the module survive a dead proxy.
 import asyncio
 import logging
 import re
-from typing import Any, Optional
+from typing import Any
 
 import aiohttp
 
@@ -61,16 +61,6 @@ BASE_URL = (
 
 def base_url() -> str:
     return str(settings.GEMINI_DIRECT_URL or "").rstrip("/") + "/v1beta/models"
-from services.common.routes import DIRECT, proxy_routes, remember_route
-
-BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
-FALLBACK_MODELS = [
-    "gemini-2.5-flash",
-    "gemini-2.0-flash",
-    "gemini-2.5-pro",
-    "gemini-flash-lite-latest",
-    "gemini-1.5-flash",
-]
 
 
 def _extract_model_name(item: Any) -> str:

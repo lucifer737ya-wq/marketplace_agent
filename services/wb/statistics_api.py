@@ -1,10 +1,19 @@
 import asyncio
+import logging
 import math
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 from config import settings
 from services.common.market_api import APIStatusError, MarketplaceClient, read_versions
+
+logger = logging.getLogger(__name__)
+
+
+def _exc_label(exc: BaseException) -> str:
+    if isinstance(exc, APIStatusError):
+        return f"HTTP {exc.status}"
+    return type(exc).__name__
 
 
 def _latin(value: str) -> int | float | str | None:
@@ -66,31 +75,54 @@ class WBStatisticsAPI(MarketplaceClient):
         )
 
     async def fetch_wb_tariffs(self) -> dict:
+        """Тарифы WB. Недоступность тарифов не должна отменять синхронизацию остатков."""
         today = datetime.utcnow().date().isoformat()
         key = "tariffs:" + today
         async with self._tariffs_lock:
             cached = self._read_disk_cache(key, 21600)
             if cached is not None:
                 return cached
-            commissions = await self._request(
-                "GET", self.COMMON_URL + "/api/v1/tariffs/commission"
-            )
-            boxes = await self._request(
-                "GET", self.COMMON_URL + "/api/v1/tariffs/box", params={"date": today}
-            )
-            subjects = {
-                str(r["subjectID"]): {
-                    "fbo": r.get("paidStorageKgvp"),
-                    "fbs": r.get("kgvpMarketplace"),
-                }
-                for r in commissions["report"]
-            }
-            warehouses = {
-                w["warehouseName"]: w
-                for w in boxes["response"]["data"]["warehouseList"]
-            }
+
+            subjects: Dict[str, Dict[str, Any]] = {}
+            warehouses: Dict[str, Dict[str, Any]] = {}
+            try:
+                commissions = await self._request(
+                    "GET", self.COMMON_URL + "/api/v1/tariffs/commission"
+                )
+                report = (
+                    commissions.get("report")
+                    if isinstance(commissions, dict)
+                    else None
+                )
+                for row in report or []:
+                    if not isinstance(row, dict) or row.get("subjectID") is None:
+                        continue
+                    subjects[str(row["subjectID"])] = {
+                        "fbo": row.get("paidStorageKgvp"),
+                        "fbs": row.get("kgvpMarketplace"),
+                    }
+            except (APIStatusError, RuntimeError, KeyError, TypeError) as exc:
+                logger.warning("WB: тарифы комиссий недоступны (%s)", type(exc).__name__)
+
+            try:
+                boxes = await self._request(
+                    "GET", self.COMMON_URL + "/api/v1/tariffs/box", params={"date": today}
+                )
+                response = boxes.get("response") if isinstance(boxes, dict) else {}
+                data = response.get("data") if isinstance(response, dict) else {}
+                warehouse_list = (
+                    data.get("warehouseList") if isinstance(data, dict) else None
+                )
+                for row in warehouse_list or []:
+                    if isinstance(row, dict) and row.get("warehouseName"):
+                        warehouses[str(row["warehouseName"])] = row
+            except (APIStatusError, RuntimeError, KeyError, TypeError) as exc:
+                logger.warning("WB: тарифы складов недоступны (%s)", type(exc).__name__)
+
             result = {"subjects": subjects, "warehouses": warehouses}
-            self._write_disk_cache(key, result)
+            if subjects or warehouses:
+                # Пустой ответ не кэшируем: следующий цикл должен повторить попытку.
+                self._write_disk_cache(key, result)
             return result
 
     async def _ad_charges(self, date_from: str, date_to: str) -> list:
@@ -104,13 +136,16 @@ class WBStatisticsAPI(MarketplaceClient):
             )
             if not isinstance(rows, list):
                 raise RuntimeError("WB: неверный формат списаний рекламы")
+            rows = [row for row in rows if isinstance(row, dict)]
             self._write_disk_cache(key, rows)
         return rows
 
     async def fetch_wb_ad_spend(self, date_from: str, date_to: str) -> float:
-        return sum(
-            float(r["updSum"]) for r in await self._ad_charges(date_from, date_to)
-        )
+        total = 0.0
+        for row in await self._ad_charges(date_from, date_to):
+            if isinstance(row, dict):
+                total += _num(row.get("updSum"))
+        return round(total, 2)
 
     async def update_price_and_min_price(
         self, nm_id: int, recommended_price_after_discount: float
@@ -411,9 +446,13 @@ class WBStatisticsAPI(MarketplaceClient):
         task = await self._request(
             "GET", url, params={"groupByNm": "true", "locale": "ru"}
         )
-        url += "/tasks/" + task["data"]["taskId"]
+        task_id = ((task or {}).get("data") or {}).get("taskId") if isinstance(task, dict) else None
+        if not task_id:
+            raise RuntimeError("WB FBO: не получен ID задачи отчёта")
+        url += "/tasks/" + str(task_id)
         for _ in range(12):
-            state = (await self._request("GET", url + "/status"))["data"]["status"]
+            state_resp = await self._request("GET", url + "/status")
+            state = ((state_resp or {}).get("data") or {}).get("status") if isinstance(state_resp, dict) else None
             if state == "done":
                 break
             if state not in {"new", "processing"}:
@@ -441,14 +480,21 @@ class WBStatisticsAPI(MarketplaceClient):
         if cached is not None:
             return cached
         groups = await self._request("GET", self.ADVERT_URL + "/adv/v1/promotion/count")
-        ids = sorted(
-            {
-                int(a["advertId"])
-                for g in groups.get("adverts") or []
-                if g["status"] in (4, 9, 11)
-                for a in g["advert_list"]
-            }
-        )
+        adverts = groups.get("adverts") if isinstance(groups, dict) else None
+        ids = set()
+        for group in adverts or []:
+            if not isinstance(group, dict) or group.get("status") not in (4, 9, 11):
+                continue
+            for advert in group.get("advert_list") or []:
+                if not isinstance(advert, dict):
+                    continue
+                try:
+                    advert_id = int(advert.get("advertId") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if advert_id > 0:
+                    ids.add(advert_id)
+        ids = sorted(ids)
         campaigns = {}
         for i in range(0, len(ids), 50):
             batch = ids[i : i + 50]
@@ -468,18 +514,30 @@ class WBStatisticsAPI(MarketplaceClient):
             for row in await read_versions(
                 ("/adv/v1/promotion/adverts", "/api/advert/v2/adverts"), details
             ):
-                cid = int(row.get("advertId") or row["id"])
+                if not isinstance(row, dict):
+                    continue
+                try:
+                    cid = int(row.get("advertId") or row.get("id") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if cid <= 0:
+                    continue
                 params = [
                     row.get("autoParams") or {},
-                    *row.get("unitedParams", []),
-                    *row.get("params", []),
+                    *(row.get("unitedParams") or []),
+                    *(row.get("params") or []),
                 ]
+                params = [p for p in params if isinstance(p, dict)]
                 nms = {
-                    str(n["nm"] if isinstance(n, dict) else n)
+                    str(n.get("nm") if isinstance(n, dict) else n)
                     for p in params
-                    for n in p.get("nms", [])
+                    for n in (p.get("nms") or [])
                 }
-                nms.update(str(n["nm_id"]) for n in row.get("nm_settings", []))
+                nms.update(
+                    str(n.get("nm_id"))
+                    for n in (row.get("nm_settings") or [])
+                    if isinstance(n, dict) and n.get("nm_id") is not None
+                )
                 campaigns[cid] = {
                     "id": cid,
                     "name": row.get("name") or row.get("settings", {}).get("name"),
@@ -495,7 +553,12 @@ class WBStatisticsAPI(MarketplaceClient):
                     "spend_rub": 0.0,
                 }
         for r in await self._ad_charges(start.isoformat(), end.isoformat()):
-            cid = int(r["advertId"])
+            try:
+                cid = int(r.get("advertId") or 0)
+            except (TypeError, ValueError):
+                continue
+            if cid <= 0:
+                continue
             campaign = campaigns.setdefault(
                 cid,
                 {
@@ -506,7 +569,7 @@ class WBStatisticsAPI(MarketplaceClient):
                     "spend_rub": 0.0,
                 },
             )
-            campaign["spend_rub"] += float(r["updSum"])
+            campaign["spend_rub"] += _num(r.get("updSum"))
         result = list(campaigns.values())
         self._write_disk_cache(key, result)
         return result
@@ -542,6 +605,41 @@ class WBStatisticsAPI(MarketplaceClient):
             cursor = nxt
             # Протокол WB: повторять, пока не вернётся пустой ответ (204).
         raise RuntimeError("WB: пагинация детализации не завершена")
+
+    async def _fetch_legacy_report_details(
+        self, date_from: str, date_to: str
+    ) -> list:
+        """Резервный источник: GET /api/v5/supplier/reportDetailByPeriod.
+
+        Метод остаётся у WB как обратная совместимость. Разбор строк общий с
+        finance-api, поэтому поля snake_case принимаются без отдельного кода.
+        """
+        rows: list = []
+        cursor = 0
+        for _ in range(200):
+            page = await self._request(
+                "GET",
+                f"{self.STATS_URL}/api/v5/supplier/reportDetailByPeriod",
+                params={
+                    "dateFrom": date_from,
+                    "dateTo": date_to,
+                    "rrdid": cursor,
+                    "limit": 100000,
+                },
+            )
+            if page is None or page == []:
+                return rows
+            if not isinstance(page, list):
+                raise RuntimeError("WB legacy: неверный формат детализации")
+            fresh = [row for row in page if isinstance(row, dict) and _rrd(row) > cursor]
+            rows.extend(fresh)
+            next_cursor = max(
+                (_rrd(row) for row in page if isinstance(row, dict)), default=0
+            )
+            if next_cursor <= cursor:
+                raise RuntimeError("WB legacy: курсор rrdid не продвигается")
+            cursor = next_cursor
+        raise RuntimeError("WB legacy: пагинация не завершена")
 
     async def _fetch_report_positions(
         self, date_from: str, date_to: str, period: str
@@ -722,20 +820,63 @@ class WBStatisticsAPI(MarketplaceClient):
             if cached is not None:
                 return cached
 
-            rows = await self._fetch_report_details(date_from, date_to, "weekly")
+            rows: list = []
+            errors: List[str] = []
+            for level in ("weekly", "daily"):
+                try:
+                    rows = await self._fetch_report_details(date_from, date_to, level)
+                except (APIStatusError, RuntimeError) as exc:
+                    errors.append(f"детализация {level}: {_exc_label(exc)}")
+                    rows = []
+                if rows:
+                    break
+
+            legacy_used = False
             if not rows:
-                rows = await self._fetch_report_details(date_from, date_to, "daily")
+                # Резерв 1: итоги закрытых отчётов из /sales-reports/list.
+                try:
+                    report = await self._finance_from_summaries(
+                        date_from, date_to, level="weekly"
+                    )
+                except (APIStatusError, RuntimeError) as exc:
+                    errors.append(f"список отчётов: {_exc_label(exc)}")
+                    report = None
+                if report is None or not (
+                    report.get("revenue_seller") or report.get("for_pay")
+                ):
+                    # Резерв 2: прежний reportDetailByPeriod (v5), если WB откатит
+                    # новый finance-api. Разбор строк понимает snake_case.
+                    try:
+                        legacy_rows = await self._fetch_legacy_report_details(
+                            date_from, date_to
+                        )
+                    except (APIStatusError, RuntimeError) as exc:
+                        errors.append(f"legacy v5: {_exc_label(exc)}")
+                        legacy_rows = []
+                    if legacy_rows:
+                        rows = legacy_rows
+                        legacy_used = True
+                    elif report is None:
+                        raise RuntimeError(
+                            "WB: ни детализация, ни закрытые отчёты недоступны ("
+                            + "; ".join(errors)
+                            + ")"
+                        )
 
             if rows:
                 ads = await self.fetch_wb_ad_spend(date_from, date_to)
                 report = self._finance_rows(rows, ads, date_from, date_to)
-                report["source"] = (
-                    f"finance-api WB, отчёт реализации ({date_from}..{date_to})"
-                )
-            else:
-                report = await self._finance_from_summaries(
-                    date_from, date_to, level="weekly"
-                )
+                if legacy_used:
+                    report["source"] = (
+                        "WB legacy reportDetailByPeriod (v5), "
+                        f"резервный источник ({date_from}..{date_to})"
+                    )
+                else:
+                    report["source"] = (
+                        f"finance-api WB, отчёт реализации ({date_from}..{date_to})"
+                    )
+                if errors:
+                    report["source"] += "; " + "; ".join(dict.fromkeys(errors))
             self._write_disk_cache(key, report)
             return report
 

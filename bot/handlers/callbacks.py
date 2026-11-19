@@ -1,4 +1,5 @@
 import html
+import logging
 import math
 from typing import Any
 
@@ -9,6 +10,8 @@ from services.common.market_api import APIStatusError
 from database.crud import claim_price_action, finish_price_action
 from services.ozon.seller_api import OzonSellerAPI
 from services.wb.statistics_api import WBStatisticsAPI
+
+logger = logging.getLogger(__name__)
 
 callbacks_router = Router()
 ozon_api = OzonSellerAPI()
@@ -123,9 +126,19 @@ async def cb_approve_action(call: CallbackQuery):
         rejected = isinstance(exc, ValueError) or (isinstance(exc, APIStatusError) and exc.status in {400, 401, 403, 404, 422, 429})
         status = "unknown" if submitted_request and not rejected else "pending"
         detail = (f"Ошибка: {exc}. " + ("Проверьте цену/задачу в кабинете до повторного запуска." if status == "unknown" else "Действие не подтверждено."))
-    await finish_price_action(action_id, status, operation_result)
+    try:
+        await finish_price_action(action_id, status, operation_result)
+    except Exception as exc:  # noqa: BLE001 — ответ пользователю важнее статуса
+        logger.warning("Не удалось сохранить статус действия %s: %s", action_id, exc)
+        detail += (
+            f" ⚠️ Статус действия не сохранён в БД ({type(exc).__name__}); "
+            "сверьте цену в кабинете перед повтором."
+        )
     if call.message:
-        await call.message.reply(html.escape(detail[:3200]), parse_mode="HTML")
+        try:
+            await call.message.reply(html.escape(detail[:3200]), parse_mode="HTML")
+        except Exception as exc:  # noqa: BLE001 — сообщение могли удалить
+            logger.warning("Ответ по действию %s не доставлен: %s", action_id, exc)
 
 
 @callbacks_router.callback_query(F.data.startswith("act:rej:"))
@@ -141,7 +154,13 @@ async def cb_reject_action(call: CallbackQuery):
     if not action:
         await call.answer("Действие уже обработано или выполняется", show_alert=True)
         return
-    await finish_price_action(action_id, "rejected")
+    try:
+        await finish_price_action(action_id, "rejected")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Не удалось отклонить действие %s: %s", action_id, exc)
     await call.answer("Рекомендация отклонена")
     if call.message:
-        await call.message.reply("Рекомендация отклонена.")
+        try:
+            await call.message.reply("Рекомендация отклонена.")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Подтверждение отклонения не доставлено: %s", exc)

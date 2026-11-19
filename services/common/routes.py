@@ -21,7 +21,6 @@ import time
 from hashlib import sha256
 from typing import Any, Awaitable, Callable, Iterable, Sequence
 from urllib.parse import urlsplit
-from typing import List, Optional
 
 import aiohttp
 
@@ -37,24 +36,9 @@ _cooldown: dict[str, tuple[str, float]] = {}
 # monotonic timestamps of consecutive failures per route fingerprint
 _failures: dict[str, int] = {}
 
-# Sentinel for "no proxy / direct connection"
-DIRECT = ""
-
-
 class RouteError(RuntimeError):
     """Every candidate route failed. Carries a compact human readable reason."""
 
-def proxy_routes(service: str, *, allow_direct: bool = False) -> List[Optional[str]]:
-    """
-    Returns ordered list of routes to try.
-    - For Telegram: only configured local HTTP proxies (required).
-    - For Gemini (allow_direct=True): direct connection first, then local proxies as fallback.
-    """
-    routes: List[Optional[str]] = []
-
-    if allow_direct:
-        # Direct is preferred: user reports ~300 ms and stable without local proxy.
-        routes.append(DIRECT)
 
 def _fingerprint(route: str) -> str:
     return sha256(route.encode()).hexdigest()
@@ -113,6 +97,25 @@ def request_routes(service: str) -> list[str]:
         )
     # A remembered working route jumps to the front, everything else keeps order.
     return _prefer_last_working(service, routes)
+
+
+def proxy_for_route(route: str) -> str | None:
+    """Translate a route token into an aiohttp/aiogram ``proxy`` argument.
+
+    ``DIRECT`` means "no proxy" and must be passed as ``None``; passing an empty
+    string to aiohttp raises instead of connecting directly.
+    """
+    return None if route == DIRECT else route
+
+
+def telegram_routes(service: str = "telegram") -> list[str]:
+    """Routes for Telegram: direct first (if allowed), then local proxies.
+
+    A dead local proxy used to stop the bot from starting at all. The direct
+    route is tried first because it needs no extra process, and every configured
+    loopback proxy remains a fallback for networks where Telegram is blocked.
+    """
+    return request_routes(service)
 
 
 def _preference_key(service: str) -> str:

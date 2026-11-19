@@ -100,8 +100,16 @@ def walk_fees(node, unknown: set):
     """
     found: list[tuple] = []
 
+    containers = ("posting", "item_fees", "non_item_fee", "accrual_id")
+
     def visit(current):
         if isinstance(current, dict):
+            # У контейнера начисления тоже бывает type_id (старая схема): это
+            # не услуга, а сама продажа — иначе сумма задвоится.
+            if any(key in current for key in containers):
+                for value in current.values():
+                    visit(value)
+                return
             if "type_id" in current and isinstance(current.get("accrued"), dict):
                 found.append((current.get("type_id"), _parse_decimal(current["accrued"].get("amount"))))
                 return
