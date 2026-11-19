@@ -80,6 +80,8 @@ except Exception:  # noqa: BLE001 — кривой TIMEZONE или отсутс�
 
 _WORKER_LOCK_SOCKET: Optional[socket.socket] = None
 _BROWSER_JOB_LOCK = asyncio.Lock()
+# Цикл автоответов обязан завершиться раньше 30-минутного интервала.
+BROWSER_JOB_BUDGET_SEC = 20 * 60
 _PRICE_AUDIT_LOCK = asyncio.Lock()
 
 
@@ -224,6 +226,39 @@ def _split_html_chunks(text: str, limit: int = 3900) -> List[str]:
     return chunks
 
 
+async def _safe_delete_message(status_msg: Message) -> None:
+    """Удаление статус-сообщения не должно превращаться в новую ошибку."""
+    try:
+        await status_msg.delete()
+    except Exception as exc:  # noqa: BLE001 — сообщение могли удалить вручную
+        print(f"[Worker] Статус-сообщение не удалено: {type(exc).__name__}", flush=True)
+
+
+async def _show_status_result(status_msg: Message, text: str) -> None:
+    """Показать итог, даже если статус-сообщение уже удалено.
+
+    Раньше ошибка после ``status_msg.delete()`` приводила к повторному
+    ``edit_text`` несуществующего сообщения: Telegram отвечал «message to edit
+    not found», и настоящая причина сбоя терялась. Теперь при неудачном edit
+    отправляется новое сообщение.
+    """
+    try:
+        await status_msg.edit_text(text, parse_mode="HTML")
+        return
+    except Exception as exc:  # noqa: BLE001
+        if "message is not modified" in str(exc).lower():
+            return
+        edit_error: BaseException = exc
+    try:
+        await status_msg.answer(text, parse_mode="HTML")
+    except Exception as exc:  # noqa: BLE001
+        print(
+            f"[Worker] Статус не показан: {type(edit_error).__name__} / "
+            f"{type(exc).__name__}",
+            flush=True,
+        )
+
+
 async def send_admin_html(text: str, disable_notification: bool = False) -> None:
     for chunk in _split_html_chunks(text):
         await bot.send_message(
@@ -341,13 +376,34 @@ async def scheduled_reviews_and_questions_job() -> None:
         return
 
     async with _BROWSER_JOB_LOCK:
-        for job in (auto_reply_unanswered_reviews, auto_reply_unanswered_questions):
-            try:
-                result = await job(headless=True, dry_run=settings.OZON_REPLY_DRY_RUN, max_per_run=15)
-                if result['status'] not in {'success', 'limit_reached'}:
-                    await notify_admin(html.escape(str(result['message'])))
-            except Exception as exc:
-                await notify_admin(f'Ozon {job.__name__}: {html.escape(str(exc))}')
+        try:
+            async with asyncio.timeout(BROWSER_JOB_BUDGET_SEC):
+                for job in (auto_reply_unanswered_reviews, auto_reply_unanswered_questions):
+                    try:
+                        result = await job(
+                            headless=True,
+                            dry_run=settings.OZON_REPLY_DRY_RUN,
+                            max_per_run=5,
+                        )
+                        if result['status'] not in {'success', 'limit_reached'}:
+                            await notify_admin(html.escape(str(result['message'])))
+                    except Exception as exc:
+                        await notify_admin(
+                            f'Ozon {job.__name__}: {html.escape(str(exc))}'
+                        )
+        except TimeoutError:
+            # Один цикл не должен занимать полчаса: иначе следующий запуск
+            # планировщика отменяется как «maximum number of running instances».
+            print(
+                f"[Worker] Автоответы Ozon: цикл превысил "
+                f"{BROWSER_JOB_BUDGET_SEC // 60} минут и остановлен.",
+                flush=True,
+            )
+            await notify_admin(
+                f"⚠️ Автоответы Ozon: цикл занял больше "
+                f"{BROWSER_JOB_BUDGET_SEC // 60} мин и был остановлен. "
+                "Обработанные ответы сохранены, остальные — в следующем цикле."
+            )
 
 
 async def scheduled_daily_price_audit_job() -> None:
@@ -443,11 +499,15 @@ async def cmd_manual_pnl(message: Message) -> None:
     status_msg = await message.answer("⏳ Собираю финансовый P&L отчет по итогам прошлого месяца из Ozon и WB...")
     try:
         report = await generate_monthly_pnl_report(ozon_service, wb_service)
-        await status_msg.delete()
+        await _safe_delete_message(status_msg)
         for chunk in _split_html_chunks(report):
             await message.answer(chunk, parse_mode="HTML")
     except Exception as exc:
-        await status_msg.edit_text(f"❌ Ошибка P&L отчета:\n<code>{html.escape(str(exc))}</code>", parse_mode="HTML")
+        print(f"[Worker] P&L: {type(exc).__name__}: {exc}", flush=True)
+        await _show_status_result(
+            status_msg,
+            f"❌ Ошибка P&L отчета:\n<code>{html.escape(str(exc))}</code>",
+        )
 
 
 @dp.message(F.text == "🏆 ТОП-5 и Убыточные")
@@ -458,11 +518,15 @@ async def cmd_top5_report(message: Message) -> None:
     status_msg = await message.answer("⏳ Анализирую поштучную рентабельность товаров за 7 дней...")
     try:
         report = await generate_weekly_top_and_unprofitable_report(ozon_service, wb_service, days=7)
-        await status_msg.delete()
+        await _safe_delete_message(status_msg)
         for chunk in _split_html_chunks(report):
             await message.answer(chunk, parse_mode="HTML")
     except Exception as exc:
-        await status_msg.edit_text(f"❌ Ошибка расчета ТОП-5:\n<code>{html.escape(str(exc))}</code>", parse_mode="HTML")
+        print(f"[Worker] ТОП-5: {type(exc).__name__}: {exc}", flush=True)
+        await _show_status_result(
+            status_msg,
+            f"❌ Ошибка расчета ТОП-5:\n<code>{html.escape(str(exc))}</code>",
+        )
 
 
 @dp.message(F.text == "🧠 ИИ-Советник (Разбор)")
@@ -477,7 +541,9 @@ async def cmd_ai_board(message: Message) -> None:
     )
     try:
         summary_text, file_path = await generate_monday_ai_board_report(ozon_service, wb_service)
-        await status_msg.delete()
+        await _safe_delete_message(status_msg)
+        if not str(summary_text).strip():
+            summary_text = "⚠️ Совет ИИ вернул пустой ответ. Полный HTML-отчёт ниже."
         await message.answer(summary_text)
         if file_path is not None and Path(file_path).exists():
             await message.answer_document(
@@ -489,7 +555,11 @@ async def cmd_ai_board(message: Message) -> None:
                 "⚠️ HTML-файл разбора не сохранился (диск/права). Краткий итог выше."
             )
     except Exception as exc:
-        await status_msg.edit_text(f"❌ Ошибка ИИ-Советника:\n<code>{html.escape(str(exc))}</code>", parse_mode="HTML")
+        print(f"[Worker] ИИ-Советник: {type(exc).__name__}: {exc}", flush=True)
+        await _show_status_result(
+            status_msg,
+            f"❌ Ошибка ИИ-Советника:\n<code>{html.escape(str(exc))}</code>",
+        )
 
 
 @dp.message(F.text == "📦 Отчет по заказам")
@@ -500,13 +570,15 @@ async def cmd_orders_report(message: Message) -> None:
     status_msg = await message.answer("⏳ Запрашиваю заказы и финансовые начисления из Ozon и WB за 7 дней...")
     try:
         report_text = await sync_and_generate_orders_report(ozon_service, wb_service, days=7)
-        await status_msg.delete()
+        await _safe_delete_message(status_msg)
         for chunk in _split_html_chunks(report_text):
             await message.answer(chunk, parse_mode="HTML")
     except Exception as exc:
-        await status_msg.edit_text(
-            f"❌ <b>Ошибка при формировании отчета:</b>\n<code>{type(exc).__name__}: {html.escape(str(exc))}</code>",
-            parse_mode="HTML",
+        print(f"[Worker] Отчет по заказам: {type(exc).__name__}: {exc}", flush=True)
+        await _show_status_result(
+            status_msg,
+            f"❌ <b>Ошибка при формировании отчета:</b>\n"
+            f"<code>{type(exc).__name__}: {html.escape(str(exc))}</code>",
         )
 
 
@@ -518,13 +590,14 @@ async def cmd_manual_audit(message: Message) -> None:
     status_msg = await message.answer("⏳ Проверяю маршруты Ozon, WB и Gemini...")
     try:
         audit = await run_monthly_api_audit()
-        await status_msg.delete()
+        await _safe_delete_message(status_msg)
         for chunk in _split_html_chunks(audit):
             await message.answer(chunk, parse_mode="HTML")
     except Exception as exc:  # noqa: BLE001 — отчёт по кнопке не должен молчать
-        await status_msg.edit_text(
+        print(f"[Worker] Аудит API: {type(exc).__name__}: {exc}", flush=True)
+        await _show_status_result(
+            status_msg,
             f"❌ Ошибка аудита API:\n<code>{html.escape(str(exc))}</code>",
-            parse_mode="HTML",
         )
 
 
@@ -552,13 +625,14 @@ async def btn_sync_mp(message: Message) -> None:
     try:
         await scheduled_daily_price_audit_job()
     except Exception as exc:  # noqa: BLE001
-        await status_msg.edit_text(
+        print(f"[Worker] Синхронизация: {type(exc).__name__}: {exc}", flush=True)
+        await _show_status_result(
+            status_msg,
             f"❌ Ошибка синхронизации:\n<code>{html.escape(str(exc))}</code>\n"
             f"<i>Остатки и цены остались прежними; ночная самопроверка повторит попытку.</i>",
-            parse_mode="HTML",
         )
         return
-    await status_msg.edit_text("✅ Синхронизация остатков и аудит цен завершены.")
+    await _show_status_result(status_msg, "✅ Синхронизация остатков и аудит цен завершены.")
 
 
 @dp.message(Command("patch"))

@@ -257,6 +257,10 @@ del "%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\marketplace_agent.l
 | Отзывы/конкуренты: «браузерный разбор недоступен» | не скачан Chromium | `venv\Scripts\python.exe -m playwright install chromium` |
 | WB: тарифы `0 категорий / 0 складов` | API тарифов временно недоступен | остатки и цены всё равно синхронизируются; повторите позже |
 | P&L: «неполное покрытие периода» | Ozon ещё не закрыл период | это штатное поведение: итоги взяты из суточных начислений |
+| В журнале `message to edit not found` | старая версия `worker.py` | обновите код до `main`; в актуальной версии статус отправляется заново |
+| `maximum number of running instances reached` | прежний цикл автоответов не успел за 30 минут | обновите код: добавлен бюджет 20 минут и лимит 5 ответов за цикл |
+| `WB HTTP 404 /api/v1/supplier/stocks` | WB отключил legacy-метод остатков | штатный переход на `analytics/warehouse_remains`; в новой версии повторный запрос — не чаще раза в 6 часов |
+| В журнале `РћС€РёР±РєР°` вместо русского текста | UTF-8 журнал прочитан PowerShell в cp1251 | `powershell -NoProfile -Command "Get-Content logs\worker.log -Tail 60 -Encoding UTF8"` |
 
 ---
 
