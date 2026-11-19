@@ -131,18 +131,182 @@ async def generate_monthly_pnl_report(
             f"Финальный сверенный отчет придет автоматически 5-го числа в 09:30.</i>\n\n"
         )
 
-    report_body = await sync_and_generate_orders_report(
-        ozon_service=oz_api,
-        wb_service=wb_api,
-        days=int(bounds["days_count"]),
-        custom_date_from=str(bounds["date_from"]),
-        custom_date_to=str(bounds["date_to"]),
-        report_title=(
-            f"📅 ИТОГОВЫЙ P&L ОТЧЕТ ЗА ПРОШЛЫЙ МЕСЯЦ: "
-            f"{str(bounds['title']).upper()} ({bounds['date_from']} .. {bounds['date_to']})"
-        ),
-    )
+    try:
+        report_body = await sync_and_generate_orders_report(
+            ozon_service=oz_api,
+            wb_service=wb_api,
+            days=int(bounds["days_count"]),
+            custom_date_from=str(bounds["date_from"]),
+            custom_date_to=str(bounds["date_to"]),
+            report_title=(
+                f"📅 ИТОГОВЫЙ P&L ОТЧЕТ ЗА ПРОШЛЫЙ МЕСЯЦ: "
+                f"{str(bounds['title']).upper()} ({bounds['date_from']} .. {bounds['date_to']})"
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001 — отчёт по кнопке не должен падать молча
+        detail = html.escape(str(exc)[:900])
+        report_body = (
+            f"📅 <b>ИТОГОВЫЙ P&L ОТЧЕТ ЗА ПРОШЛЫЙ МЕСЯЦ: "
+            f"{html.escape(str(bounds['title']).upper())}</b> "
+            f"({bounds['date_from']} .. {bounds['date_to']})\n\n"
+            f"❌ Финансовая детализация недоступна: <code>{detail}</code>\n"
+            f"<i>Отчёт по закрывающим актам формируется до 5-го числа. "
+            f"Повторите запрос позже — данные подтянутся автоматически.</i>"
+        )
     return publication_notice + report_body
+
+
+async def _fetch_sku_sales(
+    api: Any, days: int
+) -> Tuple[List[Dict[str, Any]], str]:
+    """Резервный источник продаж по артикулам для сервиса маркетплейса."""
+    getter = getattr(api, "fetch_sales_by_sku", None)
+    if getter is None:
+        return [], ""
+    result = await getter(days=days)
+    if isinstance(result, tuple) and len(result) == 2:
+        rows, source = result
+        if isinstance(rows, list):
+            return [r for r in rows if isinstance(r, dict)], str(source or "")
+        return [], str(source or "")
+    if isinstance(result, list):
+        return [r for r in result if isinstance(r, dict)], ""
+    return [], ""
+
+
+def _build_stats_from_sku_sales(
+    orders: List[Tuple[str, Dict[str, Any]]],
+    by_mp_sku: Dict[Tuple[str, str], Any],
+    by_mp_ext: Dict[Tuple[str, str], Any],
+    live_tariffs: Dict[Tuple[str, str], Dict[str, Any]],
+    *,
+    tax_rate: float,
+    acq_rate: float,
+    oz_report_comm_rate: Optional[float],
+    oz_ad_rate: float,
+    wb_acq_rate: float,
+    wb_deliv_per_order: float,
+    oz_deliv_per_order: Optional[float],
+    oz_other_overhead_per_order: float,
+    wb_overhead_per_order: float,
+) -> Tuple[Dict[Tuple[str, str], Dict[str, Any]], Dict[str, int]]:
+    """Пересчитывает статистику по артикулам из резервного источника.
+
+    Комиссии и логистика распределяются по удельным ставкам сводного отчёта,
+    а себестоимость берётся только подтверждённая. Артикулы без себестоимости
+    попадают в отдельный список и не искажают рейтинг прибыли.
+    """
+    stats: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    excluded = 0
+    for default_mp, order in orders:
+        mp = str(order.get("marketplace") or default_mp).strip().lower()
+        if mp not in {"ozon", "wb"}:
+            mp = default_mp
+        raw_sku = str(order.get("sku") or "").strip()
+        art = _resolve_order_sku(raw_sku, mp) or raw_sku
+        unit_price = _safe_nonneg(order.get("price"))
+        qty = max(_safe_int(order.get("quantity"), 1), 1)
+        if not art or unit_price <= 0.0:
+            excluded += 1
+            continue
+
+        raw_bp = order.get("buyer_price")
+        unit_buyer_price = (
+            _safe_nonneg(raw_bp)
+            if raw_bp is not None and _safe_nonneg(raw_bp) > 0.0
+            else unit_price
+        )
+
+        p_db = _lookup_product_for_order(mp, raw_sku, by_mp_sku, by_mp_ext)
+        cogs_known = p_db is not None and _safe_nonneg(p_db.cost_price) > 0.0
+        unit_cogs = (
+            _safe_nonneg(p_db.cost_price)
+            + _safe_nonneg(p_db.packaging_cost)
+            + _safe_nonneg(p_db.first_mile_unit_cost)
+            if cogs_known and p_db is not None
+            else 0.0
+        )
+
+        t_live = live_tariffs.get((mp, art)) or live_tariffs.get((mp, raw_sku)) or {}
+        if mp == "ozon":
+            c_rate = _resolve_ozon_commission_rate(unit_price, t_live, p_db, oz_report_comm_rate)
+            unit_comm = _mul_rub(unit_price, c_rate)
+            unit_acq = _mul_rub(unit_price, acq_rate)
+            unit_log = _div_rub(oz_deliv_per_order, 1) if oz_deliv_per_order else 0.0
+            unit_ad = _mul_rub(unit_price, oz_ad_rate)
+            unit_mp_fee = _round_rub(
+                _to_dec(unit_comm)
+                + _to_dec(unit_acq)
+                + _to_dec(unit_log)
+                + _to_dec(unit_ad)
+                + _to_dec(oz_other_overhead_per_order)
+            )
+            unit_tax = _mul_rub(unit_price, tax_rate)
+            if oz_deliv_per_order is None:
+                cogs_known = False  # без факта доставки экономика неполная
+        else:
+            wb_comm_rate = _safe_nonneg(t_live.get("commission_rate"))
+            if wb_comm_rate <= 0.0:
+                pct = _safe_nonneg(t_live.get("commission_rate_fbo"))
+                wb_comm_rate = pct if pct > 1.0 else 0.0  # 1.0 = 100% -> не ставка
+                if wb_comm_rate > 1.0:
+                    wb_comm_rate = wb_comm_rate / 100.0
+            unit_comm = _mul_rub(unit_price, wb_comm_rate) if wb_comm_rate > 0.0 else 0.0
+            unit_log = _safe_nonneg(t_live.get("fbo_logistics_cost"))
+            if unit_log <= 0.0 and wb_deliv_per_order > 0.0:
+                unit_log = _round_rub(wb_deliv_per_order)
+            unit_acq = _mul_rub(max(unit_buyer_price, unit_price), wb_acq_rate)
+            unit_mp_fee = _round_rub(
+                _to_dec(unit_comm)
+                + _to_dec(unit_log)
+                + _to_dec(unit_acq)
+                + _to_dec(wb_overhead_per_order)
+            )
+            unit_tax = _mul_rub(unit_buyer_price, tax_rate)
+
+        unit_profit = (
+            _round_rub(
+                _to_dec(unit_price) - _to_dec(unit_cogs) - _to_dec(unit_mp_fee) - _to_dec(unit_tax)
+            )
+            if cogs_known
+            else 0.0
+        )
+
+        key = (mp, art)
+        if key not in stats:
+            cat_meta = PRODUCTS_CATALOG.get(art, {})
+            title = (
+                cat_meta.get("name")
+                or (p_db.title if p_db is not None and p_db.title else f"Арт. {art}")
+            )
+            stats[key] = {
+                "mp": mp.upper(),
+                "sku": art,
+                "title": str(title),
+                "qty": 0,
+                "revenue": 0.0,
+                "cogs": 0.0,
+                "mp_fee": 0.0,
+                "acquiring": 0.0,
+                "tax": 0.0,
+                "profit": 0.0,
+                "cogs_complete": True,
+                "missing_cogs_qty": 0,
+            }
+        st = stats[key]
+        dec_qty = _to_dec(qty)
+        st["qty"] += qty
+        st["revenue"] = _round_rub(_to_dec(st["revenue"]) + _to_dec(unit_price) * dec_qty)
+        st["cogs"] = _round_rub(_to_dec(st["cogs"]) + _to_dec(unit_cogs) * dec_qty)
+        st["mp_fee"] = _round_rub(_to_dec(st["mp_fee"]) + _to_dec(unit_mp_fee) * dec_qty)
+        st["acquiring"] = _round_rub(_to_dec(st["acquiring"]) + _to_dec(unit_acq) * dec_qty)
+        st["tax"] = _round_rub(_to_dec(st["tax"]) + _to_dec(unit_tax) * dec_qty)
+        if cogs_known:
+            st["profit"] = _round_rub(_to_dec(st["profit"]) + _to_dec(unit_profit) * dec_qty)
+        else:
+            st["cogs_complete"] = False
+            st["missing_cogs_qty"] += qty
+    return stats, {"excluded": excluded}
 
 
 async def generate_weekly_top_and_unprofitable_report(
@@ -475,6 +639,75 @@ async def generate_weekly_top_and_unprofitable_report(
 
     if unpriced:
         api_warnings.append(f"⚠️ Без разбивки цены по SKU: {unpriced} строк, исключены из рейтинга.")
+
+    # --- Резерв: агрегаты продаж по SKU, когда финансовая детализация пуста ---
+    # Начисления Ozon и закрытые отчёты WB за последние дни формируются с
+    # задержкой, поэтому ТОП-5 без этого яруса показывал «заказов не найдено».
+    if not sku_stats:
+        fallback_orders: List[Tuple[str, Dict[str, Any]]] = []
+        fallback_sources: List[str] = []
+        fallback_results = await asyncio.gather(
+            _fetch_sku_sales(oz_api, safe_days),
+            _fetch_sku_sales(wb_api, safe_days),
+            return_exceptions=True,
+        )
+        for mp_key, result in zip(("ozon", "wb"), fallback_results):
+            if isinstance(result, Exception):
+                api_warnings.append(
+                    f"⚠️ {mp_key.upper()}: резервный источник артикулов недоступен — "
+                    f"<code>{html.escape(str(result))}</code>"
+                )
+                continue
+            rows, source = result
+            if rows:
+                fallback_orders.extend((mp_key, row) for row in rows)
+                fallback_sources.append(f"{mp_key.upper()}: {source}")
+            elif source:
+                api_warnings.append(f"⚠️ <i>{html.escape(source)}</i>")
+
+        # Удельная логистика WB: из реклассификации отчёта либо из тарифа
+        # «короб-логистика» (усреднение по складам), если факт недоступен.
+        _wb_fallback_delivery = wb_unassigned_delivery
+        if _wb_fallback_delivery <= 0.0:
+            try:
+                _tariffs = await wb_api.fetch_wb_tariffs()
+            except Exception:  # noqa: BLE001 — резервный тариф не критичен для отчёта
+                _tariffs = None
+            if isinstance(_tariffs, dict):
+                _rates = [
+                    _safe_nonneg(w.get("boxDeliveryBase"))
+                    for w in (_tariffs.get("warehouses") or {}).values()
+                    if isinstance(w, dict) and w.get("boxDeliveryBase") not in (None, "", "-")
+                ]
+                _rates = [r for r in _rates if r > 0.0]
+                if _rates:
+                    _wb_fallback_delivery = _round_rub(sum(_rates) / len(_rates))
+
+        if fallback_orders:
+            sku_stats, fallback_stats = _build_stats_from_sku_sales(
+                fallback_orders,
+                by_mp_sku,
+                by_mp_ext,
+                live_tariffs,
+                tax_rate=tax_rate,
+                acq_rate=acq_rate,
+                oz_report_comm_rate=oz_report_comm_rate,
+                oz_ad_rate=oz_ad_rate,
+                wb_acq_rate=wb_acq_rate,
+                oz_deliv_per_order=oz_deliv_per_order,
+                oz_other_overhead_per_order=oz_other_overhead_per_order,
+                wb_overhead_per_order=wb_overhead_per_order,
+                wb_deliv_per_order=_wb_fallback_delivery,
+            )
+            api_warnings.append(
+                "ℹ️ <i>Рейтинг построен по резервному источнику (начисления/детализация "
+                "ещё не сформированы): " + html.escape("; ".join(fallback_sources)) + "</i>"
+            )
+            if fallback_stats.get("excluded"):
+                api_warnings.append(
+                    f"⚠️ <i>Исключено строк без цены: {fallback_stats['excluded']}.</i>"
+                )
+
     if not sku_stats:
         empty_msg = (
             f"📈 <b>Еженедельная сводка ТОП-5 товаров:</b> "
@@ -486,7 +719,6 @@ async def generate_weekly_top_and_unprofitable_report(
 
     items_list = list(sku_stats.values())
     top_popular = sorted(items_list, key=lambda x: (x["qty"], x["revenue"]), reverse=True)[:5]
-
     verified_items = [x for x in items_list if x["cogs_complete"]]
     unverified_items = [x for x in items_list if not x["cogs_complete"]]
     top_unprofitable = sorted(

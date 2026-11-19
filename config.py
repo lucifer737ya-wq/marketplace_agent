@@ -43,15 +43,52 @@ class Settings(BaseSettings):
 
     # Gemini API
     GEMINI_API_KEY: str = Field(..., description="API ключ Google Gemini")
-    GEMINI_MODEL: str = Field(default="gemini-2.5-flash", description="Базовая модель Gemini")
+    GEMINI_MODEL: str = Field(
+        default="gemini-3.8-flash", description="Базовая модель Gemini"
+    )
+    GEMINI_FAST_MODEL: str = Field(
+        default="gemini-3.5-flash-lite",
+        description="Эконом-модель для отзывов, вопросов и коротких задач",
+    )
+    # Прямой адрес API Google. Работает без посредников и без локального прокси.
+    GEMINI_DIRECT_URL: str = Field(
+        default="https://generativelanguage.googleapis.com",
+        description="Прямой базовый адрес Gemini API (используется первым маршрутом)",
+    )
+    GEMINI_TIMEOUT: int = Field(default=90, description="Таймаут запроса к Gemini, сек")
 
-    # Сетевая маршрутизация (Telegram и Gemini — через локальный прокси; Ozon и WB — напрямую)
+    # Сетевая маршрутизация.
+    # Каждый запрос перебирает все доступные маршруты: прямые адреса площадок,
+    # прямые адреса Google и локальные прокси. Недоступный маршрут уходит в
+    # карантин и не тормозит следующие вызовы.
     LOCAL_PROXY_URL: str = Field(
         default="http://127.0.0.1:3066",
-        description="Локальный HTTP-прокси для Telegram и Gemini API",
+        description="Локальный HTTP-прокси (резервный маршрут для Telegram и Gemini)",
     )
     LOCAL_PROXY_FALLBACK_URL: str = ""
+    # Список дополнительных прокси через запятую: http://127.0.0.1:3067,...
+    LOCAL_PROXY_LIST: str = Field(
+        default="", description="Дополнительные локальные прокси через запятую"
+    )
+    # Прямые запросы без прокси разрешены (Gemini и площадки работают напрямую).
+    ALLOW_DIRECT_CONNECTIONS: bool = Field(
+        default=True, description="Разрешить прямые HTTPS-запросы без прокси"
+    )
+    # Сколько секунд держать в карантине упавший маршрут.
+    ROUTE_COOLDOWN_SECONDS: int = Field(
+        default=120, description="Карантин недоступного маршрута, сек"
+    )
     OZON_REPLY_DRY_RUN: bool = False
+    # Бюджет браузерного разбора витрин (сек): WB/Ozon отвечают медленно,
+    # но отчёт не должен ждать браузер дольше этого значения.
+    LISTINGS_BROWSER_BUDGET_SEC: int = Field(
+        default=90, description="Бюджет времени на браузерный разбор витрины, сек"
+    )
+    # Устаревшие финансовые методы Ozon отключены 08.09.2026, оставлены как
+    # последняя попытка только при явном включении.
+    OZON_LEGACY_FINANCE: bool = Field(
+        default=False, description="Пробовать отключённый /v3/finance/transaction/list"
+    )
     TIMEZONE: str = Field(default="Europe/Moscow", description="Часовой пояс планировщика")
 
     # Системные настройки, БД и защита от дублей процессов (Single-Instance Lock)
@@ -80,7 +117,10 @@ class Settings(BaseSettings):
         "WB_API_TOKEN",
         "GEMINI_API_KEY",
         "GEMINI_MODEL",
+        "GEMINI_FAST_MODEL",
+        "GEMINI_DIRECT_URL",
         "LOCAL_PROXY_URL",
+        "LOCAL_PROXY_LIST",
         mode="before",
     )
     @classmethod

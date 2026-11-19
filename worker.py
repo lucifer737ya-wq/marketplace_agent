@@ -1,4 +1,5 @@
 import asyncio
+import functools
 import html
 import json
 import os
@@ -409,9 +410,17 @@ async def cmd_orders_report(message: Message) -> None:
 async def cmd_manual_audit(message: Message) -> None:
     if not message.from_user or message.from_user.id != settings.TG_ADMIN_ID:
         return
-    audit = await run_monthly_api_audit()
-    for chunk in _split_html_chunks(audit):
-        await message.answer(chunk, parse_mode="HTML")
+    status_msg = await message.answer("⏳ Проверяю маршруты Ozon, WB и Gemini...")
+    try:
+        audit = await run_monthly_api_audit()
+        await status_msg.delete()
+        for chunk in _split_html_chunks(audit):
+            await message.answer(chunk, parse_mode="HTML")
+    except Exception as exc:  # noqa: BLE001 — отчёт по кнопке не должен молчать
+        await status_msg.edit_text(
+            f"❌ Ошибка аудита API:\n<code>{html.escape(str(exc))}</code>",
+            parse_mode="HTML",
+        )
 
 
 @dp.message(F.text == "📦 Себестоимость (поштучно)")
@@ -432,9 +441,19 @@ async def btn_first_mile_entry(message: Message, state: FSMContext) -> None:
 async def btn_sync_mp(message: Message) -> None:
     if not message.from_user or message.from_user.id != settings.TG_ADMIN_ID:
         return
-    await message.answer("⏳ Запущена синхронизация остатков FBO/FBS и эталонный аудит цен Ozon & WB...")
-    await scheduled_daily_price_audit_job()
-    await message.answer("✅ Синхронизация остатков и аудит цен завершены.")
+    status_msg = await message.answer(
+        "⏳ Запущена синхронизация остатков FBO/FBS и эталонный аудит цен Ozon & WB..."
+    )
+    try:
+        await scheduled_daily_price_audit_job()
+    except Exception as exc:  # noqa: BLE001
+        await status_msg.edit_text(
+            f"❌ Ошибка синхронизации:\n<code>{html.escape(str(exc))}</code>\n"
+            f"<i>Остатки и цены остались прежними; ночная самопроверка повторит попытку.</i>",
+            parse_mode="HTML",
+        )
+        return
+    await status_msg.edit_text("✅ Синхронизация остатков и аудит цен завершены.")
 
 
 @dp.message(Command("patch"))
@@ -527,6 +546,32 @@ async def setup_bot_commands(bot_instance: Bot) -> None:
     await bot_instance.set_my_commands(commands)
 
 
+async def _guarded_job(name: str, job) -> None:
+    """Обёртка фоновых задач: сбой одной задачи не теряется молча.
+
+    APScheduler при необработанном исключении только пишет в свой лог, а
+    скрытый запуск через pythonw.exe лога не видит. Поэтому любая ошибка
+    уходит админу в Telegram, а планировщик продолжает работать.
+    """
+    try:
+        result = await job()
+        if isinstance(result, str) and result.strip():
+            await send_admin_html(result)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — фоновая задача не должна убивать планировщик
+        print(f"[Scheduler {name} Error]: {exc}", flush=True)
+        try:
+            await notify_admin(
+                f"⚠️ <b>Фоновая задача {html.escape(name)} завершилась ошибкой:</b>\n"
+                f"<code>{html.escape(str(exc)[:900])}</code>\n"
+                f"<i>Планировщик работает, остальные задачи не затронуты. "
+                f"Ночная самопроверка в 04:30 повторит восстановление.</i>"
+            )
+        except Exception as notify_exc:  # noqa: BLE001 — Telegram может быть недоступен
+            print(f"[Scheduler {name} Notify Error]: {notify_exc}", flush=True)
+
+
 def configure_scheduler() -> AsyncIOScheduler:
     """Регистрирует все фоновые задачи без дублей с защитой от параллельного наслоения (max_instances=1)."""
     scheduler = AsyncIOScheduler(
@@ -541,7 +586,7 @@ def configure_scheduler() -> AsyncIOScheduler:
 
     # 1. Тихая синхронизация остатков FBO/FBS и цен Ozon + WB при старте и каждые 30 минут
     scheduler.add_job(
-        scheduled_marketplaces_poll,
+        functools.partial(_guarded_job, "mp_poll_job", scheduled_marketplaces_poll),
         IntervalTrigger(minutes=30, timezone=MSK_TZ),
         next_run_time=now_msk,
         id="mp_poll_job",
@@ -550,7 +595,7 @@ def configure_scheduler() -> AsyncIOScheduler:
 
     # 2. Автоответчик Ozon: при старте и каждые 30 минут, с проверкой даты публикации
     scheduler.add_job(
-        scheduled_reviews_and_questions_job,
+        functools.partial(_guarded_job, "ozon_rev_q_30m", scheduled_reviews_and_questions_job),
         IntervalTrigger(minutes=30, timezone=MSK_TZ),
         next_run_time=now_msk,
         id="ozon_rev_q_30m",
@@ -559,7 +604,7 @@ def configure_scheduler() -> AsyncIOScheduler:
 
     # 3. Единый эталонный ежедневный аудит цен Ozon (299 ₽ / >300 ₽ с 52%, 3 кнопки) и WB (FBO+FBS) в 10:00 МСК
     scheduler.add_job(
-        scheduled_daily_price_audit_job,
+        functools.partial(_guarded_job, "daily_price_audit_job", scheduled_daily_price_audit_job),
         CronTrigger(hour=10, minute=0, timezone=MSK_TZ),
         id="daily_price_audit_job",
         replace_existing=True,
@@ -567,7 +612,7 @@ def configure_scheduler() -> AsyncIOScheduler:
 
     # 4. Еженедельный аудит и рекомендации по рекламе Ozon (2 гибридные РК) и WB — понедельник 10:30 МСК
     scheduler.add_job(
-        scheduled_weekly_ads_job,
+        functools.partial(_guarded_job, "weekly_ads_audit_job", scheduled_weekly_ads_job),
         CronTrigger(day_of_week="mon", hour=10, minute=30, timezone=MSK_TZ),
         id="weekly_ads_audit_job",
         replace_existing=True,
@@ -575,7 +620,7 @@ def configure_scheduler() -> AsyncIOScheduler:
 
     # 5. Еженедельный отчет ТОП-5 популярных и убыточных товаров — понедельник 09:00 МСК
     scheduler.add_job(
-        scheduled_monday_top5_report,
+        functools.partial(_guarded_job, "weekly_top5_monday_morning", scheduled_monday_top5_report),
         CronTrigger(day_of_week="mon", hour=9, minute=0, timezone=MSK_TZ),
         id="weekly_top5_monday_morning",
         replace_existing=True,
@@ -583,7 +628,7 @@ def configure_scheduler() -> AsyncIOScheduler:
 
     # 6. Стратегический Совет ИИ-специалистов — понедельник 19:00 МСК
     scheduler.add_job(
-        scheduled_monday_evening_ai_board,
+        functools.partial(_guarded_job, "weekly_ai_board_monday_evening", scheduled_monday_evening_ai_board),
         CronTrigger(day_of_week="mon", hour=19, minute=0, timezone=MSK_TZ),
         id="weekly_ai_board_monday_evening",
         replace_existing=True,
@@ -591,7 +636,7 @@ def configure_scheduler() -> AsyncIOScheduler:
 
     # 7. Уведомление финансового календаря 1-го числа в 09:00 МСК
     scheduler.add_job(
-        scheduled_1st_day_pnl_notice,
+        functools.partial(_guarded_job, "monthly_pnl_notice_1st", scheduled_1st_day_pnl_notice),
         CronTrigger(day=1, hour=9, minute=0, timezone=MSK_TZ),
         id="monthly_pnl_notice_1st",
         replace_existing=True,
@@ -599,7 +644,7 @@ def configure_scheduler() -> AsyncIOScheduler:
 
     # 8. Ежемесячный аудит доступности API Ozon, WB и Gemini 1-го числа в 09:05 МСК
     scheduler.add_job(
-        scheduled_monthly_audit,
+        functools.partial(_guarded_job, "monthly_audit_job", scheduled_monthly_audit),
         CronTrigger(day=1, hour=9, minute=5, timezone=MSK_TZ),
         id="monthly_audit_job",
         replace_existing=True,
@@ -607,7 +652,7 @@ def configure_scheduler() -> AsyncIOScheduler:
 
     # 9. Итоговый месячный P&L отчет по закрывающим актам 5-го числа в 09:30 МСК
     scheduler.add_job(
-        scheduled_5th_day_monthly_pnl,
+        functools.partial(_guarded_job, "monthly_pnl_final_5th", scheduled_5th_day_monthly_pnl),
         CronTrigger(day=5, hour=9, minute=30, timezone=MSK_TZ),
         id="monthly_pnl_final_5th",
         replace_existing=True,
@@ -615,7 +660,7 @@ def configure_scheduler() -> AsyncIOScheduler:
 
     # 10. Автономная ночная самопроверка и автопочинка в 04:30 МСК
     scheduler.add_job(
-        scheduled_night_self_heal,
+        functools.partial(_guarded_job, "night_self_heal_job", scheduled_night_self_heal),
         CronTrigger(hour=4, minute=30, timezone=MSK_TZ),
         id="night_self_heal_job",
         replace_existing=True,

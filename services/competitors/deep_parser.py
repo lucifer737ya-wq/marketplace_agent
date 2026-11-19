@@ -152,6 +152,36 @@ def _extract_wb_product_price(product: Dict[str, Any]) -> float:
     return 0.0
 
 
+async def _wb_browser_fallback(
+    query: str, limit: int
+) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    """Ярус 2 для WB: перехват выдачи реальным браузером. Не роняет парсер."""
+    try:
+        from services.competitors.browser_listings import wb_search_via_browser
+
+        return await wb_search_via_browser(query, limit)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — браузерный ярус всегда опционален
+        logger.warning("[Competitors WB] browser tier failed: %s", exc)
+        return [], f"браузерный разбор WB недоступен: {exc}"
+
+
+async def _ozon_browser_fallback(
+    query: str, limit: int
+) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    """Ярус 2 для Ozon: in-page fetch из ozon.ru и разбор widgetStates."""
+    try:
+        from services.competitors.browser_listings import ozon_search_via_browser
+
+        return await ozon_search_via_browser(query, limit)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[Competitors Ozon] browser tier failed: %s", exc)
+        return [], f"браузерный разбор Ozon недоступен: {exc}"
+
+
 async def _parse_wb_competitors_with_status(
     query: str,
     count: int = 15,
@@ -162,45 +192,64 @@ async def _parse_wb_competitors_with_status(
         return [], None
 
     encoded_query = urllib.parse.quote(clean_query)
-    # Several catalog hosts / query shapes — try in order
-    urls = [
-        (
-            "https://search.wb.ru/exactmatch/ru/common/v7/search"
-            f"?appType=1&curr=rub&dest=-1257786&query={encoded_query}"
-            "&resultset=catalog&sort=popular&spp=30&suppressSpellcheck=false"
-        ),
-        (
-            "https://catalog.wb.ru/catalog/common/v2/search"
-            f"?ab_testing=false&appType=1&curr=rub&dest=-1257786&query={encoded_query}"
-            "&resultset=catalog&sort=popular&spp=30&suppressSpellcheck=false"
-        ),
+    # catalog.wb.ru/catalog/.../v2/search удалён вместе с версиями v2-v9.
+    # Актуальная выдача — только search.wb.ru/exactmatch/ru/<шард>/v18/search.
+    query_string = (
+        f"appType=1&curr=rub&dest={{dest}}&inheritFilters=false&lang=ru"
+        f"&page=1&query={encoded_query}&resultset=catalog&sort=popular&spp=30"
+    )
+    candidate_urls = [
+        f"https://search.wb.ru/exactmatch/ru/{shard}/v18/search?"
+        + query_string.format(dest=dest)
+        for dest in ("-1257786", "-1221148", "-1255563")
+        for shard in ("common", "ru")
     ]
     headers = {
         "User-Agent": _USER_AGENT,
         "Accept": "application/json, text/plain, */*",
         "Accept-Language": "ru-RU,ru;q=0.9",
         "Origin": "https://www.wildberries.ru",
-        "Referer": "https://www.wildberries.ru/",
+        "Referer": "https://www.wildberries.ru/catalog/0/search.aspx",
+        "Sec-Fetch-Site": "same-site",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Dest": "empty",
     }
 
     raw_products: List[Dict[str, Any]] = []
-    last_err: Optional[str] = None
-    for url in urls:
-        data, err_msg, is_transport_err = await _fetch_json(url, headers, WB_HTTP_TIMEOUT)
-        if is_transport_err:
-            data, err_msg, _ = await _fetch_json(url, headers, WB_HTTP_TIMEOUT)
+    errors: List[str] = []
+    data: Optional[Any] = None
+    err_msg: Optional[str] = None
+    for url in candidate_urls:
+        data, err_msg, is_transport_err = await _fetch_json_direct(
+            url, headers, WB_HTTP_TIMEOUT
+        )
         if isinstance(data, dict) and not err_msg:
             products = (data.get("data") or data).get("products")
             if isinstance(products, list) and products:
                 raw_products = [p for p in products if isinstance(p, dict)]
-                last_err = None
+                err_msg = None
                 break
-            last_err = "WB: неизвестный формат выдачи"
-        else:
-            last_err = err_msg
-
-    if last_err:
-        logger.warning("[Competitors WB] %s", last_err)
+            if isinstance(products, list):
+                err_msg = "WB: пустая выдача"
+            else:
+                err_msg = "WB: неизвестный формат выдачи"
+        errors.append(f"{url.split('?')[1][:40]}…: {err_msg}")
+        logger.warning("[Competitors WB] %s", err_msg)
+        if is_transport_err:
+            await asyncio.sleep(0.4)
+    if not raw_products:
+        # Ярус 2: реальный браузер. С октября 2026 прямой HTTP к search.wb.ru
+        # отдаёт 403/498, а токен x_wbaas_token привязан к браузеру, который
+        # решил JVO1, поэтому воспроизведение из httpx не работает.
+        err_msg = (
+            "витрина WB не отдала карточки (антибот-защита поиска): "
+            + "; ".join(errors[-2:])
+        )
+        browser_items, browser_err = await _wb_browser_fallback(clean_query, safe_count)
+        if browser_items:
+            return browser_items, None
+        if browser_err:
+            err_msg = f"{err_msg}; {browser_err}"
 
     items: List[Dict[str, Any]] = []
     seen_skus: set[str] = set()
@@ -342,28 +391,55 @@ async def _parse_ozon_competitors_with_status(
         return [], None
 
     search_path = f"/search/?text={urllib.parse.quote(clean_query)}&from_global=true"
-    url = (
-        "https://www.ozon.ru/api/entrypoint-api.bx/page/json/v2"
-        f"?url={urllib.parse.quote(search_path, safe='')}"
-    )
+    encoded_path = urllib.parse.quote(search_path, safe="")
+    # composer-api отвечает 307-петлёй антибота, если нет прогретой сессии.
+    # Пробуем несколько точек входа и честно сообщаем, что витрина закрыта.
+    urls = [
+        "https://www.ozon.ru/api/composer-api.bx/page/json/v2?url=" + encoded_path,
+        "https://api.ozon.ru/composer-api.bx/page/json/v2?url=" + encoded_path,
+        "https://www.ozon.ru/api/entrypoint-api.bx/page/json/v2?url=" + encoded_path,
+    ]
     headers = {
         "User-Agent": _USER_AGENT,
-        "Accept": "application/json",
+        "Accept": "application/json, text/plain, */*",
         "Accept-Language": "ru-RU,ru;q=0.9",
-        "Referer": "https://www.ozon.ru/",
+        "Referer": "https://www.ozon.ru/search/?text="
+        + urllib.parse.quote(clean_query),
+        "x-o3-app-name": "dweb_client",
+        "Sec-Fetch-Site": "same-origin",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Dest": "empty",
     }
 
-    data, err_msg, _ = await _fetch_json(
-        url, headers, OZON_HTTP_TIMEOUT, allow_redirects=True
-    )
-    if err_msg is not None:
-        logger.warning("[Competitors Ozon] live search unavailable: %s", err_msg)
-        return [], err_msg
+    errors: List[str] = []
+    for url in urls:
+        data, err_msg, _ = await _fetch_json_direct(url, headers, OZON_HTTP_TIMEOUT)
+        if err_msg is not None:
+            errors.append(err_msg)
+            logger.warning("[Competitors Ozon] live search unavailable: %s", err_msg)
+            if "307" in err_msg or "302" in err_msg:
+                continue  # антибот-петля: меняем точку входа
+            continue
+        items = _extract_ozon_items_from_payload(data, limit=safe_count)
+        if items:
+            return items, None
+        errors.append("в JSON-выдаче нет товарных карточек")
 
-    items = _extract_ozon_items_from_payload(data, limit=safe_count)
-    if not items:
-        return [], "Витрина Ozon не вернула товарных карточек в JSON-выдаче"
-    return items, None
+    # Ярус 2: браузер. Один Chromium открывает главную ozon.ru и остаётся
+    # открытым; fetch выполняется из контекста этой страницы, иначе 403/CORS.
+    browser_items, browser_err = await _ozon_browser_fallback(clean_query, safe_count)
+    if browser_items:
+        return browser_items, None
+    if browser_err:
+        errors.append(browser_err)
+
+    if any("307" in e or "302" in e for e in errors):
+        return [], (
+            "витрина Ozon закрыта антибот-проверкой: "
+            "публичный поиск недоступен ни по HTTP, ни из браузера; "
+            "используйте официальный Seller API или повторите позже"
+        )
+    return [], "; ".join(dict.fromkeys(errors)) or "витрина Ozon недоступна"
 
 
 async def parse_ozon_competitors(query: str, count: int = 15) -> List[Dict[str, Any]]:

@@ -14,7 +14,13 @@ from config import BASE_DIR, settings
 from maintenance import ai_inspector as inspector
 from maintenance import supervisor as repair
 from services.common.gemini import _extract_model_name
-from services.common.routes import proxy_routes, remember_route
+from services.common.routes import (
+    DIRECT,
+    proxy_routes,
+    remember_route,
+    request_routes,
+    reset_routes,
+)
 
 
 class InspectorAndRepair(unittest.IsolatedAsyncioTestCase):
@@ -140,14 +146,29 @@ class Runtime(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("".join(visible), "".join(fromstring(text).itertext()))
 
     def test_routes(self):
+        reset_routes()
         alternate = "http://127.0.0.1:3067"
         with patch.object(settings, "LOCAL_PROXY_FALLBACK_URL", alternate):
+            # Прямой маршрут присутствует по умолчанию: без него Gemini падал,
+            # когда локальный прокси был отключён.
+            self.assertEqual(request_routes("fixture")[0], DIRECT)
             remember_route("fixture", alternate)
             self.assertEqual(proxy_routes("fixture")[0], alternate)
+            self.assertEqual(request_routes("fixture")[0], alternate)
+            self.assertIn(DIRECT, request_routes("fixture"))
+        reset_routes()
         self.assertEqual(proxy_routes("fixture"), [settings.LOCAL_PROXY_URL])
-        with patch.object(settings, "LOCAL_PROXY_URL", ""):
+        # Нелокальный прокси не принимается (не превращаем бота в открытый релей)
+        with patch.object(settings, "LOCAL_PROXY_LIST", "http://10.0.0.1:8080"):
+            self.assertNotIn("http://10.0.0.1:8080", proxy_routes("fixture"))
+        with patch.object(settings, "LOCAL_PROXY_URL", ""), patch.object(
+            settings, "LOCAL_PROXY_FALLBACK_URL", ""
+        ), patch.object(settings, "LOCAL_PROXY_LIST", ""):
             with self.assertRaises(ValueError):
                 proxy_routes("gemini")
+            with patch.object(settings, "ALLOW_DIRECT_CONNECTIONS", False):
+                with self.assertRaises(ValueError):
+                    request_routes("gemini")
         self.assertEqual(_extract_model_name("models/gemini-test"), "gemini-test")
 
     async def test_startup_interval_router_lock_and_publish_mode(self):

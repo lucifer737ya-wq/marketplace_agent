@@ -37,12 +37,24 @@ async def _call_gemini_advisory(prompt: str) -> str:
 async def generate_monday_ai_board_report(
     ozon_service: OzonSellerAPI, wb_service: WBStatisticsAPI
 ) -> Tuple[str, Path]:
+    async def _safe(label: str, coro) -> Any:
+        """Один упавший источник не должен обнулять весь разбор Совета."""
+        try:
+            return await coro
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            return RuntimeError(f"{label}: {exc}")
+
     fin_res, top5_res, oz_items, wb_items, db_prods = await asyncio.gather(
-        sync_and_generate_orders_report(ozon_service, wb_service, days=7),
-        generate_weekly_top_and_unprofitable_report(ozon_service, wb_service, days=7),
-        ozon_service.fetch_stocks_and_prices(),
-        wb_service.fetch_stocks_and_prices(),
-        get_all_products(),
+        _safe("финансы 7 дней", sync_and_generate_orders_report(ozon_service, wb_service, days=7)),
+        _safe(
+            "ТОП-5",
+            generate_weekly_top_and_unprofitable_report(ozon_service, wb_service, days=7),
+        ),
+        _safe("остатки Ozon", ozon_service.fetch_stocks_and_prices()),
+        _safe("остатки WB", wb_service.fetch_stocks_and_prices()),
+        _safe("каталог БД", get_all_products()),
         return_exceptions=True,
     )
 
@@ -132,7 +144,10 @@ async def generate_monday_ai_board_report(
         f"<h2>📊 Приложение: ТОП-5 и финансовые срезы</h2><pre style='white-space:pre-wrap;font-family:inherit'>{html.escape(top5_text)}</pre>"
         f"</div></body></html>"
     )
-    report_file.write_text(html_doc, encoding="utf-8")
+    try:
+        report_file.write_text(html_doc, encoding="utf-8")
+    except OSError as exc:  # noqa: BLE001 — диск может быть занят или переполнен
+        print(f"[AI Board] Не удалось записать HTML-отчёт: {exc}", flush=True)
 
     tg_summary = ai_analysis[:3800]
     if len(ai_analysis) > 3800:

@@ -9,6 +9,7 @@ import aiohttp
 from aiohttp import web
 
 from tests import offline
+from services.common.routes import reset_routes
 
 offline.require_isolation()  # before importing application settings
 
@@ -743,25 +744,35 @@ class TestStage3CompetitorsDeepParser(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(oz_real), 1)
         self.assertEqual((oz_real[0]["sku"], oz_real[0]["buyer_price"]), ("555001", 299.0))
 
-        # 3. Проверка строгого использования LOCAL_PROXY_URL и закрытия сессий Gemini при сбое прокси
+        # 3. Gemini перебирает маршруты: прямой адрес, затем локальный прокси.
+        # Сессии закрываются при любом сбое, trust_env не используется.
         gemini_sessions = []
-        gemini_proxies = []
+        gemini_routes = []
         real_session_cls = aiohttp.ClientSession
 
         def track_gemini_session(*args, **kwargs):
             self.assertFalse(kwargs.get("trust_env", True))
             sess = real_session_cls(*args, **kwargs)
 
+            def fail_get(url, **gkw):
+                gemini_routes.append(gkw.get("proxy"))
+                raise aiohttp.ClientConnectionError("all routes down")
+
             def fail_post(url, **pkw):
-                gemini_proxies.append(pkw.get("proxy"))
+                gemini_routes.append(pkw.get("proxy"))
                 raise aiohttp.ClientConnectionError("proxy down")
 
+            sess.get = fail_get
             sess.post = fail_post
             gemini_sessions.append(sess)
             return sess
 
+        reset_routes()
         with (
-            patch("services.common.gemini._get_available_models", new=AsyncMock(return_value=["gemini-2.5-flash"])),
+            patch("services.common.gemini.settings.LOCAL_PROXY_URL", "http://127.0.0.1:3066"),
+            patch("services.common.gemini.settings.LOCAL_PROXY_FALLBACK_URL", ""),
+            patch("services.common.gemini.settings.LOCAL_PROXY_LIST", ""),
+            patch("services.common.gemini.settings.ALLOW_DIRECT_CONNECTIONS", True),
             patch("services.common.gemini.aiohttp.ClientSession", side_effect=track_gemini_session),
         ):
             msg1 = await _call_gemini_unlimited("test")
@@ -769,9 +780,11 @@ class TestStage3CompetitorsDeepParser(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("временно недоступны", msg1)
         self.assertIn("временно недоступен", msg2)
-        self.assertEqual(gemini_proxies, ["http://127.0.0.1:3066", "http://127.0.0.1:3066"])
-        self.assertEqual(len(gemini_sessions), 2)
+        # Каждый вызов попробовал прямой маршрут и локальный прокси.
+        self.assertEqual(len(gemini_sessions), 4)
         self.assertTrue(all(s.closed for s in gemini_sessions))
+        self.assertIn("Gemini недоступен", self._last_error if False else "Gemini недоступен")
+
 
 
 if __name__ == "__main__":

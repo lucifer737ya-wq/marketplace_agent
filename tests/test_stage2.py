@@ -77,6 +77,7 @@ class TestAsync(unittest.IsolatedAsyncioTestCase):
             if url.endswith('/status'): return {'data':{'status':'done'}}
             if url.endswith('/download'): return [{'nmId':123,'barcode':'abc','techSize':'0','warehouses':[{'warehouseName':'Всего находится на складах','quantity':5}]}]
             if '/supplier/orders' in url: return []
+            if '/analytics/v1/order-feed' in url: return {'orders': [], 'snapshotTime': '2026-11-18T00:00:00Z'}
             raise AssertionError(url)
         wb._request=AsyncMock(side_effect=request)
         rows=await wb.fetch_stocks_and_prices(); self.assertEqual(len(rows),1)
