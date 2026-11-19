@@ -31,7 +31,15 @@ async def run_full_self_check_and_heal(**checks) -> dict:
             if issue.repairable and issue.file and safe_target(issue.file, BASE_DIR):
                 groups[issue.file].append(context)
             else:
-                details.append("⚠️ " + html.escape(context) + " (без изменения кода)")
+                advice = ""
+                if issue.kind == "API":
+                    if "HTTP 429" in issue.detail:
+                        advice = "; проверьте лимиты и повторите позже, не перебирая методы"
+                    elif "Gemini HTTP 400" in issue.detail:
+                        advice = "; проверьте модель из списка доступных и параметры запроса"
+                    elif "Ozon HTTP 400" in issue.detail:
+                        advice = "; проверьте название метода и схему запроса в диагностике"
+                details.append("⚠️ " + html.escape(context + advice) + " (без изменения кода)")
         for path, contexts in groups.items():
             try:
                 ok, msg = await repair_file(path, "\n".join(contexts), **checks)

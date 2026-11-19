@@ -716,7 +716,7 @@ class OzonSellerAPI(MarketplaceClient):
         from_date = start_dt.strftime("%Y-%m-%dT00:00:00.000Z")
         to_date = end_dt.strftime("%Y-%m-%dT23:59:59.999Z")
         period_label = f"{start_dt.strftime('%d.%m.%Y')}–{end_dt.strftime('%d.%m.%Y')}"
-        cache_key = f"finance:{from_date}:{to_date}"
+        cache_key = f"finance_v2:{from_date}:{to_date}"
 
         async with self._finance_lock:
             cached = self._read_disk_cache(cache_key, 900)
@@ -779,12 +779,14 @@ class OzonSellerAPI(MarketplaceClient):
             except Exception as exc:  # noqa: BLE001 — резервный источник обязателен
                 source_parts.append(f"cash-flow {type(exc).__name__}")
 
+            accrual_success = False
             # 2) Основной per-SKU источник: /v1/finance/accrual/by-day.
             # Именно он даёт заказы и артикулы, по которым были платные услуги.
             try:
                 accrual_book, accrual_orders, accrual_billed, accrual_src = (
                     await self._fetch_accrual_by_day(start_dt.date(), end_dt.date())
                 )
+                accrual_success = True
                 orders_list = accrual_orders
                 billed_skus = set(accrual_billed)
                 if not cash_flow_applied:
@@ -795,6 +797,8 @@ class OzonSellerAPI(MarketplaceClient):
             except Exception as exc:  # noqa: BLE001
                 source_parts.append(f"accrual {type(exc).__name__}")
 
+            if not accrual_success and not cash_flow_applied:
+                raise RuntimeError("Ozon: финансы недоступны; " + "; ".join(source_parts))
             detail = "; ".join(part for part in source_parts if part) or "нет данных"
             report = dict(
                 report_totals,
@@ -950,7 +954,7 @@ class OzonSellerAPI(MarketplaceClient):
                             "buyer_price": round(sale_price or seller_price, 2),
                             "commission": round(sale_commission, 2),
                             "logistics": round(logistics, 2),
-                            "status": "sold",
+                            "status": "returned" if seller_price < 0 else "sold",
                         }
                     )
 

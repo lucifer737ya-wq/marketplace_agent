@@ -501,10 +501,9 @@ class Adapters(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(report["summary_only"])
         self.assertEqual(report["revenue_seller"], 1000)
         self.assertEqual(report["for_pay"], 700)
-        self.assertEqual(report["total_payout"], 700)
-        self.assertEqual(
-            report["total_deductions"], 100 + 20 + 5 + 10 + 15
-        )
+        self.assertNotIn("total_payout", report)
+        self.assertNotIn("total_deductions", report)
+        self.assertEqual(report["summary_reports"][0]["for_pay_sum"], 700)
         self.assertIn("закрытые", report["source"])
 
     async def test_wb_campaign_sequence_and_join_by_id(self):
@@ -624,7 +623,7 @@ class Adapters(unittest.IsolatedAsyncioTestCase):
         monthly = await sync_and_generate_orders_report(oz, wb)
         weekly = await generate_weekly_top_and_unprofitable_report(oz, wb)
         # 300 − 66 − 39 − эквайринг 1.5% (4.50) − себестоимость 10 − налог 18 = 162.50
-        self.assertIn("162.50 ₽", monthly)
+        self.assertIn("Чистая прибыль Ozon:</b> <b>н/д", monthly)
         self.assertIn("162.50 ₽", weekly)
 
     async def test_signed_wb_adjustments_and_explicit_zero_acquiring(self):

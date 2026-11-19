@@ -225,7 +225,8 @@ class TestStage3FinanceAndOrders(unittest.IsolatedAsyncioTestCase):
         )
         rep_ret = await sync_and_generate_orders_report(oz_mock, wb_mock, days=7)
         self.assertIn("Налог УСН (6%): <b>0 ₽</b> (0.0%)", rep_ret)
-        self.assertIn("<code>-678 ₽</code>", rep_ret)
+        self.assertIn("Всего к выплате Ozon: -678 ₽", rep_ret)
+        self.assertIn("Чистая прибыль Ozon:</b> <b>н/д", rep_ret)
 
     async def test_monthly_bounds_and_weekly_top5_no_fake_cogs_and_wb_acquiring(self) -> None:
         # Проверка високосного февраля и смены года

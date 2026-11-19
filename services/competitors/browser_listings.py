@@ -46,7 +46,7 @@ USER_AGENT = (
 
 WB_SEARCH_RE = re.compile(r"search\.wb\.ru/.*/search\?")
 WB_CARD_RE = re.compile(r"card\.wb\.ru/.*/detail")
-OZON_ITEM_RE = re.compile(r"/product/[^\"\\]*?-(\d+)/?")
+OZON_ITEM_RE = re.compile(r"/product/[^\"\\?#]*-([1-9]\d{5,})(?:/|[?#]|$)")
 
 PRICE_NUM_RE = re.compile(r"\d[\d\s\u00a0\u2009]*(?:[.,]\d+)?")
 
@@ -277,12 +277,13 @@ def parse_ozon_dom_cards(cards: List[Dict[str, Any]], limit: int = 15) -> List[D
         if sku in seen:
             continue
         text = str(card.get("text") or "").replace("\n", " ")
-        prices = [
-            _num(m.group(0).replace(" ", "").replace("\u00a0", ""))
-            for m in PRICE_NUM_RE.finditer(text)
-            if _num(m.group(0).replace(" ", "").replace("\u00a0", "")) > 50.0
-        ]
-        if not prices:
+        # Не выбираем минимум из произвольных чисел: размер/баллы/скидка
+        # попадали в предыдущую выдачу как цена товара. Несколько разных
+        # цен без маркировки неоднозначны и исключаются из статистики.
+        price_re = r"(?<![\d])([\d][\d\s\u00a0\u2009]*(?:[.,]\d{1,2})?)\s*₽"
+        prices = {_num(m.group(1)) for m in re.finditer(price_re, text)}
+        prices = {v for v in prices if v > 0}
+        if len(prices) != 1:
             continue
         name = re.sub(r"\s+", " ", text).strip()[:180] or f"Товар Ozon {sku}"
         seen.add(sku)
@@ -294,7 +295,7 @@ def parse_ozon_dom_cards(cards: List[Dict[str, Any]], limit: int = 15) -> List[D
                 "brand": "Без бренда",
                 "rating": 0.0,
                 "feedbacks": 0,
-                "buyer_price": round(min(prices), 2),
+                "buyer_price": round(next(iter(prices)), 2),
             }
         )
         if len(items) >= max(int(limit), 1):
@@ -419,12 +420,10 @@ async def _wb_search_uncached(
             for card in cards or []:
                 match = re.search(r"/catalog/(\d+)/detail", str(card.get("href") or ""))
                 text = str(card.get("text") or "")
-                prices = [
-                    _num(m.group(0).replace(" ", "").replace("\u00a0", ""))
-                    for m in PRICE_NUM_RE.finditer(text)
-                ]
-                prices = [v for v in prices if 50.0 < v < 1_000_000.0]
-                if not match or not prices:
+                price_re = r"(?<![\d])([\d][\d\s\u00a0\u2009]*(?:[.,]\d{1,2})?)\s*₽"
+                prices = {_num(m.group(1)) for m in re.finditer(price_re, text)}
+                prices = {v for v in prices if v > 0}
+                if not match or len(prices) != 1:
                     continue
                 dom_items.append(
                     {
@@ -434,7 +433,7 @@ async def _wb_search_uncached(
                         "brand": "Без бренда",
                         "rating": 0.0,
                         "feedbacks": 0,
-                        "buyer_price": round(min(prices), 2),
+                        "buyer_price": round(next(iter(prices)), 2),
                     }
                 )
                 if len(dom_items) >= max(int(limit), 1):

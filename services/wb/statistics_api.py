@@ -11,10 +11,17 @@ from services.common.market_api import APIStatusError, MarketplaceClient, read_v
 logger = logging.getLogger(__name__)
 
 
+class AmbiguousFinancePeriod(RuntimeError):
+    """Безопасная диагностическая строка о границах сводного отчёта."""
+
+
+
 
 def _exc_label(exc: BaseException) -> str:
     if isinstance(exc, APIStatusError):
         return f"HTTP {exc.status}"
+    if isinstance(exc, AmbiguousFinancePeriod):
+        return str(exc)
     return type(exc).__name__
 
 
@@ -835,7 +842,7 @@ class WBStatisticsAPI(MarketplaceClient):
         end = datetime.utcnow().date()
         date_from = custom_date_from or (end - timedelta(days=days - 1)).isoformat()
         date_to = custom_date_to or end.isoformat()
-        key = f"finance:{date_from}:{date_to}"
+        key = f"finance_v2:{date_from}:{date_to}"
         async with self._orders_lock:
             cached = self._read_disk_cache(key, 900)
             if cached is not None:
@@ -860,8 +867,15 @@ class WBStatisticsAPI(MarketplaceClient):
                         date_from, date_to, level="weekly"
                     )
                 except (APIStatusError, RuntimeError) as exc:
-                    errors.append(f"список отчётов: {_exc_label(exc)}")
+                    errors.append(f"список weekly: {_exc_label(exc)}")
                     report = None
+                    if isinstance(exc, AmbiguousFinancePeriod):
+                        try:
+                            report = await self._finance_from_summaries(
+                                date_from, date_to, level="daily"
+                            )
+                        except (APIStatusError, RuntimeError) as daily_exc:
+                            errors.append(f"список daily: {_exc_label(daily_exc)}")
                 if report is None or not (
                     report.get("revenue_seller") or report.get("for_pay")
                 ):
@@ -909,47 +923,61 @@ class WBStatisticsAPI(MarketplaceClient):
         if not reports:
             reports = await self._fetch_report_positions(date_from, date_to, "daily")
             level = "daily"
-        ads = await self.fetch_wb_ad_spend(date_from, date_to)
-        retail = for_pay = delivery = storage = acceptance = other = penalty = 0.0
-        cashback = 0.0
-        periods = []
+        # Сводный недельный отчёт нельзя обрезать пропорцией: на границе
+        # месяца/недели нет распределения сумм по дням.
+        selected = []
+        by_id = {}
         for rep in reports:
-            retail += _num(rep.get("retailAmountSum"))
-            for_pay += _num(rep.get("forPaySum"))
-            delivery += _num(rep.get("deliveryServiceSum"))
-            storage += _num(rep.get("paidStorageSum"))
-            acceptance += _num(rep.get("paidAcceptanceSum"))
-            other += _num(rep.get("deductionSum"))
-            penalty += _num(rep.get("penaltySum"))
-            cashback += _num(rep.get("cashbackCommissionChangeSum"))
-            if rep.get("dateFrom") and rep.get("dateTo"):
-                periods.append(f"{rep['dateFrom']}..{rep['dateTo']}")
-        deductions = delivery + storage + acceptance + other + penalty + cashback + ads
-        commission = retail - for_pay - (delivery + storage + acceptance + other + penalty)
+            report_id = str(rep.get("reportId") or rep.get("realizationreport_id") or "").strip()
+            start = str(rep.get("dateFrom") or "")[:10]
+            end = str(rep.get("dateTo") or "")[:10]
+            if not report_id or not start or not end:
+                raise RuntimeError("WB: у сводного отчёта отсутствуют ID или даты")
+            try:
+                datetime.fromisoformat(start)
+                datetime.fromisoformat(end)
+            except ValueError as exc:
+                raise RuntimeError("WB: некорректный период сводного отчёта") from exc
+            for field in ("retailAmountSum", "forPaySum"):
+                value = rep.get(field)
+                try:
+                    number = float(str(value).replace(" ", "").replace("\u00a0", "").replace(",", "."))
+                    if not math.isfinite(number):
+                        raise ValueError
+                except (TypeError, ValueError):
+                    raise RuntimeError(f"WB: в сводном отчёте отсутствует корректное поле {field}")
+            if start > end or start < date_from or end > date_to:
+                raise AmbiguousFinancePeriod(
+                    f"WB: отчёт {report_id} ({start}..{end}) выходит за запрошенный период; "
+                    "нужна дневная детализация"
+                )
+            if report_id in by_id:
+                if by_id[report_id] != rep:
+                    raise RuntimeError(f"WB: конфликтующие версии отчёта {report_id}")
+                continue
+            by_id[report_id] = rep
+            selected.append(rep)
+        # Два разных отчёта одного периода могут относиться к разным договорам;
+        # их нельзя автоматически считать ни дублем, ни независимой выручкой.
+        spans = [(str(r['dateFrom'])[:10], str(r['dateTo'])[:10]) for r in selected]
+        for i, (a, b) in enumerate(spans):
+            if any(a <= d and c <= b for c, d in spans[i + 1:]):
+                raise RuntimeError("WB: периоды разных сводных отчётов пересекаются; нужна сверка договоров")
+        if not selected:
+            raise RuntimeError("WB: нет закрытых отчётов за выбранный период")
         return {
-            "source": (
-                f"finance-api WB, закрытые {level} отчёты ({date_from}..{date_to})"
-                + ("; периодов: " + ", ".join(periods[:4]) if periods else "")
-            ),
-            "orders": [],
-            "orders_count": 0,
-            "revenue_seller": round(retail, 2),
-            "revenue_buyer": round(retail, 2),
-            "returns_amount": 0.0,
-            "for_pay": round(for_pay, 2),
-            "commission": round(commission, 2),
-            "acquiring": 0.0,
-            "acquiring_estimated": True,
-            "logistics": round(delivery, 2),
-            "logistics_direct": round(delivery, 2),
-            "logistics_return": 0.0,
-            "storage": round(storage, 2),
-            "acceptance": round(acceptance, 2),
-            "ads": round(ads, 2),
-            "other_services": round(other + penalty + cashback, 2),
-            "total_deductions": round(deductions, 2),
-            "total_payout": round(for_pay - ads, 2),
+            "source": f"finance-api WB: закрытые сводные {level} отчёты без детализации",
             "summary_only": True,
+            "summary_reports": [{
+                "id": str(r.get("reportId") or r.get("realizationreport_id")),
+                "date_from": str(r['dateFrom'])[:10],
+                "date_to": str(r['dateTo'])[:10],
+                "retail_amount_sum": _num(r.get("retailAmountSum")),
+                "for_pay_sum": _num(r.get("forPaySum")),
+            } for r in selected],
+            # Поля нужны только для обнаружения непустого ответа, не для P&L.
+            "revenue_seller": sum(_num(r.get("retailAmountSum")) for r in selected),
+            "for_pay": sum(_num(r.get("forPaySum")) for r in selected),
         }
 
     @staticmethod

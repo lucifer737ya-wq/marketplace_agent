@@ -26,6 +26,7 @@ logger = logging.getLogger(__name__)
 # Старые gemini-2.5-* автоматически переадресуются Google с 01.12.2026,
 # поэтому фолбэк-цепочка начинается с текущего поколения.
 FALLBACK_MODELS = [
+    "gemini-3.1-flash-lite",
     "gemini-3.8-flash",
     "gemini-3.5-flash",
     "gemini-3.5-flash-lite",
@@ -33,8 +34,8 @@ FALLBACK_MODELS = [
     "gemini-2.5-flash",
 ]
 FAST_MODELS = [
-    "gemini-3.5-flash-lite",
     "gemini-3.1-flash-lite",
+    "gemini-3.5-flash-lite",
     "gemini-2.5-flash-lite",
     "gemini-3.8-flash",
 ]
@@ -151,17 +152,27 @@ async def generate(
                 headers=headers,
             ) as session:
                 models = await _get_available_models(session, route)
-                chain = list(
-                    dict.fromkeys(models + _model_chain(fast))
-                )
-                if fast:
-                    chain.sort(key=lambda n: ("lite" not in n, "flash" not in n))
-                for name in chain[:6]:
+                preferred = _model_chain(fast)
+                # При доступном каталоге используем только модели с поддержкой
+                # generateContent, отдавая приоритет стабильной модели и настройке.
+                chain = ([n for n in preferred if n in models] +
+                         [n for n in models if n not in preferred]) if models else preferred
+                for name in chain:
                     url = f"{BASE_URL}/{name}:generateContent"
                     try:
                         async with session.post(url, json=payload, **proxy) as resp:
                             if resp.status != 200:
-                                errors.append(f"{name}: HTTP {resp.status}")
+                                # Не выводим текст ошибки: в нём могут быть ключи,
+                                # входные данные или прочая конфиденциальная информация.
+                                api_status = ""
+                                try:
+                                    error_data = await resp.json()
+                                    status = (error_data.get("error") or {}).get("status")
+                                    if status in {"INVALID_ARGUMENT", "FAILED_PRECONDITION", "PERMISSION_DENIED", "UNAUTHENTICATED", "NOT_FOUND", "RESOURCE_EXHAUSTED"}:
+                                        api_status = f" ({status})"
+                                except (ValueError, TypeError, AttributeError, aiohttp.ClientError):
+                                    pass
+                                errors.append(f"{name}: HTTP {resp.status}{api_status}")
                                 if resp.status in (400, 401, 403, 404):
                                     continue  # model/permission problem, next model
                                 route_broken = resp.status in (408, 425, 429, 498, 500, 502, 503, 504)

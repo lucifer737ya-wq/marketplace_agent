@@ -44,10 +44,10 @@ class Settings(BaseSettings):
     # Gemini API
     GEMINI_API_KEY: str = Field(..., description="API ключ Google Gemini")
     GEMINI_MODEL: str = Field(
-        default="gemini-3.8-flash", description="Базовая модель Gemini"
+        default="gemini-3.1-flash-lite", description="Базовая модель Gemini"
     )
     GEMINI_FAST_MODEL: str = Field(
-        default="gemini-3.5-flash-lite",
+        default="gemini-3.1-flash-lite",
         description="Эконом-модель для отзывов, вопросов и коротких задач",
     )
     # Прямой адрес API Google. Работает без посредников и без локального прокси.
