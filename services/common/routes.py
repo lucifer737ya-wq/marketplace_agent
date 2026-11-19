@@ -21,6 +21,7 @@ import time
 from hashlib import sha256
 from typing import Any, Awaitable, Callable, Iterable, Sequence
 from urllib.parse import urlsplit
+from typing import List, Optional
 
 import aiohttp
 
@@ -36,10 +37,24 @@ _cooldown: dict[str, tuple[str, float]] = {}
 # monotonic timestamps of consecutive failures per route fingerprint
 _failures: dict[str, int] = {}
 
+# Sentinel for "no proxy / direct connection"
+DIRECT = ""
+
 
 class RouteError(RuntimeError):
     """Every candidate route failed. Carries a compact human readable reason."""
 
+def proxy_routes(service: str, *, allow_direct: bool = False) -> List[Optional[str]]:
+    """
+    Returns ordered list of routes to try.
+    - For Telegram: only configured local HTTP proxies (required).
+    - For Gemini (allow_direct=True): direct connection first, then local proxies as fallback.
+    """
+    routes: List[Optional[str]] = []
+
+    if allow_direct:
+        # Direct is preferred: user reports ~300 ms and stable without local proxy.
+        routes.append(DIRECT)
 
 def _fingerprint(route: str) -> str:
     return sha256(route.encode()).hexdigest()

@@ -82,8 +82,8 @@ class OzonSellerAPI(MarketplaceClient):
 
     async def _load_inventory(self) -> List[Dict[str, Any]]:
         """
-        Собирает цены, акции, остатки FBO и FBS, комиссию (22-23% до 300₽ / 52% > 300₽)
-        и приемку на ПВЗ по FBS (first mile / drop-off).Использует кэш для защиты от 429.
+        Собирает цены, акции, остатки FBO и FBS, комиссию и приемку на ПВЗ по FBS.
+        Использует кэш для защиты от 429.
         """
         cached = self._read_disk_cache("ozon_stocks_and_prices", max_age_sec=180)
         if cached is not None:
@@ -163,7 +163,6 @@ class OzonSellerAPI(MarketplaceClient):
             fbo_map[off_id] = fbo_qty
             fbs_map[off_id] = fbs_qty
 
-        # Кэшируем аналитику продаж отдельно на 30 минут, чтобы не ловить Rate Limit 429!
         sales_7d_map = self._read_disk_cache("ordered_units", 1800)
         if sales_7d_map is None:
             end = datetime.utcnow().date()
@@ -193,9 +192,7 @@ class OzonSellerAPI(MarketplaceClient):
                     offset += len(rows)
                 self._write_disk_cache("ordered_units", sales_7d_map)
             except (RuntimeError, KeyError, ValueError):
-                sales_7d_map = (
-                    None  # optional metric: unavailable, not fabricated sales
-                )
+                sales_7d_map = None
 
         results: List[Dict[str, Any]] = []
         for item in prices_items:
@@ -226,7 +223,6 @@ class OzonSellerAPI(MarketplaceClient):
                 or raw_pct_fbo
             )
 
-            # Логистика FBO
             fbo_deliv = (
                 float(comm_block.get("fbo_deliv_to_customer_amount") or 0.0)
                 + float(
@@ -237,7 +233,6 @@ class OzonSellerAPI(MarketplaceClient):
                 + float(comm_block.get("fbo_fulfillment_amount") or 0.0)
             )
 
-            # Логистика FBS (без приемки ПВЗ, приемку выделяем отдельно!)
             fbs_deliv_pure = float(
                 comm_block.get("fbs_deliv_to_customer_amount") or 0.0
             ) + float(
@@ -246,7 +241,6 @@ class OzonSellerAPI(MarketplaceClient):
                 or 0.0
             )
 
-            # Приемка на ПВЗ по FBS (Drop-off / первая миля)
             pvz_raw = next(
                 (
                     comm_block[key]
@@ -266,7 +260,6 @@ class OzonSellerAPI(MarketplaceClient):
                 else round(cur_price * settings.ACQUIRING_RATE, 2)
             )
 
-            # Проверка участия товара в акциях Ozon
             mkt_actions = item.get("marketing_actions")
             actions_list = []
             if isinstance(mkt_actions, dict):
@@ -395,7 +388,6 @@ class OzonSellerAPI(MarketplaceClient):
             kind = str(c.get("advObjectType") or "SKU")
             rows, skus = [], []
             if kind == "SEARCH_PROMO" and cpo_count == 1:
-                # This is an account-wide read; never assign it to each of several CPO campaigns.
                 entries = await pages(
                     "/api/client/campaign/search_promo/v2/products",
                     "products",
@@ -408,7 +400,6 @@ class OzonSellerAPI(MarketplaceClient):
                         if p.get("searchPromoStatus") is True
                     }
                 )
-                # A CPO bid is not an observed DRR. The CPC statistics endpoint does not cover CPO.
             elif kind == "SKU":
                 items = await read_versions(
                     (
@@ -675,143 +666,63 @@ class OzonSellerAPI(MarketplaceClient):
                 hour=23, minute=59, second=59
             )
         else:
-            start_dt = now_utc - timedelta(days=days - 1)
+            start_dt = now_utc - timedelta(days=max(days, 1) - 1)
             end_dt = now_utc
 
         from_date = start_dt.strftime("%Y-%m-%dT00:00:00.000Z")
         to_date = end_dt.strftime("%Y-%m-%dT23:59:59.999Z")
         period_label = f"{start_dt.strftime('%d.%m.%Y')}–{end_dt.strftime('%d.%m.%Y')}"
         cache_key = f"finance:{from_date}:{to_date}"
+
         async with self._finance_lock:
             cached = self._read_disk_cache(cache_key, 900)
             if cached is not None:
                 return cached
 
-            types = await self._accrual_types()
+            report_totals: Dict[str, Any] = {
+                "sales_total": 0.0,
+                "commission": 0.0,
+                "deliv_direct": 0.0,
+                "deliv_return": 0.0,
+                "deliv_ozon_handover": 0.0,
+                "deliv_total": 0.0,
+                "partner_dropoff": 0.0,
+                "partner_pack": 0.0,
+                "partner_returns": 0.0,
+                "partner_last_mile": 0.0,
+                "acquiring": 0.0,
+                "star_products": 0.0,
+                "fbo_storage": 0.0,
+                "promo_cpc": 0.0,
+                "promo_cpo": 0.0,
+                "ads_total": 0.0,
+                "other_fines": 0.0,
+                "decompensations": 0.0,
+                "mutual_settlements": 0.0,
+                "partners_total": 0.0,
+                "total_deductions": 0.0,
+                "total_payout": 0.0,
+                "acquiring_reported": False,
+            }
+            source = ""
             orders_list: List[Dict[str, Any]] = []
-            postings: set[str] = set()
-            billed_skus: set[str] = set()
-            seen_accruals: set[str] = set()
-            operations = 0
-            unmapped: set[int] = set()
-            ledger: Dict[str, Decimal] = defaultdict(Decimal)
 
-            for day in _date_range(start_dt.date(), end_dt.date()):
-                for accrual in await self._accruals_for_day(datetime.combine(day, datetime.min.time())):
-                    accrual_id = str(
-                        accrual.get("accrual_id") or accrual.get("unit_number") or ""
-                    )
-                    if accrual_id and accrual_id in seen_accruals:
-                        continue
-                    if accrual_id:
-                        seen_accruals.add(accrual_id)
-                    operations += 1
-                    posting_number = str(accrual.get("unit_number") or "").strip()
-                    operation_date = str(accrual.get("date") or day.isoformat())
-                    units = 0
-                    for product in (accrual.get("posting") or {}).get("products") or []:
-                        units += 1
-                        commission = product.get("commission") or {}
-                        seller_price = _amount(commission.get("seller_price"))
-                        sale_commission = _amount(commission.get("sale_commission"))
-                        sale_amount = _amount(commission.get("sale_amount"))
-                        ledger["sales_total"] += _to_decimal(sale_amount or seller_price)
-                        ledger["commission"] -= _to_decimal(sale_commission)
-
-                        payload = walk_fees(product.get("delivery"), unmapped)
-                        for type_id, value in payload:
-                            # Начисления услуг приходят со знаком минус, а книга
-                            # расходов (как и в cash-flow) ведётся положительными.
-                            ledger[
-                                _accrual_category(types, type_id, unmapped, None)
-                            ] -= value
-                        sku = str(product.get("sku") or "").strip()
-                        if sku and posting_number:
-                            orders_list.append(
-                                {
-                                    "order_id": f"oz:{accrual_id or posting_number}:{sku}",
-                                    "marketplace": "ozon",
-                                    "posting": posting_number,
-                                    "sku": sku,
-                                    "created_at": operation_date,
-                                    "quantity": 1,
-                                    "status": "sold",
-                                    "price": round(
-                                        _amount(commission.get("seller_price"))
-                                        or _amount(commission.get("sale_price")),
-                                        2,
-                                    ),
-                                    "commission": round(-sale_commission, 2)
-                                    if sale_commission
-                                    else None,
-                                }
-                            )
-
-                    for group in (accrual.get("item_fees") or {}).get("fees") or []:
-                        sku = str(group.get("sku") or "").strip()
-                        for fee in group.get("fees") or []:
-                            type_id = fee.get("type_id")
-                            value = _to_decimal(_amount(fee.get("accrued")))
-                            key = _accrual_category(types, type_id, unmapped, None)
-                            ledger[key] -= value
-                            if value < 0 and key in {"promo_cpc", "promo_cpo"} and sku:
-                                billed_skus.add(sku)
-
-                    non_item = accrual.get("non_item_fee")
-                    if isinstance(non_item, dict):
-                        type_id = non_item.get("type_id")
-                        ledger[
-                            _accrual_category(types, type_id, unmapped, None)
-                        ] -= _to_decimal(_amount(non_item.get("accrued")))
-
-                    if posting_number and units:
-                        postings.add(posting_number)
-
-            report_totals = totals(ledger)
-            source = f"начисления by-day ({period_label})"
-            if unmapped:
-                source += "; неизвестные типы начислений: " + ", ".join(
-                    f"{tid}({types.get(tid, '?')})" for tid in sorted(unmapped)[:6]
-                )
-            if operations == 0:
-                source += "; за период начислений нет"
-
-            cash_flows, details_list = [], []
-            page = 1
+            # 1) Primary: cash-flow-statement
             try:
-                while True:
-                    cf = await self._request(
-                        "POST",
-                        "/v1/finance/cash-flow-statement/list",
-                        {
-                            "date": {"from": from_date, "to": to_date},
-                            "page": page,
-                            "page_size": 100,
-                            "with_details": True,
-                        },
-                    )
-                    result = cf["result"]
-                    cash_flows.extend(result["cash_flows"])
-                    details = result.get("details") or []
-                    details_list.extend(
-                        [details] if isinstance(details, dict) else details
-                    )
-                    if page >= int(result.get("page_count", cf.get("page_count", 1))):
-                        break
-                    page += 1
-                if all(
-                    complete_statement(rows, start_dt.date(), end_dt.date())
-                    for rows in (cash_flows, details_list)
-                ):
-                    statement = totals(book_statement(cash_flows, details_list))
-                    if all(
-                        abs(statement[k] - report_totals[k]) < 0.011
-                        for k in ("sales_total", "total_payout")
-                    ):
-                        report_totals = statement
-                        source = f"cash-flow, сверено с начислениями ({period_label})"
+                cash_flows, details_list, src = await self._fetch_cash_flow(
+                    from_date, to_date
+                )
+                if cash_flows or details_list:
+                    if complete_statement(
+                        cash_flows, start_dt.date(), end_dt.date()
+                    ) or details_list:
+                        statement = totals(book_statement(cash_flows, details_list))
+                        report_totals.update(statement)
+                        source = src
                     else:
-                        source += "; расхождение с cash-flow"
+                        source = f"{src} (неполное покрытие периода)"
+                        statement = totals(book_statement(cash_flows, details_list))
+                        report_totals.update(statement)
                 else:
                     source += "; cash-flow не покрывает период"
             except (APIStatusError, RuntimeError) as exc:
@@ -827,6 +738,35 @@ class OzonSellerAPI(MarketplaceClient):
                 orders_count=len(postings),
                 billed_skus=sorted(billed_skus),
                 source=f"Ozon {source}",
+                    source = "cash-flow пуст"
+            except APIStatusError as exc:
+                if exc.status not in {400, 404, 410, 429}:
+                    raise
+                source = f"cash-flow HTTP {exc.status}"
+
+            # 2) Fallback: accrual/by-day (official replacement of v3/transaction/list)
+            if report_totals.get("sales_total", 0) == 0 and report_totals.get(
+                "total_deductions", 0
+            ) == 0:
+                try:
+                    book, src = await self._fetch_accrual_by_day(
+                        start_dt.date(), end_dt.date()
+                    )
+                    # Normalize into the same shape as totals()
+                    normalized = totals(defaultdict(Decimal, book))
+                    report_totals.update(normalized)
+                    source = (source + "; " if source else "") + src
+                except APIStatusError as exc:
+                    source = (source + "; " if source else "") + f"accrual HTTP {exc.status}"
+                except Exception as exc:
+                    source = (source + "; " if source else "") + f"accrual {type(exc).__name__}"
+
+            report = dict(
+                report_totals,
+                orders=orders_list,
+                orders_count=len(orders_list),
+                billed_skus=[],
+                source=f"Ozon {source or 'нет данных'} ({period_label})",
             )
             self._write_disk_cache(cache_key, report)
             return report
@@ -842,36 +782,18 @@ class OzonSellerAPI(MarketplaceClient):
             or not isinstance(offer_id, str)
             or not offer_id.strip()
         ):
-            raise ValueError("Необходимы product_id и offer_id из одного товара Ozon")
-        item = {
-            "product_id": int(product_id),
-            "offer_id": offer_id.strip(),
-            "price": f"{new_price:.2f}",
-            "auto_action_enabled": "UNKNOWN",
+            raise ValueError("Требуются числовой product_id и непустой offer_id")
+        payload = {
+            "prices": [
+                {
+                    "auto_action_enabled": "UNKNOWN",
+                    "currency_code": "RUB",
+                    "min_price": str(round(new_price * 0.7, 2)),
+                    "offer_id": offer_id.strip(),
+                    "old_price": "0",
+                    "price": str(round(new_price, 2)),
+                    "product_id": int(product_id),
+                }
+            ]
         }
-        return await self._request(
-            "POST", "/v1/product/import/prices", {"prices": [item]}
-        )
-
-    async def update_price_and_min_price(
-        self, offer_id: str, recommended_price: float
-    ) -> Dict[str, Any]:
-        items = await self.fetch_stocks_and_prices()
-        matches = [item for item in items if item["sku"] == offer_id]
-        if len(matches) != 1:
-            raise ValueError("Неоднозначный offer_id Ozon")
-        return await self.update_price(
-            matches[0]["product_id"], offer_id, recommended_price
-        )
-
-    async def pause_or_reduce_campaign(
-        self, campaign_id: str, pause: bool = True
-    ) -> bool:
-        token = await self._perf_token()
-        endpoint = "deactivate" if pause else "activate"
-        await self.request_json(
-            "POST",
-            f"{self.PERF_URL}/api/client/campaign/{int(campaign_id)}/{endpoint}",
-            {"Authorization": f"Bearer {token}"},
-        )
-        return True
+        return await self._request("POST", "/v1/product/import/prices", payload)

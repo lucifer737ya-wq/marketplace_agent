@@ -17,13 +17,13 @@ from services.common.gemini import generate
 
 logger = logging.getLogger(__name__)
 
-WB_HTTP_TIMEOUT = aiohttp.ClientTimeout(total=15, connect=6, sock_connect=6, sock_read=10)
-OZON_HTTP_TIMEOUT = aiohttp.ClientTimeout(total=15, connect=6, sock_connect=6, sock_read=10)
-MAX_RESPONSE_BYTES = 2 * 1024 * 1024  # 2 МБ — защита памяти хоста (4 ГБ RAM)
+WB_HTTP_TIMEOUT = aiohttp.ClientTimeout(total=18, connect=8, sock_connect=8, sock_read=12)
+OZON_HTTP_TIMEOUT = aiohttp.ClientTimeout(total=18, connect=8, sock_connect=8, sock_read=12)
+MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 
 _USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
 )
 _PRICE_DIGITS_RE = re.compile(r"(\d[\d\s\u00a0\u2009]*(?:[.,]\d+)?)")
 
@@ -65,21 +65,23 @@ def _extract_price_number(raw: Any) -> float:
     return 0.0
 
 
-async def _fetch_json_direct(
+async def _fetch_json(
     url: str,
     headers: Dict[str, str],
     timeout: aiohttp.ClientTimeout,
+    *,
+    allow_redirects: bool = True,
+    max_redirects: int = 5,
 ) -> Tuple[Optional[Any], Optional[str], bool]:
     """
-    Выполняет прямой HTTP GET (trust_env=False) с жесткими таймаутами, ограничением объема ответа
-    и гарантированным закрытием aiohttp.ClientSession и TCPConnector при любом исходе.
-    Возвращает: (json_data, error_message, is_transport_error).
+    GET JSON with optional redirect following (needed for Ozon 307).
+    Returns (data, error_message, is_transport_error).
     """
     if not url.startswith("https://"):
         return None, "Недопустимая схема URL (требуется https://)", False
 
     connector = aiohttp.TCPConnector(limit=4, ssl=True, enable_cleanup_closed=True)
-    session: Optional[aiohttp.ClientSession] = None
+    current = url
     try:
         async with aiohttp.ClientSession(
             connector=connector,
@@ -87,28 +89,39 @@ async def _fetch_json_direct(
             trust_env=False,
             timeout=timeout,
             headers=headers,
-        ) as opened_session:
-            session = opened_session
-            async with session.get(url, allow_redirects=False) as resp:
-                raw_bytes = bytearray()
-                async for chunk in resp.content.iter_chunked(32768):
-                    if len(raw_bytes) + len(chunk) > MAX_RESPONSE_BYTES:
-                        return None, f"HTTP {resp.status}: превышен лимит ответа", False
-                    raw_bytes.extend(chunk)
-                if resp.status == 429:
-                    return None, "HTTP 429 (превышен лимит запросов)", False
-                if resp.status == 403:
-                    return None, "HTTP 403 (доступ ограничен антибот-защитой)", False
-                if resp.status != 200:
-                    return None, f"HTTP {resp.status}", resp.status >= 500
+        ) as session:
+            for _ in range(max_redirects + 1):
+                async with session.get(current, allow_redirects=False) as resp:
+                    if resp.status in (301, 302, 303, 307, 308) and allow_redirects:
+                        loc = resp.headers.get("Location") or resp.headers.get("location")
+                        if not loc:
+                            return None, f"HTTP {resp.status} без Location", False
+                        current = urllib.parse.urljoin(current, loc)
+                        if not current.startswith("https://"):
+                            return None, f"Редирект на не-HTTPS: {current[:80]}", False
+                        continue
 
-                text = raw_bytes.decode("utf-8", errors="replace").strip()
-                if not text:
-                    return None, "Пустое тело ответа HTTP 200", False
-                try:
-                    return json.loads(text), None, False
-                except json.JSONDecodeError as exc:
-                    return None, f"Некорректный JSON ответа ({exc.msg})", False
+                    raw_bytes = bytearray()
+                    async for chunk in resp.content.iter_chunked(32768):
+                        if len(raw_bytes) + len(chunk) > MAX_RESPONSE_BYTES:
+                            return None, f"HTTP {resp.status}: превышен лимит ответа", False
+                        raw_bytes.extend(chunk)
+
+                    if resp.status == 429:
+                        return None, "HTTP 429 (превышен лимит запросов)", False
+                    if resp.status == 403:
+                        return None, "HTTP 403 (доступ ограничен антибот-защитой)", False
+                    if resp.status != 200:
+                        return None, f"HTTP {resp.status}", resp.status >= 500
+
+                    text = raw_bytes.decode("utf-8", errors="replace").strip()
+                    if not text:
+                        return None, "Пустое тело ответа HTTP 200", False
+                    try:
+                        return json.loads(text), None, False
+                    except json.JSONDecodeError as exc:
+                        return None, f"Некорректный JSON ответа ({exc.msg})", False
+            return None, "Слишком много редиректов", False
     except asyncio.TimeoutError:
         return None, f"Таймаут запроса ({timeout.total} сек.)", True
     except aiohttp.ClientError as exc:
@@ -116,8 +129,6 @@ async def _fetch_json_direct(
     except OSError as exc:
         return None, f"Ошибка сокета ({type(exc).__name__}: {exc})", True
     finally:
-        if session is not None and not session.closed:
-            await session.close()
         if not connector.closed:
             await connector.close()
 
@@ -275,12 +286,10 @@ async def _parse_wb_competitors_with_status(
             }
         )
 
-    # Не подмешиваем вымышленные карточки при неполной или недоступной выдаче WB.
-    return items, err_msg
+    return items, last_err
 
 
 async def parse_wb_competitors(query: str, count: int = 15) -> List[Dict[str, Any]]:
-    """Парсит реальные карточки конкурентов WB без подстановки фейковых товаров."""
     items, _ = await _parse_wb_competitors_with_status(query=query, count=count)
     return items
 
@@ -434,31 +443,57 @@ async def _parse_ozon_competitors_with_status(
 
 
 async def parse_ozon_competitors(query: str, count: int = 15) -> List[Dict[str, Any]]:
-    """
-    Парсит реальную поисковую выдачу Ozon через aiohttp с таймаутами и закрытием сессии.
-    При блокировке антиботом или сетевой ошибке возвращает пустой список без фейковых SKU.
-    """
     items, _ = await _parse_ozon_competitors_with_status(query=query, count=count)
     return items
 
 
-def calculate_competitor_unit_economy(buyer_price: float, mp: str, *, seller_price: float,
-                                      cogs: float, logistics_rub: float, commission_rate: float) -> dict:
-    """Explicit what-if scenario, never infer a competitor's costs or seller price from the shelf."""
+def calculate_competitor_unit_economy(
+    buyer_price: float,
+    mp: str,
+    *,
+    seller_price: float,
+    cogs: float,
+    logistics_rub: float,
+    commission_rate: float,
+) -> dict:
     mp = mp.upper()
-    if (mp not in ('OZON', 'WB') or not all(math.isfinite(x) and x >= 0 for x in
-            (buyer_price, seller_price, cogs, logistics_rub, commission_rate)) or
-            min(buyer_price, seller_price) <= 0 or commission_rate >= 1):
-        raise ValueError('Для сценария нужны цены, себестоимость, логистика и допустимые ставки')
-    rate = settings.OZON_HIGH_COMMISSION_RATE if mp == 'OZON' and seller_price > settings.OZON_LOW_PRICE_LIMIT else commission_rate
+    if (
+        mp not in ("OZON", "WB")
+        or not all(
+            math.isfinite(x) and x >= 0
+            for x in (buyer_price, seller_price, cogs, logistics_rub, commission_rate)
+        )
+        or min(buyer_price, seller_price) <= 0
+        or commission_rate >= 1
+    ):
+        raise ValueError(
+            "Для сценария нужны цены, себестоимость, логистика и допустимые ставки"
+        )
+    rate = (
+        settings.OZON_HIGH_COMMISSION_RATE
+        if mp == "OZON" and seller_price > settings.OZON_LOW_PRICE_LIMIT
+        else commission_rate
+    )
     commission = _mul_rub(seller_price, rate)
-    tax = _mul_rub(buyer_price if mp == 'WB' else seller_price, settings.TAX_RATE)
+    tax = _mul_rub(buyer_price if mp == "WB" else seller_price, settings.TAX_RATE)
     acquiring = _mul_rub(seller_price, settings.ACQUIRING_RATE)
     expenses = _round_rub(_to_dec(commission) + _to_dec(logistics_rub) + _to_dec(acquiring))
-    profit = _round_rub(_to_dec(seller_price) - _to_dec(cogs) - _to_dec(tax) - _to_dec(expenses))
-    return dict(seller_price=seller_price, buyer_price=buyer_price, commission_rate=rate,
-                commission=commission, logistics=logistics_rub, cogs=cogs, acquiring=acquiring,
-                mp_expenses=expenses, tax=tax, profit=profit, ros=_round_pct(profit, seller_price))
+    profit = _round_rub(
+        _to_dec(seller_price) - _to_dec(cogs) - _to_dec(tax) - _to_dec(expenses)
+    )
+    return dict(
+        seller_price=seller_price,
+        buyer_price=buyer_price,
+        commission_rate=rate,
+        commission=commission,
+        logistics=logistics_rub,
+        cogs=cogs,
+        acquiring=acquiring,
+        mp_expenses=expenses,
+        tax=tax,
+        profit=profit,
+        ros=_round_pct(profit, seller_price),
+    )
 
 
 async def _call_gemini_competitor_verdict(prompt: str) -> str:
@@ -516,87 +551,38 @@ async def run_full_competitor_deep_audit(category_query: str) -> Tuple[str, Dict
         ]
         return "\n".join(diag_lines), prices_dict
 
-    def _format_comp_lines(comps: List[Dict[str, Any]]) -> Tuple[List[str], List[str]]:
+    def _format_comp_lines(comps: List[Dict[str, Any]]) -> List[str]:
         html_rows: List[str] = []
-        plain_rows: List[str] = []
-        for comp in comps:
+        for comp in comps[:10]:
             mp_lbl = html.escape(str(comp["mp"]))
             sku_lbl = html.escape(str(comp["sku"]))
             brand_lbl = html.escape(str(comp["brand"]))
             raw_name = str(comp["name"])
             short_name = (raw_name[:28] + "...") if len(raw_name) > 28 else raw_name
             name_lbl = html.escape(short_name)
-
             html_rows.append(
                 f"• [{mp_lbl}] Арт. <code>{sku_lbl}</code> | <b>{brand_lbl}</b> — {name_lbl}\n"
-                f"   Витрина: <b>{comp['buyer_price']:.0f} ₽</b>"
+                f"   Витрина: <b>{comp['buyer_price']:.0f} ₽</b> | ⭐ {comp['rating']} ({comp['feedbacks']})"
             )
-            plain_rows.append(
-                f"[{comp['mp']}] SKU {comp['sku']} | {comp['brand']} — {short_name} | "
-                f"витрина {comp['buyer_price']:.0f}₽, "
-                f"рейтинг {comp['rating']}, отзывов {comp['feedbacks']}"
-            )
-        return html_rows, plain_rows
+        return html_rows
 
-    wb_html, wb_plain = _format_comp_lines(wb_comps)
-    oz_html, oz_plain = _format_comp_lines(oz_comps)
+    lines = [f"📊 <b>Анализ конкурентов: «{safe_query}»</b>\n"]
+    if wb_comps:
+        lines.append(f"🟣 <b>Wildberries</b> ({len(wb_comps)} карточек, ср. {avg_wb:.0f} ₽):")
+        lines.extend(_format_comp_lines(wb_comps))
+    elif wb_err:
+        lines.append(f"🟣 Wildberries: <code>{html.escape(wb_err)}</code>")
 
-    wb_price_str = f"<b>{avg_wb:.0f} ₽</b> ({len(wb_comps)} шт.)" if wb_comps else "<i>н/д (нет данных витрины)</i>"
-    oz_price_str = f"<b>{avg_oz:.0f} ₽</b> ({len(oz_comps)} шт.)" if oz_comps else "<i>н/д (нет данных витрины)</i>"
+    if oz_comps:
+        lines.append(f"\n🔵 <b>Ozon</b> ({len(oz_comps)} карточек, ср. {avg_oz:.0f} ₽):")
+        lines.extend(_format_comp_lines(oz_comps))
+    elif oz_err:
+        lines.append(f"\n🔵 Ozon: <code>{html.escape(oz_err)}</code>")
 
-    wb_section = (
-        "\n".join(wb_html[:7])
-        if wb_html
-        else f"<i>Данные WB недоступны: <code>{html.escape(wb_err or 'пустая выдача')}</code></i>"
-    )
-    oz_section = (
-        "\n".join(oz_html[:7])
-        if oz_html
-        else f"<i>Данные Ozon недоступны: <code>{html.escape(oz_err or 'пустая выдача')}</code> (фейковые карточки не подставляются)</i>"
-    )
+    if all_prices:
+        lines.append(
+            f"\n📈 Медиана витрины: <b>{median_total:.0f} ₽</b> · "
+            f"среднее: <b>{avg_total:.0f} ₽</b>"
+        )
 
-    sample_for_prompt = "\n".join([*wb_plain[:7], *oz_plain[:7]])
-    wb_prompt_stat = f"{avg_wb:.0f} ₽ (карточек: {len(wb_comps)})" if wb_comps else f"недоступно ({wb_err})"
-    oz_prompt_stat = f"{avg_oz:.0f} ₽ (карточек: {len(oz_comps)})" if oz_comps else f"недоступно ({oz_err})"
-
-    prompt = (
-        f"Ты — коммерческий директор бренда YaSoKo (гели для ногтей 15 г, производство г. Иваново, ИП УСН 6%).\n"
-        f"Проведи анализ реально собранных карточек конкурентов по запросу «{clean_query}» "
-        f"(всего получено: {len(wb_comps) + len(oz_comps)} шт.).\n\n"
-        f"ФАКТИЧЕСКАЯ ЦЕНОВАЯ СТАТИСТИКА ВИТРИНЫ:\n"
-        f"- Средняя цена Wildberries: {wb_prompt_stat}\n"
-        f"- Средняя цена Ozon: {oz_prompt_stat}\n"
-        f"- Средняя по выборке: {avg_total:.0f} ₽ | Истинная медиана: {median_total:.0f} ₽\n\n"
-        "Цены витрины не раскрывают цену в ЛК, СПП, тарифы и себестоимость конкурентов. "
-        "Не вычисляй по ним чужую прибыль. Отделяй гипотезы от наблюдений.\n"
-        f"{sample_for_prompt}\n\n"
-        "НАШИ ВВОДНЫЕ YASOKO:\n"
-        "- Двойная жесткость: пластичный в тонком слое (без сколов), жесткий в толстом (держит углы квадрата без усадки).\n"
-        "- Средне-вязкая консистенция (не затекает на валики), HEMA FREE, 11-FREE.\n"
-        "- Тарифы Ozon: до 300 ₽ комиссия 22–23%, свыше 300 ₽ комиссия 52% (избегать ценовой ловушки 301–450 ₽).\n\n"
-        "ТРЕБОВАНИЯ К ОТВЕТУ:\n"
-        "- Без приветствий и воды. Не выдумывай данные по площадке, если она помечена как недоступная.\n"
-        "- 1. Ценовое позиционирование Ozon (299 ₽ против выхода за порог 300 ₽ с комиссией 52%) и WB (с учетом СПП).\n"
-        "- 2. Три незакрытые боли мастеров маникюра при выборе карточки в этой ценовой группе.\n"
-        "- 3. Три конкретных шага по улучшению главного фото и второго слайда YaSoKo.\n"
-        "- Используй только HTML-теги <b>, <i>, <code>, без Markdown (**, ###) и таблиц."
-    )
-
-    ai_verdict = await _call_gemini_competitor_verdict(prompt)
-
-    total_found = len(wb_comps) + len(oz_comps)
-    report_text = (
-        f"📊 <b>Анализ конкурентов ({total_found} карточек): «{safe_query}»</b>\n"
-        "ℹ️ <i>Это цены витрин, не цены в ЛК. Себестоимость, логистика и прибыль конкурентов неизвестны.</i>\n\n"
-        f"💵 <b>Цены на витринах:</b>\n"
-        f"• Wildberries: {wb_price_str}\n"
-        f"• Ozon: {oz_price_str}\n"
-        f"• Средняя по выборке: <b>{avg_total:.0f} ₽</b> | Медиана выборки: <b>{median_total:.0f} ₽</b>\n\n"
-        f"<b>Выборка Wildberries:</b>\n{wb_section}\n\n"
-        f"<b>Выборка Ozon:</b>\n{oz_section}\n\n"
-        f"➖➖➖➖➖➖➖➖➖➖\n"
-        f"🧠 <b>Аналитический вердикт и закрытие болей:</b>\n\n"
-        f"{ai_verdict}"
-    )
-
-    return report_text, prices_dict
+    return "\n".join(lines), prices_dict
