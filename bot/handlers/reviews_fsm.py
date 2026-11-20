@@ -15,6 +15,7 @@ from config import settings
 from database.crud import get_db_session
 from database.models import Product
 from products_catalog import get_catalog_product
+from services.common.buyer_questions import BRAND_MATRIX_RULES
 from services.common.gemini import generate
 
 reviews_router = Router()
@@ -69,12 +70,10 @@ async def generate_review_reply_llm(sku: str, product_meta: dict, review_text: s
     art = product_meta.get("art", sku)
     title = product_meta.get("title") or product_meta.get("name") or "товар YaSoKo"
     prompt = (
-        "Ты — представитель YaSoKo. Вежливо ответь на отзыв покупателя. "
-        "Используй только название товара и текст отзыва. Не утверждай неподтверждённые "
-        "свойства, состав, сертификаты, сроки поступления и совместимость; "
-        "не советуй спирт, растворители, нагрев или непроверенные процедуры. "
-        "Если информации недостаточно, предложи уточнить у продавца. "
-        "Выведи только текст ответа.\n"
+        "Ты — специалист контроля качества бренда YaSoKo. Вежливо и по делу ответь на отзыв покупателя.\n"
+        f"{BRAND_MATRIX_RULES}\n"
+        "Не советуй спирт, растворители, нагрев или непроверенные процедуры. "
+        "Выведи только готовый текст ответа (3–4 предложения).\n"
         f"Артикул: {art}; название: {title}\nОтзыв: {review_text}"
     )
 

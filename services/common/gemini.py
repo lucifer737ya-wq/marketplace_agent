@@ -18,6 +18,7 @@ from services.common.routes import (
     mark_route_failed,
     mark_route_ok,
     request_routes,
+    route_available,
 )
 
 logger = logging.getLogger(__name__)
@@ -136,9 +137,11 @@ async def generate(
         "Content-Type": "application/json",
     }
     try:
-        routes = request_routes("gemini")
+        raw_routes = request_routes("gemini")
     except ValueError as exc:
         raise RuntimeError(str(exc)) from exc
+    available = [r for r in raw_routes if route_available("gemini", r)]
+    routes = available + [r for r in raw_routes if r not in available]
 
     errors: list[str] = []
     for route in routes:
@@ -173,9 +176,15 @@ async def generate(
                                 except (ValueError, TypeError, AttributeError, aiohttp.ClientError):
                                     pass
                                 errors.append(f"{name}: HTTP {resp.status}{api_status}")
-                                if resp.status in (400, 401, 403, 404):
-                                    continue  # model/permission problem, next model
-                                route_broken = resp.status in (408, 425, 429, 498, 500, 502, 503, 504)
+                                if resp.status == 400 and api_status == " (FAILED_PRECONDITION)":
+                                    # Геоблок маршрута (например, прямой РФ-IP): в карантин и сразу на прокси.
+                                    route_broken = True
+                                    break
+                                if resp.status in (400, 401, 403, 404, 429):
+                                    # Ошибка модели, прав или квоты (429): пробуем следующую модель
+                                    # на том же рабочем маршруте, не блокируя локальный прокси.
+                                    continue
+                                route_broken = resp.status in (408, 425, 498, 500, 502, 503, 504)
                                 break  # route problem, next route
                             data = await resp.json()
                     except (

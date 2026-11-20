@@ -521,9 +521,6 @@ async def sync_and_generate_orders_report(
                 mark in oz_source_low
                 for mark in (
                     "незнакомые типы",
-                    "неполное покрытие",
-                    "cash-flow пуст",
-                    "cash-flow http",
                     "accrual http",
                     "accrual runtimeerror",
                     "accrual timeouterror",

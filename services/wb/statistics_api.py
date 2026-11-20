@@ -73,9 +73,10 @@ class WBStatisticsAPI(MarketplaceClient):
         super().__init__("WB", settings.WB_API_TOKEN, notify_callback)
         self._tariffs_lock = asyncio.Lock()
         self._orders_lock = asyncio.Lock()
-        # WB отключил legacy /api/v1/supplier/stocks: после 404 не дёргаем
-        # его 6 часов, иначе каждый цикл синхронизации пишет ту же ошибку.
+        # WB отключил legacy /api/v1/supplier/stocks и /api/v5/supplier/reportDetailByPeriod:
+        # после 404 не дёргаем их 6 часов, чтобы не засорять журнал и самопроверку.
         self._fbo_legacy_retry_at = 0.0
+        self._finance_legacy_retry_at = 0.0
 
     async def _request(self, method: str, url: str, params=None, json_data=None) -> Any:
         return await self.request_json(
@@ -668,19 +669,33 @@ class WBStatisticsAPI(MarketplaceClient):
         Метод остаётся у WB как обратная совместимость. Разбор строк общий с
         finance-api, поэтому поля snake_case принимаются без отдельного кода.
         """
+        if time.monotonic() < self._finance_legacy_retry_at:
+            raise APIStatusError(
+                404, "WB: legacy reportDetailByPeriod отключён (пауза 6 ч)"
+            )
         rows: list = []
         cursor = 0
         for _ in range(200):
-            page = await self._request(
-                "GET",
-                f"{self.STATS_URL}/api/v5/supplier/reportDetailByPeriod",
-                params={
-                    "dateFrom": date_from,
-                    "dateTo": date_to,
-                    "rrdid": cursor,
-                    "limit": 100000,
-                },
-            )
+            try:
+                page = await self._request(
+                    "GET",
+                    f"{self.STATS_URL}/api/v5/supplier/reportDetailByPeriod",
+                    params={
+                        "dateFrom": date_from,
+                        "dateTo": date_to,
+                        "rrdid": cursor,
+                        "limit": 100000,
+                    },
+                )
+            except APIStatusError as exc:
+                if exc.status in {404, 410}:
+                    self._finance_legacy_retry_at = time.monotonic() + 6 * 3600
+                    logger.warning(
+                        "WB legacy /api/v5/supplier/reportDetailByPeriod недоступен (HTTP %s): "
+                        "пауза повторных обращений 6 часов",
+                        exc.status,
+                    )
+                raise
             if page is None or page == []:
                 return rows
             if not isinstance(page, list):
@@ -882,6 +897,9 @@ class WBStatisticsAPI(MarketplaceClient):
                 except (APIStatusError, RuntimeError) as exc:
                     errors.append(f"детализация {level}: {_exc_label(exc)}")
                     rows = []
+                    if isinstance(exc, APIStatusError) and exc.status == 429:
+                        # Лимит на /sales-reports/detailed уже исчерпан — не добиваем daily.
+                        break
                 if rows:
                     break
 

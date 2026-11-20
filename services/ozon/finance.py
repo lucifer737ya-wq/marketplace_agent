@@ -50,8 +50,14 @@ ACCRUAL_TYPES = {
     46: "fbo_storage",       # Placements
     78: "fbo_storage",       # TemporaryPlacement
     96: "other_fines",       # AcceleratedReviewCollection
+    116: "other_fines",      # FirstCustomerReview
     48: "other_fines",       # PremiumCashbackIndividualPoints
+    76: "other_fines",       # StockInsurance
+    94: "other_fines",       # DefectFineShipmentDelayRate
     12: "partner_dropoff",   # CrossDock
+    17: "partner_dropoff",   # Drop-Off Agent
+    74: "star_products",     # StarsMembership
+    72: "mutual_settlements",  # SetOff
     1: "acquiring",          # Acquiring
     10: "decompensations",   # Compensation
     25: "decompensations",   # ItemCompensation
@@ -68,7 +74,10 @@ _TYPE_HINTS = (
     ("cancel", "deliv_return"),
     ("handover", "deliv_ozon_handover"),
     ("crossdock", "partner_dropoff"),
+    ("drop-off", "partner_dropoff"),
     ("dropoff", "partner_dropoff"),
+    ("stars", "star_products"),
+    ("setoff", "mutual_settlements"),
     ("logistic", "deliv_direct"),
     ("lastmile", "deliv_direct"),
     ("delivery", "deliv_direct"),
@@ -77,6 +86,9 @@ _TYPE_HINTS = (
     ("pack", "partner_pack"),
     ("supply", "partner_pack"),
     ("compensation", "decompensations"),
+    ("insurance", "other_fines"),
+    ("fine", "other_fines"),
+    ("review", "other_fines"),
 )
 
 

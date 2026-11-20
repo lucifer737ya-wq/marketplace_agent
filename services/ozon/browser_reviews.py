@@ -973,6 +973,28 @@ async def _visit_review(
             raise RuntimeError("Не удалось безопасно закрыть шторку отзыва; обход остановлен")
 
 
+async def _answers_col_index(page) -> Optional[int]:
+    """Ищет индекс столбца «Ответы» в заголовке таблицы отзывов Ozon."""
+    headers = page.locator("thead th")
+    count = await headers.count()
+    for idx in range(count):
+        text = (await headers.nth(idx).inner_text()).strip().lower()
+        if "ответ" in text or "коммент" in text:
+            return idx
+    return None
+
+
+async def _row_has_table_answers(cells, cell_count: int, ans_col_idx: Optional[int]) -> bool:
+    """Быстрая проверка по таблице: если у отзыва уже >= 1 ответа, шторку не открываем."""
+    col = ans_col_idx if ans_col_idx is not None and ans_col_idx < cell_count else (
+        cell_count - 3 if cell_count >= 8 else None
+    )
+    if col is None:
+        return False
+    ans_str = (await cells.nth(col).inner_text()).strip()
+    return ans_str.isdigit() and int(ans_str) > 0
+
+
 async def _scan_reviews(page, tracker, dry_run: bool, max_per_run: int) -> dict:
     records, failures, attempted = [], [], set()
     start = tracker["replied_count"]
@@ -987,6 +1009,7 @@ async def _scan_reviews(page, tracker, dry_run: bool, max_per_run: int) -> dict:
             ("Новые", ["Новые", "Новое"]),
         ]
 
+    max_pages_per_tab = 5
     for title, names in tabs:
         if len(records) >= budget:
             break
@@ -994,7 +1017,12 @@ async def _scan_reviews(page, tracker, dry_run: bool, max_per_run: int) -> dict:
             failures.append(f"Не найдена вкладка «{title}»")
             continue
 
+        ans_col_idx = await _answers_col_index(page)
         visited, last_page, idle = set(), None, 0
+        pages_checked = 0
+        page_saw_old_date = False
+        page_saw_fresh_or_undated = False
+
         while idle < 2 and len(records) < budget:
             rows = page.locator("tbody tr")
             opened = False
@@ -1018,10 +1046,15 @@ async def _scan_reviews(page, tracker, dry_run: bool, max_per_run: int) -> dict:
 
                 stamp = await _item_date(row, table_row=True)
                 if not _is_date_from_nov_13_2026(stamp):
+                    page_saw_old_date = True
                     continue
+                page_saw_fresh_or_undated = True
 
                 cells = row.locator("td")
-                if await cells.count() < 4:
+                cell_count = await cells.count()
+                if cell_count < 4:
+                    continue
+                if await _row_has_table_answers(cells, cell_count, ans_col_idx):
                     continue
                 comment = _clean_review_text(await cells.nth(3).inner_text())
 
@@ -1051,6 +1084,10 @@ async def _scan_reviews(page, tracker, dry_run: bool, max_per_run: int) -> dict:
 
             idle += 1
             if idle == 2:
+                # На Ozon отзывы идут от новых к старым: если вся страница старее порога
+                # или достигнут лимит страниц, не листаем архив до таймаута.
+                if (page_saw_old_date and not page_saw_fresh_or_undated) or pages_checked >= max_pages_per_tab:
+                    break
                 nxt = page.get_by_role(
                     "button", name=re.compile(r"^(?:Следующая страница|Далее)$", re.I)
                 ).first
@@ -1063,6 +1100,9 @@ async def _scan_reviews(page, tracker, dry_run: bool, max_per_run: int) -> dict:
                     await page.wait_for_timeout(500)
                     if signature != tuple(await rows.all_inner_texts()):
                         visited.clear()
+                    pages_checked += 1
+                    page_saw_old_date = False
+                    page_saw_fresh_or_undated = False
                     idle = 0
 
     count = tracker["replied_count"] - start
