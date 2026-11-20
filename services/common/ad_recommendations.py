@@ -95,7 +95,9 @@ async def _call_gemini_unlimited(prompt: str) -> str:
     try:
         text, _ = await generate(prompt, max_tokens=8192, temperature=0.15)
         return sanitize_telegram_html(text)
-    except RuntimeError as exc:
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — сбой ИИ не должен ронять фактический отчёт
         return f"⚠️ <i>Рекомендации ИИ временно недоступны ({html.escape(str(exc))}).</i>"
 
 
@@ -724,15 +726,34 @@ def _render_factual_ads_header(
     # Блок Wildberries
     wb_fin_dict = wb_fin if isinstance(wb_fin, dict) else {}
     wb_rev = _safe_float(wb_fin_dict.get("revenue_seller"))
-    wb_ads = _safe_nonneg(wb_fin_dict.get("ads"))
-    drr_label = f'{_round_pct(wb_ads, wb_rev):.1f}%' if wb_rev > 0 else 'н/д'
-    lines.append('\n🟣 <b>ФАКТИЧЕСКИЙ СРЕЗ РЕКЛАМЫ WB (7 дн.):</b>')
-    if isinstance(wb_fin, dict):
-        lines.append(f'• Выручка ЛК: <b>{_fmt_money(wb_rev)} ₽</b> | Списания ВБ.Продвижение: '
-                     f'<b>{_fmt_money(wb_ads)} ₽</b> (ДРР {drr_label})')
+    wb_summary_only = bool(wb_fin_dict.get("summary_only"))
+    wb_camp_spend = _round_rub(
+        sum(
+            _safe_nonneg(c.get("spend_7d_rub") or c.get("spend") or c.get("updSum"))
+            for c in wb_campaigns
+            if isinstance(c, dict)
+        )
+    )
+    lines.append("\n🟣 <b>ФАКТИЧЕСКИЙ СРЕЗ РЕКЛАМЫ WB (7 дн.):</b>")
+    if isinstance(wb_fin, dict) and wb_summary_only:
+        spend_note = (
+            f"Списания по РК WB: <b>{_fmt_money(wb_camp_spend)} ₽</b>"
+            if wb_camp_spend > 0.0
+            else "Списания ВБ.Продвижение: <i>н/д (только сводный финотчёт WB)</i>"
+        )
+        lines.append(
+            f"• Выручка (сводный отчёт): <b>{_fmt_money(wb_rev)} ₽</b> | {spend_note}"
+        )
+    elif isinstance(wb_fin, dict):
+        wb_ads = _safe_nonneg(wb_fin_dict.get("ads"))
+        drr_label = f"{_round_pct(wb_ads, wb_rev):.1f}%" if wb_rev > 0 else "н/д"
+        lines.append(
+            f"• Выручка ЛК: <b>{_fmt_money(wb_rev)} ₽</b> | Списания ВБ.Продвижение: "
+            f"<b>{_fmt_money(wb_ads)} ₽</b> (ДРР {drr_label})"
+        )
     else:
-        lines.append('• Финансовый отчёт WB недоступен.')
-    lines.append(f'• Получено активных/учтённых РК: <b>{len(wb_campaigns)}</b>')
+        lines.append("• Финансовый отчёт WB недоступен.")
+    lines.append(f"• Получено активных/учтённых РК: <b>{len(wb_campaigns)}</b>")
 
     if api_errors:
         lines.append("\n" + "\n".join(api_errors))
@@ -811,7 +832,11 @@ async def generate_weekly_ads_report_and_recommendations(ozon_api, wb_api) -> st
     elif isinstance(wb_camp_res, list):
         wb_campaigns = [c for c in wb_camp_res if isinstance(c, dict)]
 
-    db_products: List[Product] = db_prods_res if isinstance(db_prods_res, list) else []
+    if isinstance(db_prods_res, Exception):
+        api_errors.append(f"⚠️ База себестоимости: <code>{html.escape(str(db_prods_res))}</code>")
+        db_products: List[Product] = []
+    else:
+        db_products = db_prods_res if isinstance(db_prods_res, list) else []
 
     oz_analysis = analyze_ozon_campaigns(
         raw_campaigns=oz_campaigns,

@@ -6,6 +6,7 @@ set "AGENT_ROOT=%~dp0"
 echo Останавливаю только процессы marketplace_agent в этой папке...
 del /Q "logs\restart_worker.signal" 2>nul
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-  "$root = $env:AGENT_ROOT; Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -and (($_.CommandLine -like ('*' + $root + '*supervisor.py*')) -or ($_.CommandLine -like ('*' + $root + '*worker.py*'))) } | ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop; Write-Host ('Stopped PID ' + $_.ProcessId) } catch { } }"
+  "$root = $env:AGENT_ROOT; Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -and (($_.CommandLine -like '*supervisor.py*') -or ($_.CommandLine -like '*worker.py*')) -and (($_.CommandLine -like ('*' + $root + '*')) -or ($_.ExecutablePath -and $_.ExecutablePath -like ($root + '*'))) } | ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop; Write-Host ('Stopped PID ' + $_.ProcessId) } catch { } }"
+del /Q "logs\supervisor.pid" "logs\worker.pid" 2>nul
 timeout /t 2 /nobreak >nul
 echo Готово. Проверить: tasklist ^| findstr /I "pythonw python"

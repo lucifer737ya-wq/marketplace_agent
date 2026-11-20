@@ -109,6 +109,8 @@ async def _fetch_json(
 
                     if resp.status == 429:
                         return None, "HTTP 429 (превышен лимит запросов)", False
+                    if resp.status == 498:
+                        return None, "HTTP 498 (антибот-проверка витрины WB)", False
                     if resp.status == 403:
                         return None, "HTTP 403 (доступ ограничен антибот-защитой)", False
                     if resp.status != 200:
@@ -226,6 +228,7 @@ async def _parse_wb_competitors_with_status(
 
     raw_products: List[Dict[str, Any]] = []
     errors: List[str] = []
+    antibot_hits = 0
     data: Optional[Any] = None
     err_msg: Optional[str] = None
     for url in candidate_urls:
@@ -233,7 +236,9 @@ async def _parse_wb_competitors_with_status(
             url, headers, WB_HTTP_TIMEOUT
         )
         if isinstance(data, dict) and not err_msg:
-            products = (data.get("data") or data).get("products")
+            inner = data.get("data")
+            container = inner if isinstance(inner, dict) else data
+            products = container.get("products")
             if isinstance(products, list) and products:
                 raw_products = [p for p in products if isinstance(p, dict)]
                 err_msg = None
@@ -244,6 +249,10 @@ async def _parse_wb_competitors_with_status(
                 err_msg = "WB: неизвестный формат выдачи"
         errors.append(f"{url.split('?')[1][:40]}…: {err_msg}")
         logger.warning("[Competitors WB] %s", err_msg)
+        if err_msg and ("403" in err_msg or "498" in err_msg):
+            antibot_hits += 1
+            if antibot_hits >= 2:
+                break
         if is_transport_err:
             await asyncio.sleep(0.4)
     if not raw_products:
@@ -509,7 +518,9 @@ async def _call_gemini_competitor_verdict(prompt: str) -> str:
     try:
         text, _ = await generate(prompt, max_tokens=4096, temperature=0.3)
         return sanitize_telegram_html(text)
-    except RuntimeError as exc:
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001
         return f"⚠️ <i>ИИ-разбор временно недоступен ({html.escape(str(exc))}).</i>"
 
 
@@ -563,15 +574,20 @@ async def run_full_competitor_deep_audit(category_query: str) -> Tuple[str, Dict
     def _format_comp_lines(comps: List[Dict[str, Any]]) -> List[str]:
         html_rows: List[str] = []
         for comp in comps[:10]:
-            mp_lbl = html.escape(str(comp["mp"]))
-            sku_lbl = html.escape(str(comp["sku"]))
-            brand_lbl = html.escape(str(comp["brand"]))
-            raw_name = str(comp["name"])
+            if not isinstance(comp, dict):
+                continue
+            mp_lbl = html.escape(str(comp.get("mp") or "?"))
+            sku_lbl = html.escape(str(comp.get("sku") or "—"))
+            brand_lbl = html.escape(str(comp.get("brand") or "Без бренда"))
+            raw_name = str(comp.get("name") or f"Товар {sku_lbl}")
             short_name = (raw_name[:28] + "...") if len(raw_name) > 28 else raw_name
             name_lbl = html.escape(short_name)
+            buyer_price = _safe_float(comp.get("buyer_price"), 0.0)
+            rating = _safe_float(comp.get("rating"), 0.0)
+            feedbacks = _safe_int(comp.get("feedbacks"), 0)
             html_rows.append(
                 f"• [{mp_lbl}] Арт. <code>{sku_lbl}</code> | <b>{brand_lbl}</b> — {name_lbl}\n"
-                f"   Витрина: <b>{comp['buyer_price']:.0f} ₽</b> | ⭐ {comp['rating']} ({comp['feedbacks']})"
+                f"   Витрина: <b>{buyer_price:.0f} ₽</b> | ⭐ {rating:.1f} ({feedbacks})"
             )
         return html_rows
 

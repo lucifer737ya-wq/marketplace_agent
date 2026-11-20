@@ -201,8 +201,8 @@ class OzonSellerAPI(MarketplaceClient):
                         fbs_qty += avail
                     else:
                         fbo_qty += avail
-            fbo_map[off_id] = fbo_qty
-            fbs_map[off_id] = fbs_qty
+            fbo_map[off_id] = fbo_map.get(off_id, 0) + fbo_qty
+            fbs_map[off_id] = fbs_map.get(off_id, 0) + fbs_qty
 
         sales_7d_map = self._read_disk_cache("ordered_units", 1800)
         if sales_7d_map is None:
@@ -263,6 +263,8 @@ class OzonSellerAPI(MarketplaceClient):
                 or comm_block.get("sales_percent")
                 or raw_pct_fbo
             )
+            if raw_pct_fbo <= 0 and raw_pct_fbs > 0:
+                raw_pct_fbo = raw_pct_fbs
 
             fbo_deliv = (
                 float(comm_block.get("fbo_deliv_to_customer_amount") or 0.0)

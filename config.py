@@ -8,6 +8,7 @@ LOGS_DIR = Path(os.environ.get("MARKETPLACE_LOG_DIR", BASE_DIR / "logs"))
 BACKUPS_DIR = Path(os.environ.get("MARKETPLACE_BACKUP_DIR", BASE_DIR / "backups"))
 DB_DIR = BASE_DIR / "database"
 
+
 def prepare_runtime_dirs() -> None:
     for directory in (LOGS_DIR, BACKUPS_DIR, DB_DIR):
         directory.mkdir(parents=True, exist_ok=True)
@@ -132,6 +133,7 @@ class Settings(BaseSettings):
         "GEMINI_FAST_MODEL",
         "GEMINI_DIRECT_URL",
         "LOCAL_PROXY_URL",
+        "LOCAL_PROXY_FALLBACK_URL",
         "LOCAL_PROXY_LIST",
         mode="before",
     )

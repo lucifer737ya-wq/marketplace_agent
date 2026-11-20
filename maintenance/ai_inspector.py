@@ -38,9 +38,11 @@ SOURCE_DIRS = {"bot", "services", "database", "maintenance"}
 ROOT_MODULES = {
     "worker.py",
     "supervisor.py",
+    "runtime_bootstrap.py",
     "products_catalog.py",
     "config.py",
     "calibrate_clicks.py",
+    "doctor.py",
 }
 DAY = 86400
 TAIL = 128 * 1024
@@ -153,6 +155,34 @@ def local_exports(name: str, root: Path):
     return None
 
 
+def _handler_catches_import_error(handler: ast.ExceptHandler) -> bool:
+    if handler.type is None:
+        return True
+    caught = {"ImportError", "ModuleNotFoundError", "Exception", "BaseException"}
+    if isinstance(handler.type, ast.Name):
+        return handler.type.id in caught
+    if isinstance(handler.type, ast.Tuple):
+        return any(
+            isinstance(elt, ast.Name) and elt.id in caught
+            for elt in handler.type.elts
+        )
+    return False
+
+
+def _optional_import_nodes(tree: ast.AST) -> set[int]:
+    """Импорты внутри try ... except ImportError (например, опциональный Playwright)."""
+    guarded: set[int] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Try) and any(
+            _handler_catches_import_error(h) for h in node.handlers
+        ):
+            for stmt in node.body:
+                for inner in ast.walk(stmt):
+                    if isinstance(inner, (ast.Import, ast.ImportFrom)):
+                        guarded.add(id(inner))
+    return guarded
+
+
 def inspect_source(path: Path, source: str, root: Path) -> list[Issue]:
     try:
         tree = ast.parse(source, filename=str(path))
@@ -205,6 +235,7 @@ def inspect_source(path: Path, source: str, root: Path) -> list[Issue]:
                         f"{owner}: нет атрибута {node.attr}",
                     )
                 )
+    optional_imports = _optional_import_nodes(tree)
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             modules = [n.name for n in node.names]
@@ -247,8 +278,11 @@ def inspect_source(path: Path, source: str, root: Path) -> list[Issue]:
             )
         else:
             continue
+        is_optional = id(node) in optional_imports
         for name in modules:
             if not resolvable(name, root):
+                if is_optional and name.split(".")[0] not in SOURCE_DIRS:
+                    continue
                 issues.append(
                     Issue(
                         "ImportError",
@@ -262,6 +296,9 @@ def inspect_source(path: Path, source: str, root: Path) -> list[Issue]:
 
 
 _TIMESTAMP = re.compile(r"^\[?(20\d\d-\d\d-\d\d[ T]\d\d:\d\d:\d\d)")
+_WORKER_START_TS = re.compile(
+    r"\[Worker\]\s*===\s*старт\s+(\d\d\.\d\d\.20\d\d\s+\d\d:\d\d:\d\d)"
+)
 _FRAME = re.compile(r'^\s*File "([^"]+\.py)", line (\d+)')
 _EXCEPTION = re.compile(
     r"^(NameError|ModuleNotFoundError|ImportError|AttributeError|SyntaxError):\s*(.*)"
@@ -291,6 +328,7 @@ def recent_log_issues(root: Path, directory: Path, now: float) -> list[Issue]:
         with path.open("rb") as stream:
             stream.seek(start)
             raw = stream.read(TAIL)
+        chunk = raw.split(b"\n", 1)[1] if start > offset and b"\n" in raw else raw
         counts = Counter(
             prev.get("counts", {})
             if offset and now - prev.get("since", 0) < DAY
@@ -299,7 +337,7 @@ def recent_log_issues(root: Path, directory: Path, now: float) -> list[Issue]:
         since = prev.get("since", now) if counts else now
         frame, line = None, 0
         event_time = stat.st_mtime
-        for text in raw.decode("utf-8", "replace").splitlines():
+        for text in chunk.decode("utf-8", "replace").splitlines():
             stamp = _TIMESTAMP.match(text)
             if stamp:
                 try:
@@ -307,6 +345,15 @@ def recent_log_issues(root: Path, directory: Path, now: float) -> list[Issue]:
                 except ValueError:
                     continue
                 text = text[stamp.end() :].lstrip(",.0123456789 ]")
+            else:
+                worker_stamp = _WORKER_START_TS.search(text)
+                if worker_stamp:
+                    try:
+                        event_time = datetime.strptime(
+                            worker_stamp[1], "%d.%m.%Y %H:%M:%S"
+                        ).timestamp()
+                    except ValueError:
+                        pass
             if now - event_time > DAY:
                 continue
             if text.startswith("Traceback "):

@@ -5,27 +5,29 @@ from datetime import date
 from decimal import Decimal, InvalidOperation
 
 
-def money(value) -> Decimal:
-    return Decimal(str(value or 0))
-
-
 def _parse_decimal(value) -> Decimal:
     if value is None or isinstance(value, bool):
         return Decimal(0)
     if isinstance(value, Decimal):
         return value if value.is_finite() else Decimal(0)
     try:
-        parsed = Decimal(str(value).strip().replace("\u00a0", "").replace(" ", "").replace(",", "."))
+        parsed = Decimal(
+            str(value).strip().replace("\u00a0", "").replace(" ", "").replace(",", ".")
+        )
     except (InvalidOperation, ValueError):
         return Decimal(0)
     return parsed if parsed.is_finite() else Decimal(0)
 
 
+def money(value) -> Decimal:
+    if isinstance(value, dict):
+        return _parse_decimal(value.get("amount"))
+    return _parse_decimal(value)
+
+
 def amount(node) -> float:
     """Ozon отдаёт деньги объектом {'amount': '123.45', 'currency': 'RUB'}."""
-    if isinstance(node, dict):
-        return float(_parse_decimal(node.get("amount")))
-    return float(_parse_decimal(node))
+    return float(money(node))
 
 
 # type_id -> ключ книги (тот же словарь, что у cash-flow/транзакций).
@@ -55,21 +57,25 @@ ACCRUAL_TYPES = {
     25: "decompensations",   # ItemCompensation
 }
 
+# Более специфичные маркеры (возвраты, передача, drop-off) обязаны идти раньше
+# общих «logistic» / «delivery», чтобы ReturnLogistic не попадал в прямую доставку.
 _TYPE_HINTS = (
     ("acquiring", "acquiring"),
     ("payperclick", "promo_cpc"),
     ("perclick", "promo_cpc"),
     ("promotion", "promo_cpo"),
+    ("return", "deliv_return"),
+    ("cancel", "deliv_return"),
+    ("handover", "deliv_ozon_handover"),
+    ("crossdock", "partner_dropoff"),
+    ("dropoff", "partner_dropoff"),
     ("logistic", "deliv_direct"),
     ("lastmile", "deliv_direct"),
     ("delivery", "deliv_direct"),
-    ("return", "deliv_return"),
     ("storage", "fbo_storage"),
     ("placement", "fbo_storage"),
     ("pack", "partner_pack"),
     ("supply", "partner_pack"),
-    ("crossdock", "partner_dropoff"),
-    ("dropoff", "partner_dropoff"),
     ("compensation", "decompensations"),
 )
 
@@ -129,6 +135,7 @@ def walk_fees(node, unknown: set):
 
 
 def category(name: str, default: str) -> str:
+    clean_name = str(name or "")
     categories = {
         "CostPerClick": "promo_cpc",
         "ElectronicServiceStencil": "promo_cpc",
@@ -157,20 +164,22 @@ def category(name: str, default: str) -> str:
         "Decompensation": "decompensations",
         "SetOffBalance": "mutual_settlements",
     }
-    return next((v for k, v in categories.items() if k in name), default)
+    return next((v for k, v in categories.items() if k in clean_name), default)
 
 
 def book_transaction(book, op) -> None:
+    if not isinstance(op, dict):
+        return
     sales = money(op.get("accruals_for_sale"))
     commission = -money(op.get("sale_commission"))
     book["sales_total"] += sales
     book["commission"] += commission
-    expenses = sales - commission - money(op["amount"])
+    expenses = sales - commission - money(op.get("amount"))
     # Legacy delivery_charge and modern itemized delivery represent the same service.
-    services = op.get("services") or []
+    services = [s for s in (op.get("services") or []) if isinstance(s, dict)]
     for s in services:
-        cost = -money(s["price"])
-        book[category(s["name"], "other_fines")] += cost
+        cost = -money(s.get("price"))
+        book[category(str(s.get("name") or ""), "other_fines")] += cost
         expenses -= cost
     if not services:
         for field, key in (
@@ -180,19 +189,21 @@ def book_transaction(book, op) -> None:
             cost = -money(op.get(field))
             book[key] += cost
             expenses -= cost
-    book[category(op["operation_type"], "other_fines")] += expenses
+    book[category(str(op.get("operation_type") or ""), "other_fines")] += expenses
 
 
 def complete_statement(rows, start: date, end: date) -> bool:
     """Reporting periods must cover the requested window exactly, without gaps/overlap."""
     intervals = []
-    for r in rows:
+    for r in rows or []:
+        if not isinstance(r, dict):
+            return False
         period = r.get("period") or {}
         try:
             intervals.append(
                 (
-                    date.fromisoformat(period["begin"][:10]),
-                    date.fromisoformat(period["end"][:10]),
+                    date.fromisoformat(str(period["begin"])[:10]),
+                    date.fromisoformat(str(period["end"])[:10]),
                 )
             )
         except (ValueError, KeyError, TypeError):
@@ -202,15 +213,19 @@ def complete_statement(rows, start: date, end: date) -> bool:
         if first.toordinal() != cursor or last < first:
             return False
         cursor = last.toordinal() + 1
-    return bool(rows) and cursor == end.toordinal() + 1
+    return bool(intervals) and cursor == end.toordinal() + 1
 
 
 def book_statement(flows, details):
     book = defaultdict(Decimal)
-    for cf in flows:
-        book["sales_total"] += money(cf["orders_amount"]) + money(cf["returns_amount"])
-        book["commission"] -= money(cf["commission_amount"])
-    for det in details:
+    for cf in flows or []:
+        if not isinstance(cf, dict):
+            continue
+        book["sales_total"] += money(cf.get("orders_amount")) + money(cf.get("returns_amount"))
+        book["commission"] -= money(cf.get("commission_amount"))
+    for det in details or []:
+        if not isinstance(det, dict):
+            continue
         groups = [
             (
                 (det.get("delivery") or {}).get("delivery_services") or {},
@@ -221,11 +236,13 @@ def book_statement(flows, details):
             (det.get("others") or {}, "decompensations"),
         ]
         for group, default in groups:
-            items = group.get("items") or []
+            if not isinstance(group, dict):
+                continue
+            items = [i for i in (group.get("items") or []) if isinstance(i, dict)]
             if not items and group.get("total"):
-                book[default] -= money(group["total"])
+                book[default] -= money(group.get("total"))
             for item in items:
-                name = item["name"]
+                name = str(item.get("name") or "")
                 if any(
                     code in name
                     for code in (
@@ -235,15 +252,16 @@ def book_statement(flows, details):
                     )
                 ):
                     continue  # settlement / commission already present in the summary
-                book[category(name, default)] -= money(item["price"])
+                book[category(name, default)] -= money(item.get("price"))
     return book
 
 
 def totals(book) -> dict:
     def subtotal(*keys):
-        return sum((book[k] for k in keys), Decimal(0))
+        return sum((book.get(k, Decimal(0)) for k in keys), Decimal(0))
 
     acquiring_reported = "acquiring" in book
+    sales_total = book.get("sales_total", Decimal(0))
     delivery = subtotal("deliv_direct", "deliv_ozon_handover", "deliv_return")
     partner = subtotal(
         "partner_dropoff",
@@ -266,14 +284,15 @@ def totals(book) -> dict:
             "mutual_settlements",
         )
     )
+    merged = {
+        **dict(book),
+        "sales_total": sales_total,
+        "deliv_total": delivery,
+        "partners_total": partner,
+        "ads_total": ads,
+        "total_deductions": deductions,
+        "total_payout": sales_total - deductions,
+    }
     return {
-        k: float(round(v, 2))
-        for k, v in dict(
-            book,
-            deliv_total=delivery,
-            partners_total=partner,
-            ads_total=ads,
-            total_deductions=deductions,
-            total_payout=book["sales_total"] - deductions,
-        ).items()
+        k: float(round(v, 2)) for k, v in merged.items()
     } | {"acquiring_reported": acquiring_reported}

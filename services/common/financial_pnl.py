@@ -50,8 +50,8 @@ def _current_business_dt() -> datetime:
     tz_name = str(getattr(settings, "TIMEZONE", "Europe/Moscow") or "Europe/Moscow").strip()
     try:
         return datetime.now(ZoneInfo(tz_name))
-    except ZoneInfoNotFoundError:
-        return datetime.now(timezone.utc)
+    except (ZoneInfoNotFoundError, ValueError, KeyError):
+        return datetime.now(timezone(timedelta(hours=3)))
 
 
 def get_previous_month_bounds(ref_date: Optional[datetime] = None) -> Dict[str, Any]:
@@ -189,6 +189,7 @@ def _build_stats_from_sku_sales(
     oz_deliv_per_order: Optional[float],
     oz_other_overhead_per_order: float,
     wb_overhead_per_order: float,
+    oz_dropoff_per_order: float = 0.0,
 ) -> Tuple[Dict[Tuple[str, str], Dict[str, Any]], Dict[str, int]]:
     """Пересчитывает статистику по артикулам из резервного источника.
 
@@ -238,6 +239,7 @@ def _build_stats_from_sku_sales(
                 _to_dec(unit_comm)
                 + _to_dec(unit_acq)
                 + _to_dec(unit_log)
+                + _to_dec(oz_dropoff_per_order)
                 + _to_dec(unit_ad)
                 + _to_dec(oz_other_overhead_per_order)
             )
@@ -245,12 +247,17 @@ def _build_stats_from_sku_sales(
             if oz_deliv_per_order is None:
                 cogs_known = False  # без факта доставки экономика неполная
         else:
-            wb_comm_rate = _safe_nonneg(t_live.get("commission_rate"))
-            if wb_comm_rate <= 0.0:
-                pct = _safe_nonneg(t_live.get("commission_rate_fbo"))
-                wb_comm_rate = pct if pct > 1.0 else 0.0  # 1.0 = 100% -> не ставка
-                if wb_comm_rate > 1.0:
-                    wb_comm_rate = wb_comm_rate / 100.0
+            raw_wb_comm = (
+                _safe_nonneg(t_live.get("commission_rate"))
+                or _safe_nonneg(t_live.get("commission_rate_fbo"))
+                or (_safe_nonneg(p_db.commission_rate) if p_db is not None else 0.0)
+            )
+            if raw_wb_comm > 1.0:
+                wb_comm_rate = raw_wb_comm / 100.0 if raw_wb_comm < 100.0 else 0.0
+            elif 0.0 < raw_wb_comm < 1.0:
+                wb_comm_rate = raw_wb_comm
+            else:
+                wb_comm_rate = 0.0
             unit_comm = _mul_rub(unit_price, wb_comm_rate) if wb_comm_rate > 0.0 else 0.0
             unit_log = _safe_nonneg(t_live.get("fbo_logistics_cost"))
             if unit_log <= 0.0 and wb_deliv_per_order > 0.0:
@@ -260,6 +267,22 @@ def _build_stats_from_sku_sales(
                 _to_dec(unit_comm)
                 + _to_dec(unit_log)
                 + _to_dec(unit_acq)
+                + _to_dec(wb_overhead_per_order)
+            )
+            unit_tax = _mul_rub(unit_buyer_price, tax_rate)
+
+        t_live = live_tariffs.get((mp, art)) or live_tariffs.get((mp, raw_sku)) or {}
+        if mp == "ozon":
+            c_rate = _resolve_ozon_commission_rate(unit_price, t_live, p_db, oz_report_comm_rate)
+            unit_comm = _mul_rub(unit_price, c_rate)
+            unit_acq = _mul_rub(unit_price, acq_rate)
+            unit_log = _div_rub(oz_deliv_per_order, 1) if oz_deliv_per_order else 0.0
+            unit_ad = _mul_rub(unit_price, oz_ad_rate)
+            unit_mp_fee = _round_rub(
+                _to_dec(unit_comm)
+                + _to_dec(unit_acq)
+                + _to_dec(unit_log)
+                + _to_dec(unit_ad)
                 + _to_dec(wb_overhead_per_order)
             )
             unit_tax = _mul_rub(unit_buyer_price, tax_rate)
@@ -698,6 +721,7 @@ async def generate_weekly_top_and_unprofitable_report(
                 oz_ad_rate=oz_ad_rate,
                 wb_acq_rate=wb_acq_rate,
                 oz_deliv_per_order=oz_deliv_per_order,
+                oz_dropoff_per_order=oz_dropoff_per_order,
                 oz_other_overhead_per_order=oz_other_overhead_per_order,
                 wb_overhead_per_order=wb_overhead_per_order,
                 wb_deliv_per_order=_wb_fallback_delivery,

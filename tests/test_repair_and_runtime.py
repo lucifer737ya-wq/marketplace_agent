@@ -75,10 +75,16 @@ class InspectorAndRepair(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_patch_rejects_truncation_syntax_and_outside_targets(self):
+        outside = [self.root / "private", "../worker.py", "state/test.py"]
         link = self.root / "services/link.py"
-        link.symlink_to(self.path)
+        try:
+            link.symlink_to(self.path)
+        except OSError:
+            pass
+        else:
+            outside.insert(0, link)
         with patch.object(repair, "generate", AsyncMock()) as llm:
-            for path in [link, self.root / "private", "../worker.py", "state/test.py"]:
+            for path in outside:
                 self.assertFalse((await repair.repair_file(path, "test"))[0])
             llm.assert_not_awaited()
         for code in [

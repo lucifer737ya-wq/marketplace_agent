@@ -82,5 +82,5 @@ async def run_monthly_api_audit() -> str:
         f"🧠 <b>Gemini Pro/Flash (Совет директоров):</b>\n  └ {ai_main_status}\n\n"
         f"⚡ <b>Gemini Fast-Lite (Отзывы и Вопросы):</b>\n  └ {ai_fast_status}\n\n"
         f"🛣 <b>Маршруты Gemini</b> (<code>{html.escape(models)}</code>):\n"
-        f"  └ {html.escape(routes_gemini)}"
+        f"  └ {routes_gemini}"
     )

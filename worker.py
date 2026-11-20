@@ -323,6 +323,7 @@ async def write_heartbeat(status: str = "running") -> None:
         "iso_time": datetime.now(timezone.utc).isoformat(),
         "status": status,
         "pid": os.getpid(),
+        "boot_id": os.environ.get("MARKETPLACE_BOOT_ID", ""),
         "ozon_degraded": ozon_service.is_degraded,
         "wb_degraded": wb_service.is_degraded,
         "routes": _ROUTE_SNAPSHOT,
@@ -424,17 +425,19 @@ async def scheduled_reviews_and_questions_job() -> None:
         job_budget = BROWSER_JOB_BUDGET_SEC / 2
         for job in (auto_reply_unanswered_reviews, auto_reply_unanswered_questions):
             try:
-                async with asyncio.timeout(job_budget):
-                    result = await job(headless=True, dry_run=settings.OZON_REPLY_DRY_RUN, max_per_run=5)
-                if result['status'] not in {'success', 'limit_reached'}:
-                    await notify_admin(html.escape(str(result.get('message') or result['status'])))
-            except TimeoutError:
+                result = await asyncio.wait_for(
+                    job(headless=True, dry_run=settings.OZON_REPLY_DRY_RUN, max_per_run=5),
+                    timeout=job_budget,
+                )
+                if result["status"] not in {"success", "limit_reached"}:
+                    await notify_admin(html.escape(str(result.get("message") or result["status"])))
+            except (TimeoutError, asyncio.TimeoutError):
                 await notify_admin(
                     f"⚠️ Ozon {job.__name__}: остановлен, превышен бюджет {int(job_budget // 60)} мин. "
                     "Не все записи могли быть проверены; состояние публикации проверьте в ЛК."
                 )
             except Exception as exc:
-                await notify_admin(f'Ozon {job.__name__}: {html.escape(str(exc))}')
+                await notify_admin(f"Ozon {job.__name__}: {html.escape(str(exc))}")
 
 
 async def scheduled_daily_price_audit_job() -> None:

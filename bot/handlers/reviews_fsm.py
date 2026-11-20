@@ -14,11 +14,7 @@ from bot.keyboards import get_main_menu_keyboard
 from config import settings
 from database.crud import get_db_session
 from database.models import Product
-from products_catalog import (
-    ALLOWED_UPSELL_LIST,
-    LEGAL_COMPLIANCE_INFO,
-    get_catalog_product,
-)
+from products_catalog import get_catalog_product
 from services.common.gemini import generate
 
 reviews_router = Router()
@@ -169,7 +165,8 @@ async def process_review_text(message: Message, state: FSMContext) -> None:
         await status_msg.delete()
     await state.clear()
 
-    product_header = f"{product_meta.get('title')} (арт. {sku_input})"
+    product_title = product_meta.get("title") or product_meta.get("name") or "товар YaSoKo"
+    product_header = f"{product_title} (арт. {sku_input})"
     await message.answer(
         f"✅ <b>Готовый ответ для {html.escape(product_header)}:</b>\n\n"
         f"<i>👇 Нажмите на текст в блоке ниже для моментального копирования:</i>\n\n"

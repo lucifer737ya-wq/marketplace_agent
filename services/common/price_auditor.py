@@ -1,5 +1,6 @@
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from sqlalchemy import select
+from aiogram.exceptions import TelegramBadRequest
 from database.models import AsyncSessionLocal, Product
 from database.crud import create_pending_action, create_pending_actions
 from services.common.orders_report import _mul_rub, _round_rub
@@ -10,12 +11,21 @@ from uuid import uuid4
 import math
 import html
 
+
 async def send_tg_safe(bot, chat_id: int, text: str, reply_markup=None) -> bool:
     """Использует уже настроенный прокси и сессию основного бота."""
     try:
         await bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=reply_markup)
         return True
-    except Exception as exc:
+    except TelegramBadRequest as exc:
+        print(f"[Price audit] HTML-ошибка Telegram ({exc}), повторяю без разметки", flush=True)
+        try:
+            await bot.send_message(chat_id, text, parse_mode=None, reply_markup=reply_markup)
+            return True
+        except Exception as fallback_exc:  # noqa: BLE001
+            print(f"[Price audit] Ошибка Telegram: {fallback_exc}", flush=True)
+            return False
+    except Exception as exc:  # noqa: BLE001
         print(f"[Price audit] Ошибка Telegram: {exc}", flush=True)
         return False
 
@@ -28,26 +38,28 @@ def calculate_ozon_unit_profit(
     overhead_per_order_rub: float,
     ad_rate: float,
     api_comm_rate_under_300: float = 0.23,
-    acquiring_rate: float = 0.015,
-    usn_rate: float = 0.06,
+    acquiring_rate: Optional[float] = None,
+    usn_rate: Optional[float] = None,
 ) -> Dict[str, float]:
     """
     Расчет чистой прибыли на 1 заказ Ozon:
     - До 300 ₽ включительно: реальный % вознаграждения из API (22-23%).
     - Свыше 300 ₽: вознаграждение Ozon 52%.
-    - Логистика: фактическая средняя из «Услуги доставки / Заказы» (~39 ₽).
+    - Логистика: фактическая средняя из «Услуги доставки / Заказы».
     """
     if not 0 < api_comm_rate_under_300 < 1:
         raise ValueError("Нет корректной комиссии Ozon из API")
+    acq_rate = settings.ACQUIRING_RATE if acquiring_rate is None else acquiring_rate
+    tax_rate = settings.TAX_RATE if usn_rate is None else usn_rate
     # At an existing high-tier price the API returns the high commission. Use the
     # conservative edge of the specified 22–23% low tariff for the 299 scenario.
     under_300_rate = api_comm_rate_under_300 if 0.22 <= api_comm_rate_under_300 <= 0.23 else 0.23
     comm_rate = under_300_rate if price <= settings.OZON_LOW_PRICE_LIMIT else settings.OZON_HIGH_COMMISSION_RATE
 
     comm_rub = _mul_rub(price, comm_rate)
-    acq_rub = _mul_rub(price, acquiring_rate)
+    acq_rub = _mul_rub(price, acq_rate)
     ad_rub = _mul_rub(price, ad_rate)
-    tax_rub = _mul_rub(price, usn_rate)
+    tax_rub = _mul_rub(price, tax_rate)
 
     total_deductions = comm_rub + acq_rub + logistics_rub + pvz_dropoff_rub + overhead_per_order_rub + ad_rub + tax_rub + cogs
     net_profit = _round_rub(price - total_deductions)
@@ -117,8 +129,10 @@ def evaluate_ozon_dual_scenarios(
         raise ValueError("Доля удержаний >= 100%: прибыльную цену рассчитать нельзя")
     fixed = cogs + actual_delivery_per_order + weighted_pvz + overhead_per_order_rub
     price = max(301, math.ceil((fixed + target_profit + 0.02) / remaining))
-    best_over300_m = calculate_ozon_unit_profit(float(price), cogs, actual_delivery_per_order,
-                                               weighted_pvz, overhead_per_order_rub, ad_rate, weighted_comm)
+    best_over300_m = calculate_ozon_unit_profit(
+        float(price), cogs, actual_delivery_per_order,
+        weighted_pvz, overhead_per_order_rub, ad_rate, weighted_comm
+    )
 
     return {
         "wh_mode": wh_mode,
@@ -151,20 +165,31 @@ def find_optimal_wb_price(
         weighted_log = fbo_logistics
         wh_mode = f"FBO ({fbo_stock} шт.)"
 
+    acq_rate = settings.ACQUIRING_RATE
+    tax_rate = settings.TAX_RATE
     target_ros = 0.20 if daily_sales >= 2.0 else 0.24
-    denom = 1.0 - comm_rate - 0.015 - 0.06 - ad_rate - target_ros
+    denom = 1.0 - comm_rate - acq_rate - tax_rate - ad_rate - target_ros
     if denom <= 0:
         raise ValueError("Целевая рентабельность недостижима при текущих удержаниях WB")
 
     opt_price = float(math.ceil((cogs + weighted_log + overhead_per_order_rub) / denom))
-    acq_rub = _mul_rub(opt_price, 0.015)
+    acq_rub = _mul_rub(opt_price, acq_rate)
     comm_rub = _mul_rub(opt_price, comm_rate)
     ad_rub = _mul_rub(opt_price, ad_rate)
-    tax_rub = _mul_rub(opt_price, 0.06)
-    net_profit = round(opt_price - comm_rub - acq_rub - weighted_log - overhead_per_order_rub - ad_rub - tax_rub - cogs, 2)
+    tax_rub = _mul_rub(opt_price, tax_rate)
+    net_profit = _round_rub(
+        opt_price - comm_rub - acq_rub - weighted_log - overhead_per_order_rub - ad_rub - tax_rub - cogs
+    )
 
-    cur_net = round(
-        current_price * (1.0 - comm_rate - 0.015 - 0.06 - ad_rate) - weighted_log - overhead_per_order_rub - cogs, 2
+    cur_net = _round_rub(
+        current_price
+        - _mul_rub(current_price, comm_rate)
+        - _mul_rub(current_price, acq_rate)
+        - _mul_rub(current_price, tax_rate)
+        - _mul_rub(current_price, ad_rate)
+        - weighted_log
+        - overhead_per_order_rub
+        - cogs
     )
 
     return {
@@ -188,7 +213,8 @@ async def run_daily_price_audit(bot, admin_id: int, ozon_api, wb_api) -> None:
         res = await session.execute(select(Product))
         db_prods = {(p.marketplace, p.sku): p for p in res.scalars().all()}
 
-    # 1. Сбор фактических расходов Ozon из недельного отчета (включая реальную доставку 6686 / 172 = 38.87 ₽!)
+    # 1. Сбор фактических расходов Ozon из недельного отчета
+    oz_fin: Dict[str, Any] = {}
     oz_actual_delivery_per_order = None
     oz_overhead_per_order = 0.0
     try:
@@ -225,18 +251,18 @@ async def run_daily_price_audit(bot, admin_id: int, ozon_api, wb_api) -> None:
         try:
             campaigns = await ozon_api.fetch_active_ad_campaigns(days=7)
         except RuntimeError:
-            if oz_fin.get('ads_total') != 0 or oz_fin.get('billed_skus'):
+            if oz_fin.get("ads_total") != 0 or oz_fin.get("billed_skus"):
                 raise
             # No expenses to allocate in this billing period; not a claim of organic traffic.
             campaigns = []
-            await send_tg_safe(bot, admin_id, 'Ozon: состав РК недоступен. В расчёте за период рекламных списаний нет.')
+            await send_tg_safe(bot, admin_id, "Ozon: состав РК недоступен. В расчёте за период рекламных списаний нет.")
         ads = analyze_ozon_campaigns(campaigns, ozon_items, oz_fin, list(db_prods.values()))
-        if any(c['products_missing'] for c in ads['campaigns']):
-            raise ValueError('Неполный состав кампаний: нельзя исключить пересечение SKU; кнопки Ozon не созданы')
-        rates = {card['sku']: 0.0 for card in ads['organic_items']}
-        for campaign in ads['campaigns']:
-            if campaign['drr_in_promo_pct'] is not None:
-                rates.update({sku: campaign['drr_in_promo_pct'] / 100 for sku in campaign['skus']})
+        if any(c["products_missing"] for c in ads["campaigns"]):
+            raise ValueError("Неполный состав кампаний: нельзя исключить пересечение SKU; кнопки Ozon не созданы")
+        rates = {card["sku"]: 0.0 for card in ads["organic_items"]}
+        for campaign in ads["campaigns"]:
+            if campaign["drr_in_promo_pct"] is not None:
+                rates.update({sku: campaign["drr_in_promo_pct"] / 100 for sku in campaign["skus"]})
         seen_ozon = set()
         for item in ozon_items:
             sku = str(item.get("sku") or "").strip()
@@ -256,11 +282,16 @@ async def run_daily_price_audit(bot, admin_id: int, ozon_api, wb_api) -> None:
                 continue
             cogs = p_db.cost_price + p_db.packaging_cost + p_db.first_mile_unit_cost
 
-            product_id = str(item.get('product_id') or '')
-            fee = item.get('fbs_pvz_dropoff_rub')
-            if (sku not in rates or sku in ads['overlapping_skus'] or not product_id.isdecimal()
-                or int(product_id) <= 0 or (fbs_st and fee is None)):
-                await send_tg_safe(bot, admin_id, f'⚠️ {html.escape(sku)}: неполные данные ID, ПВЗ или атрибуции; нет кнопок')
+            product_id = str(item.get("product_id") or "")
+            fee = item.get("fbs_pvz_dropoff_rub")
+            if (
+                sku not in rates
+                or sku in ads["overlapping_skus"]
+                or not product_id.isdecimal()
+                or int(product_id) <= 0
+                or (fbs_st and fee is None)
+            ):
+                await send_tg_safe(bot, admin_id, f"⚠️ {html.escape(sku)}: неполные данные ID, ПВЗ или атрибуции; нет кнопок")
                 continue
             try:
                 dual = evaluate_ozon_dual_scenarios(
@@ -277,7 +308,7 @@ async def run_daily_price_audit(bot, admin_id: int, ozon_api, wb_api) -> None:
                     daily_sales=float(item.get("daily_sales") or 0.0),
                 )
             except ValueError as exc:
-                await send_tg_safe(bot, admin_id, f'⚠️ {html.escape(sku)}: {html.escape(str(exc))}')
+                await send_tg_safe(bot, admin_id, f"⚠️ {html.escape(sku)}: {html.escape(str(exc))}")
                 continue
             t299 = dual["tier_299"]
             tover = dual["tier_over300"]
@@ -291,9 +322,13 @@ async def run_daily_price_audit(bot, admin_id: int, ozon_api, wb_api) -> None:
                 else "🏷 <b>Участие в акции:</b> Нет (свободное управление ценой)\n"
             )
 
-            common = {'product_id': int(product_id), 'offer_id': sku, 'group_id': uuid4().hex}
-            threshold, optimal = await create_pending_actions('ozon', sku, 'update_price', [
-                dict(common, new_price=299.0), dict(common, new_price=tover['price'])])
+            common = {"product_id": int(product_id), "offer_id": sku, "group_id": uuid4().hex}
+            threshold, optimal = await create_pending_actions(
+                "ozon",
+                sku,
+                "update_price",
+                [dict(common, new_price=299.0), dict(common, new_price=tover["price"])],
+            )
 
             msg_text = (
                 f"🔵 <b>[Аудит цены Ozon] Артикул {html.escape(sku)}</b>\n"
@@ -378,10 +413,13 @@ async def run_daily_price_audit(bot, admin_id: int, ozon_api, wb_api) -> None:
                 continue
             cogs = p_db.cost_price + p_db.packaging_cost + p_db.first_mile_unit_cost
 
-            if (item.get('commission_rate') is None or item.get('daily_sales') is None or
-                (fbo_st and item.get('fbo_logistics_cost') is None) or
-                (fbs_st and item.get('fbs_logistics_cost') is None)):
-                await send_tg_safe(bot, admin_id, f'⚠️ {html.escape(sku)}: нет тарифов/продаж WB, рекомендация пропущена')
+            if (
+                item.get("commission_rate") is None
+                or item.get("daily_sales") is None
+                or (fbo_st and item.get("fbo_logistics_cost") is None)
+                or (fbs_st and item.get("fbs_logistics_cost") is None)
+            ):
+                await send_tg_safe(bot, admin_id, f"⚠️ {html.escape(sku)}: нет тарифов/продаж WB, рекомендация пропущена")
                 continue
             try:
                 calc = find_optimal_wb_price(
@@ -397,7 +435,7 @@ async def run_daily_price_audit(bot, admin_id: int, ozon_api, wb_api) -> None:
                     daily_sales=float(item.get("daily_sales") or 0.0),
                 )
             except ValueError as exc:
-                await send_tg_safe(bot, admin_id, f'⚠️ {html.escape(sku)}: {html.escape(str(exc))}')
+                await send_tg_safe(bot, admin_id, f"⚠️ {html.escape(sku)}: {html.escape(str(exc))}")
                 continue
             rec_p = calc["recommended_price"]
             act_id = await create_pending_action(
@@ -417,9 +455,9 @@ async def run_daily_price_audit(bot, admin_id: int, ozon_api, wb_api) -> None:
                 f"ℹ️ Логистика — базовый тариф коробки (верхняя оценка по складам); проверьте объём и склад.\n"
                 f"💰 Текущая цена: <b>{cur_p:.0f} ₽</b> ➡️ Рекомендуемая: <b>{rec_p:.0f} ₽</b>\n"
                 f"📊 Комиссия WB ({calc['commission_pct']}%): <b>-{calc['commission_rub']:.0f} ₽</b>\n"
-                f"🚚 Логистика: <b>-{calc['logistics_rub']:.0f} ₽</b> | Эквайринг (1.5%): <b>-{calc['acquiring_rub']:.2f} ₽</b>\n"
-                f"🧾 Прочие удержания на 1 заказ: <b>-{calc['overhead_rub']:.0f} ₽</b> | Налог УСН (6%): <b>-{calc['tax_rub']:.0f} ₽</b>\n"
-                f"💵 Себестоимость: <b>-{cogs:.0f} ₽</b>\n"
+                f"🚚 Логистика: <b>-{calc['logistics_rub']:.0f} ₽</b> | Эквайринг ({settings.ACQUIRING_RATE * 100:.1f}%): <b>-{calc['acquiring_rub']:.2f} ₽</b>\n"
+                f"📣 Реклама ({calc['ad_pct']}%): <b>-{calc['ad_rub']:.0f} ₽</b> | Прочие удержания: <b>-{calc['overhead_rub']:.0f} ₽</b>\n"
+                f"🧾 Налог УСН ({settings.TAX_RATE * 100:.0f}%): <b>-{calc['tax_rub']:.0f} ₽</b> | Себестоимость: <b>-{cogs:.0f} ₽</b>\n"
                 f"👉 <b>Чистая прибыль: {calc['net_profit']:+.0f} ₽/шт.</b> (сейчас: {calc['current_net_profit']:+.0f} ₽/шт.)"
             )
             await send_tg_safe(

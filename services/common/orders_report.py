@@ -126,18 +126,21 @@ def _resolve_order_sku(raw_sku: Any, marketplace: str) -> str:
     return clean
 
 
-def _pct(value: float, base: float) -> str:
-    if not (math.isfinite(value) and math.isfinite(base)) or base <= 0.0:
+def _pct(value: Any, base: Any) -> str:
+    val = _safe_float(value)
+    denom = _safe_float(base)
+    if denom <= 0.0:
         return "0.0%"
-    return f"{_round_pct(value, base):.1f}%"
+    return f"{_round_pct(val, denom):.1f}%"
 
 
-def _fmt_money(value: float) -> str:
-    if not math.isfinite(value) or abs(value) < 0.005:
+def _fmt_money(value: Any) -> str:
+    val = _safe_float(value)
+    if abs(val) < 0.005:
         return "0"
-    if abs(value - round(value)) >= 0.005:
-        return f"{value:,.2f}"
-    return f"{value:,.0f}"
+    if abs(val - round(val)) >= 0.005:
+        return f"{val:,.2f}"
+    return f"{val:,.0f}"
 
 
 def _fmt_expense(value: float) -> str:
@@ -505,12 +508,29 @@ async def sync_and_generate_orders_report(
         oz_tax = _mul_rub(oz_tax_base, tax_rate)
         oz_net_profit = _round_rub(_to_dec(oz_payout) - _to_dec(oz_cogs) - _to_dec(oz_tax))
 
+        oz_source_low = str(ozon_fin.get("source") or "").lower()
         oz_profit_known = (
             oz_missing_cogs == 0
             and (oz_sales == 0 or bool(oz_orders))
-            and not any(str(o.get("status") or "").lower() in {"return", "returned", "возврат"} for o in oz_orders if isinstance(o, dict))
-            and not any(mark in str(ozon_fin.get("source") or "").lower()
-                        for mark in ("незнакомые типы", "неполное покрытие", "cash-flow пуст", "cash-flow http", "accrual http", "accrual runtimeerror"))
+            and not any(
+                str(o.get("status") or "").lower() in {"return", "returned", "возврат"}
+                for o in oz_orders
+                if isinstance(o, dict)
+            )
+            and not any(
+                mark in oz_source_low
+                for mark in (
+                    "незнакомые типы",
+                    "неполное покрытие",
+                    "cash-flow пуст",
+                    "cash-flow http",
+                    "accrual http",
+                    "accrual runtimeerror",
+                    "accrual timeouterror",
+                    "accrual oserror",
+                    "accrual client",
+                )
+            )
             and (oz_sales == 0 or all(k in ozon_fin for k in ("total_deductions", "total_payout")))
             and all(o.get("price") is not None for o in oz_orders if isinstance(o, dict))
         )
@@ -573,8 +593,9 @@ async def sync_and_generate_orders_report(
         report_rows = "\n".join(
             f"• №{html.escape(str(r.get('id')))} ({html.escape(str(r.get('date_from')))}..{html.escape(str(r.get('date_to')))}): "
             f"retailAmountSum {_fmt_money(r.get('retail_amount_sum'))} ₽; forPaySum {_fmt_money(r.get('for_pay_sum'))} ₽"
-            for r in rows if isinstance(r, dict)
-        )
+            for r in rows
+            if isinstance(r, dict)
+        ) or "• Сводных отчётов WB за выбранный период не найдено."
         wb_block = (
             "🟣 <b>WILDBERRIES: только сводные отчёты</b>\n"
             f"{report_rows}\n"

@@ -220,7 +220,7 @@ class WBStatisticsAPI(MarketplaceClient):
             "seller_discount_pct": discount,
             "price_before_discount_set": before,
             "price_after_discount_target": target,
-            "min_price_for_promotions": int(round(target * 0.92)),
+            "min_price_for_promotions": int(round(target * settings.WB_MIN_PRICE_RATIO)),
             "min_price_set": False,
             "api_response": response,
         }
@@ -315,8 +315,12 @@ class WBStatisticsAPI(MarketplaceClient):
                     json_data={"chrtIds" if use_chrt else "skus": batch},
                 )
                 seen = set()
-                for row in st["stocks"]:
-                    ident = row.get("chrtId") if use_chrt else str(row["sku"])
+                for row in (st.get("stocks") or []) if isinstance(st, dict) else []:
+                    if use_chrt:
+                        raw_ident = row.get("chrtId") if row.get("chrtId") is not None else row.get("chrtID")
+                        ident = int(raw_ident) if raw_ident is not None else None
+                    else:
+                        ident = str(row.get("sku") or "")
                     if ident not in mapping:
                         raise RuntimeError(
                             "WB FBS: не удалось сопоставить размер со складской позицией"
@@ -326,7 +330,7 @@ class WBStatisticsAPI(MarketplaceClient):
                     seen.add(ident)
                     nm = mapping[ident]
                     fbs_stocks_map[nm] = fbs_stocks_map.get(nm, 0) + max(
-                        0, int(row["amount"])
+                        0, int(row.get("amount") or 0)
                     )
 
         fbo_stocks_map, locations = await read_versions(
@@ -379,7 +383,7 @@ class WBStatisticsAPI(MarketplaceClient):
                 if sales_count_7d is not None
                 else None
             )
-            acquiring_val = round(max(buyer_price, seller_price) * 0.015, 2)
+            acquiring_val = round(max(buyer_price, seller_price) * settings.ACQUIRING_RATE, 2)
 
             rates = tariffs["subjects"].get(subject_by_nm.get(nm_id), {})
             total_stock = fbo_qty + fbs_qty
@@ -488,16 +492,38 @@ class WBStatisticsAPI(MarketplaceClient):
             await asyncio.sleep(5)
         else:
             raise RuntimeError("WB FBO: истёк срок ожидания отчёта")
-        for row in await self._request("GET", url + "/download"):
+        service_wh_names = {
+            "всего находится на складах",
+            "в пути к получателю",
+            "в пути возвраты на склад wb",
+            "в пути до получателя",
+            "в пути возвраты на склад",
+        }
+        download_rows = await self._request("GET", url + "/download")
+        if not isinstance(download_rows, list):
+            raise RuntimeError("WB FBO: неверный формат выгрузки warehouse_remains")
+        for row in download_rows:
+            if not isinstance(row, dict) or row.get("nmId") is None:
+                continue
             nm = int(row["nmId"])
+            warehouses_list = row.get("warehouses") or []
             totals = [
                 w
-                for w in row["warehouses"]
-                if w["warehouseName"].lower() == "всего находится на складах"
+                for w in warehouses_list
+                if isinstance(w, dict)
+                and str(w.get("warehouseName") or "").strip().lower()
+                == "всего находится на складах"
             ]
             if len(totals) != 1 or nm in quantities:
                 raise RuntimeError("WB FBO: неоднозначные остатки")
-            quantities[nm] = int(totals[0]["quantity"])
+            quantities[nm] = max(0, int(totals[0].get("quantity") or 0))
+            for w in warehouses_list:
+                if not isinstance(w, dict):
+                    continue
+                wh_name = str(w.get("warehouseName") or "").strip()
+                wh_qty = max(0, int(w.get("quantity") or 0))
+                if wh_name and wh_qty > 0 and wh_name.lower() not in service_wh_names:
+                    locations.setdefault(nm, set()).add(wh_name)
         return quantities, locations
 
     async def fetch_active_ad_campaigns(self, days: int = 7) -> list:
