@@ -111,6 +111,14 @@ class Settings(BaseSettings):
     LISTINGS_BROWSER_BUDGET_SEC: int = Field(
         default=90, description="Бюджет времени на браузерный разбор витрины, сек"
     )
+    # Браузер для разбора витрин: установленный Chrome/Edge проходит антибот заметно чаще
+    # встроенного Chromium Playwright. Пусто = только встроенный Chromium.
+    LISTINGS_BROWSER_CHANNEL: str = Field(
+        default="chrome", description="Канал браузера: chrome | msedge | пусто (встроенный Chromium)"
+    )
+    LISTINGS_BROWSER_HEADLESS: bool = Field(
+        default=True, description="false — показывать окно браузера (антибот реже блокирует)"
+    )
     # Устаревшие финансовые методы Ozon отключены 08.09.2026, оставлены как
     # последняя попытка только при явном включении.
     OZON_LEGACY_FINANCE: bool = Field(

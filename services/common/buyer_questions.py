@@ -19,6 +19,8 @@ BRAND_MATRIX_RULES = """
 3. Палитра и сопутствующие позиции:
    - Если ищут цвет без блёсток — рекомендуем классическую серию 1001–1036.
    - Праймер сейчас не разрабатывается; наклейки на типсы в комплект не входят.
+   - Собственные базы и топы YaSoKo находятся на стадии РАЗРАБОТКИ и в продаже пока не представлены: не называй их
+     артикулы, цены и сроки, не предлагай купить как существующий товар (допустим только ненавязчивый анонс разработки).
 4. Жёсткие ограничения безопасности:
    - Не выдумывай точные даты поставок, неподтверждённые сертификаты или состав вне карточки.
    - При вопросах о наличии/поступлении отвечай по существу (предложи добавить магазин в избранное для уведомления о поступлении) и не пиши про вязкость и лампы.
@@ -54,10 +56,22 @@ _LAMP_CONTEXT_RE = re.compile(
 )
 
 
+# Подготовка ногтевой пластины (обезжирить/дегидратор) — штатный совет технолога, а не совет
+# «обезжирить/разбавить продукт». Разрешаем, если речь о ногте/пластине/кутикуле.
+_NAIL_PREP_RE = re.compile(r"ногт|пластин|кутикул|маникюр", re.IGNORECASE)
+_PRODUCT_CONTEXT_RE = re.compile(r"\bгель\w*\b.*\b(?:спирт|разбав|растворител)|(?:спирт|разбав|растворител).*\bгель", re.IGNORECASE)
+
+
 def has_unsafe_advice(text: str) -> bool:
     """True, если в ответе есть совет разбавлять/подогревать/протирать продукт."""
     for sentence in re.split(r"(?<=[.!?…])\s+|\n+", text or ""):
         if not sentence.strip() or _NEGATION_RE.search(sentence):
+            continue
+        if (
+            re.search(r"обезжир", sentence, re.IGNORECASE)
+            and _NAIL_PREP_RE.search(sentence)
+            and not _PRODUCT_CONTEXT_RE.search(sentence)
+        ):
             continue
         if _HARD_RISK_RE.search(sentence):
             return True
@@ -73,11 +87,49 @@ _STRICT_SUFFIX = (
 _REVIEW_CLOSING = "Желаем красивого маникюра и отличного настроения! Будем рады видеть вас снова."
 
 
-def _ensure_review_shape(reply: str) -> str:
-    """Приветствие и завершающее пожелание обязательны по ТЗ (раньше терялись)."""
+# Ненавязчивый анонс: собственные базы и топы YaSoKo в разработке. Добавляется кодом (не ИИ),
+# чтобы не выдумывались сроки/артикулы и фраза не пропадала при смене модели.
+_ANNOUNCEMENTS = (
+    "Кстати, мы работаем над собственными базами и топами под наши гели — они проектируются для максимальной "
+    "совместимости; следите за новостями магазина.",
+    "Сейчас мы разрабатываем линейку баз и топов YaSoKo специально под наши гели — будем рады, если вы "
+    "будете с нами, когда они появятся.",
+    "Для лучшей работы геля мы готовим собственные базы и топы YaSoKo (пока на стадии разработки) — "
+    "подпишитесь на магазин, чтобы не пропустить.",
+)
+
+
+_ANNOUNCED_RE = re.compile(r"баз\w*\s+и\s+топ", re.IGNORECASE)
+
+
+def soft_announcement(seed: str = "") -> str:
+    """Стабильный (по тексту) выбор одной из формулировок анонса."""
+    return _ANNOUNCEMENTS[sum(ord(c) for c in str(seed)) % len(_ANNOUNCEMENTS)]
+
+
+_NEGATIVE_WORDS_RE = re.compile(
+    r"плох|ужас|отврат|кошмар|разочар|не рекоменд|не понрав|брак|отсло|отслаи|отлет|отлип|отклеи|скол|трещ|пузыр|не держ|"
+    r"слез|слезает|слезл|не сохн|не засых|не полимериз|не запекается|липк|течёт|течет|растека|густ|"
+    r"жидк|комок|комьями|аллерг|жжёт|жжет|зуд|не подош|не советую|деньги на ветер|развод|обман|"
+    r"мутн|желте|пожелте|морщин|не лож|плохо лож|полос",
+    re.IGNORECASE,
+)
+
+
+def is_negative_review(text: str, rating: Optional[int] = None) -> bool:
+    """Отрицательный отзыв: оценка 1–3, а при неизвестной оценке — по лексике жалоб."""
+    if rating is not None:
+        return rating <= 3
+    return bool(_NEGATIVE_WORDS_RE.search(text or ""))
+
+
+def _ensure_review_shape(reply: str, announcement: str = "") -> str:
+    """Приветствие, (по возможности) анонс и завершающее пожелание обязательны по ТЗ."""
     text = reply.strip()
     if not text.lower().startswith("здравствуйте"):
         text = "Здравствуйте! " + text
+    if announcement and not _ANNOUNCED_RE.search(text):
+        text = text.rstrip() + " " + announcement
     if "желаем" not in text.lower()[-200:]:
         text = text.rstrip() + " " + _REVIEW_CLOSING
     return text
@@ -127,6 +179,9 @@ async def generate_buyer_question_answer(question_text: str, sku: Optional[str] 
         if has_unsafe_advice(reply):
             last_problem = "Ответ содержит неподтверждённый совет; публикация отменена"
             continue
+        reply = reply.strip()
+        if not _ANNOUNCED_RE.search(reply):
+            reply += "\n\n" + soft_announcement(question_text)
         return reply
     raise RuntimeError(last_problem)
 
@@ -134,6 +189,20 @@ async def generate_buyer_question_answer(question_text: str, sku: Optional[str] 
 async def generate_review_reply(review_text: str, rating: Optional[int], sku: Optional[str] = None) -> str:
     sku_context = _build_sku_context(sku, "Товар из отзыва")
 
+    negative = is_negative_review(review_text, rating)
+    tech_block = ""
+    if negative:
+        tech_block = """
+ОТЗЫВ ОТРИЦАТЕЛЬНЫЙ — отвечай как ТЕХНОЛОГ-КОЛОРИСТ и МАСТЕР маникюра:
+- Выдели из текста отзыва признаки проблемы (отслойка, пузыри, течёт/густой, не полимеризуется, цвет, липкость и т.п.).
+- Если информации достаточно: назови наиболее вероятную причину и 2–3 проверяемых шага (толщина слоя 0,3–0,5 мм и
+  тонкие слои, время и мощность UV/LED-лампы по инструкции, подготовка ногтевой пластины и отступ от кутикулы,
+  не касаться кутикулы и боковых валиков, равномерная полимеризация, хранение банки в темноте при комнатной температуре).
+- Если информации мало — не гадай: задай 1–2 уточняющих вопроса (какой лампой и сколько секунд сушили, какая подготовка,
+  какая база/топ использовались, какая партия/дата покупки) и пригласи написать в чат магазина.
+- Не обвиняй покупателя, не обещай возврат/компенсацию, не выдумывай состав и сертификаты. Объём до 5–6 предложений.
+- Анонс про базы и топы в этом ответе НЕ добавляй.
+"""
     prompt = f"""
 Ты — специалист контроля качества бренда YaSoKo.
 Напиши официальный ответ на отзыв покупателя на Ozon (оценка: {rating if rating is not None else "не указана, не придумывай"}).
@@ -143,7 +212,7 @@ async def generate_review_reply(review_text: str, rating: Optional[int], sku: Op
 
 ОТЗЫВ ПОКУПАТЕЛЯ:
 «{review_text}»
-
+{tech_block}
 ТРЕБОВАНИЯ:
 0. Не упоминай спирт, растворители, разбавление, подогрев и нагрев продукта.
 1. Начни с вежливого приветствия: «Здравствуйте!», поблагодари за выбор бренда YaSoKo и обратную связь.
@@ -152,7 +221,8 @@ async def generate_review_reply(review_text: str, rating: Optional[int], sku: Op
 4. Если оценка 1–3 — выскажи сожаление и предложи написать в чат магазина для разбора; не спорь и не обвиняй покупателя.
 5. Не предлагай другие линейки и товары: упоминай только то, что есть в базе знаний и нужно по сути отзыва.
 6. Заверши тёплым пожеланием: «{_REVIEW_CLOSING}».
-7. Объём: 3–4 предложения.
+7. Объём: 3–4 предложения (для отрицательного отзыва — до 5–6).
+8. Не добавляй сам анонс баз/топов — он добавляется отдельно.
 """
     last_error: Optional[RuntimeError] = None
     for attempt in range(3):
@@ -164,7 +234,9 @@ async def generate_review_reply(review_text: str, rating: Optional[int], sku: Op
                 raise RuntimeError("Gemini вернул пустой ответ")
             if has_unsafe_advice(reply):
                 raise RuntimeError("Ответ содержит неподтвержденный совет; публикация отменена")
-            return _ensure_review_shape(reply)
+            return _ensure_review_shape(
+                reply, "" if negative else soft_announcement(review_text)
+            )
         except GeminiUnavailable:
             raise  # все маршруты уже перебраны внутри generate(); повторы только тратят время
         except RuntimeError as exc:

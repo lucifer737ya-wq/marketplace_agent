@@ -41,7 +41,7 @@ def get_product_context(identifier: str) -> dict:
         "category": "Камуфлирующий гель для наращивания и моделирования ногтей",
         "volume": "15 г",
         "formula": "HEMA FREE, 11-FREE",
-        "recommended_upsell": "каучуковая эластичная база YaSoKo (арт. 21000) или топ без липкого слоя (арт. 22000)",
+        "recommended_upsell": "базы и топы YaSoKo — в разработке, как товар не предлагать",
         "composition": "Acrylates/Carbamate Copolymer; Acrylates/VP Copolymer; Acrylates Copolymer; CI 77891; CI 77491",
     }
 
@@ -60,7 +60,7 @@ def _build_review_fallback_reply(product_meta: dict) -> str:
     return (
         f"Здравствуйте! Благодарим за отзыв и выбор {item_label}! "
         "Мы рады, что вы оценили комфорт в работе и качество покрытия. "
-        "Для безупречного глянца рекомендуем дополнить маникюр нашим топом без липкого слоя (арт. 22000). "
+        "Мы разрабатываем собственные базы и топы под наши гели — следите за новостями магазина. "
         "Желаем вам красивых и стойких работ!"
     )
 

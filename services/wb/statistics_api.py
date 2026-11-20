@@ -543,7 +543,8 @@ class WBStatisticsAPI(MarketplaceClient):
         adverts = groups.get("adverts") if isinstance(groups, dict) else None
         ids = set()
         for group in adverts or []:
-            if not isinstance(group, dict) or group.get("status") not in (4, 9, 11):
+            # Статусы WB: 4 — готова к запуску, 9 — АКТИВНА, 11 — на паузе. В аудит идут только активные.
+            if not isinstance(group, dict) or group.get("status") != 9:
                 continue
             for advert in group.get("advert_list") or []:
                 if not isinstance(advert, dict):
@@ -972,27 +973,37 @@ class WBStatisticsAPI(MarketplaceClient):
                     report["source"] += "; " + "; ".join(dict.fromkeys(errors))
                 if not report.get("orders_count"):
                     # Строки есть, а продаж/возвратов нет: чаще всего неделя ещё не закрыта
-                    # (отчёт реализации формируется после воскресенья) или WB сменил название
-                    # операции. Показываем, что именно пришло, и сверяем с Sales API.
+                    # (отчёт реализации формируется после воскресенья). Показываем, что именно
+                    # пришло, и достраиваем ОЦЕНКУ вознаграждения/эквайринга по Sales API.
                     ops = report.get("operation_counts") or {}
                     shown = ", ".join(f"{k}×{v}" for k, v in sorted(ops.items())[:8]) or "нет"
                     report["source"] += f"; в отчёте нет строк «Продажа/Возврат» (операции: {shown})"
                     try:
-                        hint = await self._sales_api_summary(date_from, date_to)
+                        sales_rows = await self._sales_api_rows(date_from, date_to)
                     except (APIStatusError, RuntimeError, ValueError, TypeError) as exc:
                         report["source"] += f"; Sales API: {_exc_label(exc)}"
                     else:
+                        hint = self._sales_rows_summary(sales_rows)
                         report["sales_api"] = hint
                         if hint["count"]:
-                            report["source"] += (
-                                f"; ⚠ Sales API видит {hint['count']} продаж на "
-                                f"{hint['price_with_disc']:.0f} ₽ — отчёт реализации ещё не закрыт"
-                            )
+                            if self._apply_sales_api_estimate(
+                                report, sales_rows, float(settings.ACQUIRING_RATE)
+                            ):
+                                report["source"] += (
+                                    f"; ⚠ отчёт реализации не закрыт — вознаграждение и эквайринг "
+                                    f"ОЦЕНЕНЫ по Sales API ({hint['count']} продаж на "
+                                    f"{hint['price_with_disc']:.0f} ₽)"
+                                )
+                            else:
+                                report["source"] += (
+                                    f"; ⚠ Sales API видит {hint['count']} продаж на "
+                                    f"{hint['price_with_disc']:.0f} ₽ — отчёт реализации ещё не закрыт"
+                                )
             self._write_disk_cache(key, report)
             return report
 
-    async def _sales_api_summary(self, date_from: str, date_to: str) -> dict:
-        """Сверка: GET /api/v1/supplier/sales (оперативные продажи, без удержаний)."""
+    async def _sales_api_rows(self, date_from: str, date_to: str) -> list:
+        """GET /api/v1/supplier/sales — оперативные продажи/возвраты за период (без удержаний)."""
         rows = await self._request(
             "GET",
             self.STATS_URL + "/api/v1/supplier/sales",
@@ -1002,14 +1013,21 @@ class WBStatisticsAPI(MarketplaceClient):
             rows = []
         if not isinstance(rows, list):
             raise RuntimeError("WB: неверный формат Sales API")
-        count = 0
-        total = 0.0
+        result = []
         for row in rows:
             if not isinstance(row, dict):
                 continue
             day = str(row.get("date") or "")[:10]
             if day and not (date_from <= day <= date_to):
                 continue
+            result.append(row)
+        return result
+
+    @staticmethod
+    def _sales_rows_summary(rows: list) -> dict:
+        count = 0
+        total = 0.0
+        for row in rows:
             sale_id = str(row.get("saleID") or "")
             if sale_id.startswith("R"):  # возврат
                 total -= _num(row.get("priceWithDisc"))
@@ -1018,6 +1036,86 @@ class WBStatisticsAPI(MarketplaceClient):
             total += _num(row.get("priceWithDisc"))
             count += 1
         return {"count": max(count, 0), "price_with_disc": round(max(total, 0.0), 2)}
+
+    async def _sales_api_summary(self, date_from: str, date_to: str) -> dict:
+        """Сверка: GET /api/v1/supplier/sales (оперативные продажи, без удержаний)."""
+        return self._sales_rows_summary(await self._sales_api_rows(date_from, date_to))
+
+    @staticmethod
+    def _apply_sales_api_estimate(report: dict, sales_rows: list, acq_rate: float) -> bool:
+        """Отчёт реализации ещё не закрыт: строим ОЦЕНКУ вознаграждения и эквайринга по Sales API.
+
+        priceWithDisc — цена, от которой WB считает вознаграждение; forPay — к перечислению
+        (после вознаграждения и эквайринга). Эквайринг оцениваем долей от цены покупателя
+        (finishedPrice), вознаграждение — остаток. Все такие строки помечаются «оценка»,
+        чтобы в отчёте не было ложных нулей и ложной точности.
+        """
+        orders = []
+        seller = buyer = payout = commission = acquiring = returns = 0.0
+        for row in sales_rows:
+            sale_id = str(row.get("saleID") or "")
+            price = _num(row.get("priceWithDisc"))
+            paid = _num(row.get("finishedPrice")) or price
+            for_pay = _num(row.get("forPay"))
+            if price <= 0:
+                continue
+            if sale_id.startswith("R"):
+                seller -= price
+                buyer -= paid
+                payout -= for_pay
+                returns += price
+                continue
+            fee = round(paid * acq_rate, 2)
+            comm = max(price - for_pay - fee, 0.0) if for_pay > 0 else 0.0
+            seller += price
+            buyer += paid
+            payout += for_pay
+            acquiring += fee
+            commission += comm
+            orders.append(
+                {
+                    "order_id": f"wbs_{sale_id or len(orders)}",
+                    "marketplace": "wb",
+                    "sku": str(row.get("supplierArticle") or row.get("nmId") or ""),
+                    "created_at": str(row.get("date") or "")[:10],
+                    "quantity": 1,
+                    "price": price,
+                    "buyer_price": paid,
+                    "acquiring": fee,
+                    "commission": comm,
+                    "logistics": 0.0,
+                    "status": "sold",
+                }
+            )
+        if not orders:
+            return False
+        deductions = (
+            commission
+            + acquiring
+            + report.get("logistics_direct", 0.0)
+            + report.get("logistics_return", 0.0)
+            + report.get("storage", 0.0)
+            + report.get("acceptance", 0.0)
+            + report.get("other_services", 0.0)
+            + report.get("ads", 0.0)
+        )
+        report.update(
+            {
+                "orders": orders,
+                "orders_count": len(orders),
+                "revenue_seller": seller,
+                "revenue_buyer": buyer,
+                "returns_amount": returns,
+                "for_pay": payout,
+                "commission": commission,
+                "acquiring": acquiring,
+                "acquiring_estimated": True,
+                "commission_estimated": True,
+                "total_deductions": round(deductions, 2),
+                "total_payout": round(seller - deductions, 2),
+            }
+        )
+        return True
 
     async def _finance_from_summaries(
         self, date_from: str, date_to: str, level: str
@@ -1085,6 +1183,23 @@ class WBStatisticsAPI(MarketplaceClient):
         }
 
     @staticmethod
+    def _row_kind(operation: str, doc_type: str) -> str:
+        """sale / return / other по «обоснованию для оплаты», при пустом — по типу документа."""
+        op = (operation or "").strip().lower()
+        doc = (doc_type or "").strip().lower()
+        if op:
+            if op == "продажа":
+                return "sale"
+            if op == "возврат":
+                return "return"
+            return "other"  # логистика, хранение, штрафы, коррекции, компенсации…
+        if doc == "продажа":
+            return "sale"
+        if doc == "возврат":
+            return "return"
+        return "other"
+
+    @staticmethod
     def _finance_rows(rows: list, ads: float, start: str, end: str) -> dict:
         """
         Разбор детализации отчёта реализации.
@@ -1105,11 +1220,20 @@ class WBStatisticsAPI(MarketplaceClient):
             if rid in seen:
                 continue
             seen.add(rid)
-            operation = str(_pick(r, "supplierOperName", "supplier_oper_name") or "").strip().lower()
-            op_counts[operation or "—"] = op_counts.get(operation or "—", 0) + 1
+            # Новый finance-api отдаёт «Обоснование для оплаты» как sellerOperName
+            # (в v5 было supplier_oper_name), тип документа — docTypeName. Раньше код читал
+            # только supplierOperName → операция всегда пустая → ВСЕ продажи пропускались,
+            # а вознаграждение/эквайринг WB оставались нулями.
+            operation = str(
+                _pick(r, "sellerOperName", "supplierOperName", "supplier_oper_name") or ""
+            ).strip().lower()
+            doc_type = str(_pick(r, "docTypeName", "doc_type_name") or "").strip().lower()
+            kind = WBStatisticsAPI._row_kind(operation, doc_type)
+            label = operation or doc_type or "—"
+            op_counts[label] = op_counts.get(label, 0) + 1
             logistics = _num(_pick(r, "deliveryService", "delivery_rub"))
             returned = _num(_pick(r, "returnAmount", "return_amount"))
-            if returned or "возврат" in operation:
+            if kind == "return" or (kind == "other" and (returned or "возврат" in operation)):
                 reverse += logistics
             else:
                 delivery += logistics
@@ -1119,7 +1243,7 @@ class WBStatisticsAPI(MarketplaceClient):
             deduction = _num(_pick(r, "deduction", "deduction_sum"))
             # Идентифицируемые рекламные удержания приходят отдельно из /upd.
             other += penalty + deduction
-            if operation not in {"продажа", "возврат"}:
+            if kind not in {"sale", "return"}:
                 continue
             qty = int(_num(_pick(r, "quantity")) or 1)
             if qty <= 0:
@@ -1135,7 +1259,7 @@ class WBStatisticsAPI(MarketplaceClient):
                 estimated = True
             else:
                 fee = _num(fee_raw)  # acquiring_bank is a bank NAME
-            sign = -1 if operation == "возврат" else 1
+            sign = -1 if kind == "return" else 1
             seller += sign * gross
             buyer += sign * paid
             payout += sign * transfer

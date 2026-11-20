@@ -26,10 +26,9 @@ GEL_COMMON_DESCRIPTION = (
 )
 
 ALLOWED_UPSELL_LIST = (
-    "В ассортименте YaSoKo есть ТОЛЬКО следующие категории для рекомендаций:\n"
-    "1. Базы (15 мл): каучуковая эластичная (арт. 21000), многофункциональная жесткая 5 в 1 (арт. 21001), адгезивная 8 в 1 (арт. 21002).\n"
-    "2. Топы (15 мл): бриллиантовый с УФ-защитой без липкого слоя (арт. 22000), кристально-прозрачный самовыравнивающийся (арт. 22001), молочный полупрозрачный Milky Top (арт. 22002).\n"
-    "3. Камуфлирующие гели YaSoKo (15 г) других оттенков палитры.\n"
+    "В ассортименте YaSoKo сейчас продаются ТОЛЬКО камуфлирующие и моделирующие гели (15 г) — их оттенки можно рекомендовать.\n"
+    "Собственные базы и топы YaSoKo находятся на стадии РАЗРАБОТКИ и в продаже НЕ представлены: не называй артикулы, цены и сроки, "
+    "не предлагай купить их как существующие. Допустим только ненавязчивый анонс, что они разрабатываются под наши гели.\n"
     "СТРОГО ЗАПРЕЩЕНО рекомендовать несуществующие товары нашего бренда: праймеры, обезжириватели, жидкости для снятия, безворсовые салфетки, лампы и пилки!"
 )
 
@@ -45,7 +44,7 @@ PRODUCTS_CATALOG: Dict[str, Dict[str, Any]] = {
         "ozon_sku": "3405669329", "wb_sku": "765197240", "barcode": "4638944332008", "gtin": "04638944332008",
         "composition": "Acrylates/Carbamate Copolymer; Acrylates/VP Copolymer; Acrylates Copolymer; CI 77891; CI 77491; CI 77492; CI 77499; CI 77742",
         "curing_time": "60–90 сек UV/LED",
-        "recommended_upsell": "эластичная каучуковая база YaSoKo (арт. 21000) под подложку или топ без липкого слоя (арт. 22000)",
+        "recommended_upsell": "соседние оттенки серии (базы и топы YaSoKo — в разработке, как товар не предлагать)",
     },
     "1002": {
         "art": "1002", "shade": "#02", "color_name": "Зефирная Мечта",
@@ -56,7 +55,7 @@ PRODUCTS_CATALOG: Dict[str, Dict[str, Any]] = {
         "barcode": "4638944332015", "gtin": "04638944332015",
         "composition": "Acrylates/Carbamate Copolymer; Acrylates/VP Copolymer; Acrylates Copolymer; CI 77891; CI 77491; CI 77492; CI 77499; CI 77742",
         "curing_time": "60–90 сек UV/LED",
-        "recommended_upsell": "бриллиантовый топ YaSoKo без липкого слоя (арт. 22000)",
+        "recommended_upsell": "соседние оттенки серии (базы и топы YaSoKo — в разработке, как товар не предлагать)",
     },
     "1003": {
         "art": "1003", "shade": "#03", "color_name": "Клубничный Джем",
@@ -67,7 +66,7 @@ PRODUCTS_CATALOG: Dict[str, Dict[str, Any]] = {
         "barcode": "4638944332022", "gtin": "04638944332022",
         "composition": "Acrylates/Carbamate Copolymer; Acrylates/VP Copolymer; Acrylates Copolymer; CI 77891; CI 77491; CI 77492; CI 77499; CI 77742",
         "curing_time": "60–90 сек UV/LED",
-        "recommended_upsell": "кристально-прозрачный топ YaSoKo (арт. 22001)",
+        "recommended_upsell": "соседние оттенки серии (базы и топы YaSoKo — в разработке, как товар не предлагать)",
     },
     "1006": {
         "art": "1006", "shade": "#06", "color_name": "Малиновый Сорбет",
@@ -78,7 +77,7 @@ PRODUCTS_CATALOG: Dict[str, Dict[str, Any]] = {
         "barcode": "4638944332039", "gtin": "04638944332039",
         "composition": "Acrylates/Carbamate Copolymer; Acrylates/VP Copolymer; Acrylates Copolymer; CI 77891; CI 77491; CI 77492; CI 77499; CI 77742",
         "curing_time": "60–90 сек UV/LED",
-        "recommended_upsell": "бриллиантовый топ YaSoKo (арт. 22000)",
+        "recommended_upsell": "соседние оттенки серии (базы и топы YaSoKo — в разработке, как товар не предлагать)",
     },
     "1010": {
         "art": "1010", "shade": "#10", "color_name": "Малиновый Щербет",
@@ -89,7 +88,7 @@ PRODUCTS_CATALOG: Dict[str, Dict[str, Any]] = {
         "barcode": "4638944332046", "gtin": "04638944332046",
         "composition": "Acrylates/Carbamate Copolymer; Acrylates/VP Copolymer; Acrylates Copolymer; CI 77891; CI 77491; CI 77492; CI 77499; CI 77742",
         "curing_time": "60–90 сек UV/LED",
-        "recommended_upsell": "каучуковая эластичная база YaSoKo (арт. 21000)",
+        "recommended_upsell": "соседние оттенки серии (базы и топы YaSoKo — в разработке, как товар не предлагать)",
     },
     "1023": {
         "art": "1023", "shade": "#23", "color_name": "Черничный Мусс",
@@ -100,7 +99,7 @@ PRODUCTS_CATALOG: Dict[str, Dict[str, Any]] = {
         "barcode": "4638944332053", "gtin": "04638944332053",
         "composition": "Acrylates/Carbamate Copolymer; Acrylates/VP Copolymer; Acrylates Copolymer; CI 77891; CI 77491; CI 77492; CI 77499; CI 77742",
         "curing_time": "60–90 сек UV/LED",
-        "recommended_upsell": "бриллиантовый топ YaSoKo (арт. 22000)",
+        "recommended_upsell": "соседние оттенки серии (базы и топы YaSoKo — в разработке, как товар не предлагать)",
     },
     "1028": {
         "art": "1028", "shade": "#28", "color_name": "Миндальное Молоко",
@@ -111,7 +110,7 @@ PRODUCTS_CATALOG: Dict[str, Dict[str, Any]] = {
         "barcode": "4638944332060", "gtin": "04638944332060",
         "composition": "Acrylates/Carbamate Copolymer; Acrylates/VP Copolymer; Acrylates Copolymer; CI 77891; CI 77491; CI 77492; CI 77499; CI 77742",
         "curing_time": "60–90 сек UV/LED",
-        "recommended_upsell": "молочный топ Milky Top (арт. 22002) или прозрачный топ (арт. 22001)",
+        "recommended_upsell": "соседние оттенки серии (базы и топы YaSoKo — в разработке, как товар не предлагать)",
     },
     "1031": {
         "art": "1031", "shade": "#31", "color_name": "Арахисовое Пралине",
@@ -122,7 +121,7 @@ PRODUCTS_CATALOG: Dict[str, Dict[str, Any]] = {
         "barcode": "4638944332077", "gtin": "04638944332077",
         "composition": "Acrylates/Carbamate Copolymer; Acrylates/VP Copolymer; Acrylates Copolymer; CI 77891; CI 77491; CI 77492; CI 77499; CI 77742",
         "curing_time": "60–90 сек UV/LED",
-        "recommended_upsell": "бриллиантовый топ YaSoKo (арт. 22000)",
+        "recommended_upsell": "соседние оттенки серии (базы и топы YaSoKo — в разработке, как товар не предлагать)",
     },
     "1033": {
         "art": "1033", "shade": "#33", "color_name": "Карамельный Макиато",
@@ -133,7 +132,7 @@ PRODUCTS_CATALOG: Dict[str, Dict[str, Any]] = {
         "barcode": "4638944332084", "gtin": "04638944332084",
         "composition": "Acrylates/Carbamate Copolymer; Acrylates/VP Copolymer; Acrylates Copolymer; CI 77891; CI 77491; CI 77492; CI 77499; CI 77742",
         "curing_time": "60–90 сек UV/LED",
-        "recommended_upsell": "топ без липкого слоя YaSoKo (арт. 22001)",
+        "recommended_upsell": "соседние оттенки серии (базы и топы YaSoKo — в разработке, как товар не предлагать)",
     },
     "1103": {
         "art": "1103", "shade": "#39", "color_name": "Ванильная Глазурь",
@@ -144,7 +143,7 @@ PRODUCTS_CATALOG: Dict[str, Dict[str, Any]] = {
         "barcode": "4638944332091", "gtin": "04638944332091",
         "composition": "Acrylates/Carbamate Copolymer; Acrylates/VP Copolymer; Acrylates Copolymer; CI 77891; CI 77491; CI 77492; CI 77499; CI 77742",
         "curing_time": "60–90 сек UV/LED",
-        "recommended_upsell": "бриллиантовый топ YaSoKo (арт. 22000)",
+        "recommended_upsell": "соседние оттенки серии (базы и топы YaSoKo — в разработке, как товар не предлагать)",
     },
     "1104": {
         "art": "1104", "shade": "#40", "color_name": "Розовый Леденец",
@@ -155,7 +154,7 @@ PRODUCTS_CATALOG: Dict[str, Dict[str, Any]] = {
         "barcode": "4638944332107", "gtin": "04638944332107",
         "composition": "Acrylates/Carbamate Copolymer; Acrylates/VP Copolymer; Acrylates Copolymer; CI 77891; CI 77491; CI 77492; CI 77499; CI 77742",
         "curing_time": "60–90 сек UV/LED",
-        "recommended_upsell": "бриллиантовый топ YaSoKo (арт. 22000)",
+        "recommended_upsell": "соседние оттенки серии (базы и топы YaSoKo — в разработке, как товар не предлагать)",
     },
     "1202": {
         "art": "1202", "shade": "#52", "color_name": "Молочный Жемчуг",
@@ -166,7 +165,7 @@ PRODUCTS_CATALOG: Dict[str, Dict[str, Any]] = {
         "barcode": "4638944332114", "gtin": "04638944332114",
         "composition": "Acrylates/Carbamate Copolymer; Acrylates/VP Copolymer; Acrylates Copolymer; CI 77891; CI 77491; CI 77019; CI 77492; CI 77499; CI 77742",
         "curing_time": "60–90 сек UV/LED",
-        "recommended_upsell": "глянцевый топ без УФ-фильтра (арт. 22001), чтобы подчеркнуть мерцание шиммера",
+        "recommended_upsell": "соседние оттенки серии (базы и топы YaSoKo — в разработке, как товар не предлагать)",
     },
     "1204": {
         "art": "1204", "shade": "#54", "color_name": "Клубничный Жемчуг",
@@ -177,7 +176,7 @@ PRODUCTS_CATALOG: Dict[str, Dict[str, Any]] = {
         "barcode": "4638944332121", "gtin": "04638944332121",
         "composition": "Acrylates/Carbamate Copolymer; Acrylates/VP Copolymer; Acrylates Copolymer; CI 77891; CI 77491; CI 77019; CI 77492; CI 77499; CI 77742",
         "curing_time": "60–90 сек UV/LED",
-        "recommended_upsell": "бриллиантовый топ YaSoKo (арт. 22000)",
+        "recommended_upsell": "соседние оттенки серии (базы и топы YaSoKo — в разработке, как товар не предлагать)",
     },
     "1206": {
         "art": "1206", "shade": "#56", "color_name": "Сиреневое Сияние",
@@ -188,7 +187,7 @@ PRODUCTS_CATALOG: Dict[str, Dict[str, Any]] = {
         "barcode": "4638944332138", "gtin": "04638944332138",
         "composition": "Acrylates/Carbamate Copolymer; Acrylates/VP Copolymer; Acrylates Copolymer; CI 77891; CI 77491; CI 77019; CI 77492; CI 77499; CI 77742",
         "curing_time": "60–90 сек UV/LED",
-        "recommended_upsell": "кристально-прозрачный топ YaSoKo (арт. 22001)",
+        "recommended_upsell": "соседние оттенки серии (базы и топы YaSoKo — в разработке, как товар не предлагать)",
     },
     "1302": {
         "art": "1302", "shade": "#59", "color_name": "Жемчужная Жвачка",
@@ -199,7 +198,7 @@ PRODUCTS_CATALOG: Dict[str, Dict[str, Any]] = {
         "barcode": "4638944332145", "gtin": "04638944332145",
         "composition": "Acrylates/Carbamate Copolymer; Acrylates/VP Copolymer; Acrylates Copolymer; CI 77891; CI 77491; CI 77019; CI 77492; CI 77499; CI 77742",
         "curing_time": "60–90 сек UV/LED",
-        "recommended_upsell": "бриллиантовый топ YaSoKo (арт. 22000)",
+        "recommended_upsell": "соседние оттенки серии (базы и топы YaSoKo — в разработке, как товар не предлагать)",
     },
     "1305": {
         "art": "1305", "shade": "#62", "color_name": "Аквамариновая Мечта",
@@ -210,7 +209,7 @@ PRODUCTS_CATALOG: Dict[str, Dict[str, Any]] = {
         "barcode": "4638944332152", "gtin": "04638944332152",
         "composition": "Acrylates/Carbamate Copolymer; Acrylates/VP Copolymer; Acrylates Copolymer; CI 77891; CI 77491; CI 77019; CI 77492; CI 77499; CI 77742",
         "curing_time": "60–90 сек UV/LED",
-        "recommended_upsell": "кристально-прозрачный топ YaSoKo (арт. 22001)",
+        "recommended_upsell": "соседние оттенки серии (базы и топы YaSoKo — в разработке, как товар не предлагать)",
     },
     "1402": {
         "art": "1402", "shade": "#66", "color_name": "Манговое Смузи",
@@ -221,7 +220,7 @@ PRODUCTS_CATALOG: Dict[str, Dict[str, Any]] = {
         "barcode": "4638944332169", "gtin": "04638944332169",
         "composition": "Acrylates/Carbamate Copolymer; Acrylates/VP Copolymer; Acrylates Copolymer; CI 77891; CI 77491; CI 77492; CI 77499; CI 77742",
         "curing_time": "60–90 сек UV/LED",
-        "recommended_upsell": "бриллиантовый топ YaSoKo (арт. 22000)",
+        "recommended_upsell": "соседние оттенки серии (базы и топы YaSoKo — в разработке, как товар не предлагать)",
     },
     "1403": {
         "art": "1403", "shade": "#67", "color_name": "Желе из Личи",
@@ -232,7 +231,7 @@ PRODUCTS_CATALOG: Dict[str, Dict[str, Any]] = {
         "barcode": "4638944332176", "gtin": "04638944332176",
         "composition": "Acrylates/Carbamate Copolymer; Acrylates/VP Copolymer; Acrylates Copolymer; CI 77891; CI 77491; CI 77492; CI 77499; CI 77742",
         "curing_time": "60–90 сек UV/LED",
-        "recommended_upsell": "эластичная каучуковая база YaSoKo (арт. 21000)",
+        "recommended_upsell": "соседние оттенки серии (базы и топы YaSoKo — в разработке, как товар не предлагать)",
     },
     "1405": {
         "art": "1405", "shade": "#69", "color_name": "Голубая Малина",
@@ -243,7 +242,7 @@ PRODUCTS_CATALOG: Dict[str, Dict[str, Any]] = {
         "barcode": "4638944332183", "gtin": "04638944332183",
         "composition": "Acrylates/Carbamate Copolymer; Acrylates/VP Copolymer; Acrylates Copolymer; CI 77891; CI 77491; CI 77492; CI 77499; CI 77742",
         "curing_time": "60–90 сек UV/LED",
-        "recommended_upsell": "бриллиантовый топ YaSoKo (арт. 22000)",
+        "recommended_upsell": "соседние оттенки серии (базы и топы YaSoKo — в разработке, как товар не предлагать)",
     },
     "1408": {
         "art": "1408", "shade": "#72", "color_name": "Виноградная Газировка",
@@ -254,7 +253,7 @@ PRODUCTS_CATALOG: Dict[str, Dict[str, Any]] = {
         "barcode": "4638944332190", "gtin": "04638944332190",
         "composition": "Acrylates/Carbamate Copolymer; Acrylates/VP Copolymer; Acrylates Copolymer; CI 77891; CI 77491; CI 77492; CI 77499; CI 77742",
         "curing_time": "60–90 сек UV/LED",
-        "recommended_upsell": "бриллиантовый топ YaSoKo (арт. 22000)",
+        "recommended_upsell": "соседние оттенки серии (базы и топы YaSoKo — в разработке, как товар не предлагать)",
     },
     "1503": {
         "art": "1503", "shade": "#75", "color_name": "Сахарная Вата",
@@ -265,7 +264,7 @@ PRODUCTS_CATALOG: Dict[str, Dict[str, Any]] = {
         "barcode": "4638944332206", "gtin": "04638944332206",
         "composition": "Acrylates/Carbamate Copolymer; Acrylates/VP Copolymer; Acrylates Copolymer; CI 77891; CI 77491; CI 77492; CI 77499; CI 77742",
         "curing_time": "60–90 сек UV/LED",
-        "recommended_upsell": "кристально-прозрачный топ YaSoKo (арт. 22001)",
+        "recommended_upsell": "соседние оттенки серии (базы и топы YaSoKo — в разработке, как товар не предлагать)",
     },
     "1511": {
         "art": "1511", "shade": "#83", "color_name": "Клубничный Коктейль",
@@ -276,7 +275,7 @@ PRODUCTS_CATALOG: Dict[str, Dict[str, Any]] = {
         "barcode": "4638944332213", "gtin": "04638944332213",
         "composition": "Acrylates/Carbamate Copolymer; Acrylates/VP Copolymer; Acrylates Copolymer; CI 77891; CI 77491; CI 77492; CI 77499; CI 77742",
         "curing_time": "60–90 сек UV/LED",
-        "recommended_upsell": "эластичная каучуковая база YaSoKo (арт. 21000)",
+        "recommended_upsell": "соседние оттенки серии (базы и топы YaSoKo — в разработке, как товар не предлагать)",
     },
 
     # --- ДРУГИЕ ГЕЛИ КАТАЛОГА ---
@@ -288,7 +287,7 @@ PRODUCTS_CATALOG: Dict[str, Dict[str, Any]] = {
         "formula": "9-FREE", "ozon_sku": None, "wb_sku": None, "barcode": "4638944332428", "gtin": "04638944332428",
         "composition": "Acrylated Aliphatic Urethane; 1-Hydroxycyclohexyl Phenyl Ketone; 2-Hydroxyethyl Methacrylate",
         "curing_time": "60–90 сек UV/LED",
-        "recommended_upsell": "топ без липкого слоя YaSoKo (арт. 22000)",
+        "recommended_upsell": "соседние оттенки серии (базы и топы YaSoKo — в разработке, как товар не предлагать)",
     },
     "1601": {
         "art": "1601", "shade": "#85", "color_name": "Персиковый Парфе (Peach Parfait)",
@@ -298,7 +297,7 @@ PRODUCTS_CATALOG: Dict[str, Dict[str, Any]] = {
         "ozon_sku": None, "wb_sku": None, "barcode": "4638944332299", "gtin": "04638944332299",
         "composition": "Acrylates/Carbamate Copolymer; Acrylates/VP Copolymer; VP/DMAPA Acrylates Copolymer; 1-Hydroxycyclohexyl Phenyl Ketone; 2-Hydroxyethyl Methacrylate; CI 77891; CI 77491",
         "curing_time": "60–90 сек UV/LED",
-        "recommended_upsell": "молочный топ Milky Top (арт. 22002)",
+        "recommended_upsell": "соседние оттенки серии (базы и топы YaSoKo — в разработке, как товар не предлагать)",
     },
     "1701": {
         "art": "1701", "shade": "#101", "color_name": "Сиреневый Блеск (Lilac Sparkle)",
@@ -308,7 +307,7 @@ PRODUCTS_CATALOG: Dict[str, Dict[str, Any]] = {
         "ozon_sku": None, "wb_sku": None, "barcode": "4638944332350", "gtin": "04638944332350",
         "composition": "Acrylates/Carbamate Copolymer; Acrylates/VP Copolymer; Acrylates Copolymer; CI 77891; CI 77491; CI 77019; CI 77492; CI 77499; CI 77742",
         "curing_time": "60–90 сек UV/LED",
-        "recommended_upsell": "кристально-прозрачный топ YaSoKo без УФ-фильтра (арт. 22001)",
+        "recommended_upsell": "соседние оттенки серии (базы и топы YaSoKo — в разработке, как товар не предлагать)",
     },
 
     # --- БАЗЫ ДЛЯ НОГТЕЙ (15 мл) ---
@@ -321,7 +320,7 @@ PRODUCTS_CATALOG: Dict[str, Dict[str, Any]] = {
         "ozon_sku": None, "wb_sku": None, "barcode": "4638944332237", "gtin": "04638944332237",
         "composition": "Styrene/Acrylates Copolymer; Acrylates Copolymer; VP/DMAPA Acrylates Copolymer; Isobornyl Acrylate; 1-Hydroxycyclohexyl Phenyl Ketone; Ethyl (2,4,6-trimethylbenzoyl) Phenylphosphinate",
         "description": "Эластичная каучуковая база. Идеальна для тонких и слоящихся ногтей, а также в качестве тонкой амортизирующей подложки под твердые гели для моделирования.",
-        "recommended_upsell": "камуфлирующий гель YaSoKo (арт. 1001 или 1028) и бриллиантовый топ (арт. 22000)",
+        "recommended_upsell": "соседние оттенки серии (базы и топы YaSoKo — в разработке, как товар не предлагать)",
     },
     "21001": {
         "art": "21001", "model": "D5A",
@@ -332,7 +331,7 @@ PRODUCTS_CATALOG: Dict[str, Dict[str, Any]] = {
         "ozon_sku": None, "wb_sku": None, "barcode": "4638944332244", "gtin": "04638944332244",
         "composition": "Styrene/Acrylates Copolymer; Acrylates Copolymer; VP/DMAPA Acrylates Copolymer; 1-Hydroxycyclohexyl Phenyl Ketone; Trimethylbenzoyl Diphenylphosphine Oxide; Isobornyl Acrylate",
         "description": "Жесткая база для армирования свободного края, укрепления длины и ремонта ногтей без проседания.",
-        "recommended_upsell": "топ без липкого слоя YaSoKo (арт. 22000)",
+        "recommended_upsell": "соседние оттенки серии (базы и топы YaSoKo — в разработке, как товар не предлагать)",
     },
     "21002": {
         "art": "21002", "model": "D5C",
@@ -343,7 +342,7 @@ PRODUCTS_CATALOG: Dict[str, Dict[str, Any]] = {
         "ozon_sku": None, "wb_sku": None, "barcode": "4638944332251", "gtin": "04638944332251",
         "composition": "Acrylates/VP Copolymer; VP/DMAPA Acrylates Copolymer; Acrylates Copolymer; 1-Hydroxycyclohexyl Phenyl Ketone; Diphenyl(2,4,6-trimethylbenzoyl)phosphine Oxide",
         "description": "Жидкая адгезивная база для гелевых типс, скоростного выравнивания и надежной фиксации декора.",
-        "recommended_upsell": "камуфлирующий гель YaSoKo (арт. 1001, 1002)",
+        "recommended_upsell": "соседние оттенки серии (базы и топы YaSoKo — в разработке, как товар не предлагать)",
     },
 
     # --- ТОПЫ ДЛЯ НОГТЕЙ (15 мл) ---
@@ -356,7 +355,7 @@ PRODUCTS_CATALOG: Dict[str, Dict[str, Any]] = {
         "ozon_sku": None, "wb_sku": None, "barcode": "4638944332268", "gtin": "04638944332268",
         "composition": "Acrylates/VP Copolymer; Acrylates Copolymer; VP/DMAPA Acrylates Copolymer; 2-Hydroxyethyl Methacrylate; Diphenyl(2,4,6-trimethylbenzoyl)phosphine Oxide; Hydroxycyclohexyl Phenyl Ketone",
         "description": "Глянцевый финиш с оптическим осветлителем (УФ-фильтром). Сохраняет зеркальный блеск до 4 недель, предотвращает пожелтение светлых и пастельных оттенков.",
-        "recommended_upsell": "камуфлирующий гель YaSoKo светлых тонов (#01, #28)",
+        "recommended_upsell": "соседние оттенки серии (базы и топы YaSoKo — в разработке, как товар не предлагать)",
     },
     "22001": {
         "art": "22001", "model": "F130D",
@@ -367,7 +366,7 @@ PRODUCTS_CATALOG: Dict[str, Dict[str, Any]] = {
         "ozon_sku": None, "wb_sku": None, "barcode": "4638944332275", "gtin": "04638944332275",
         "composition": "Acrylates/Carbamate Copolymer; Acrylates Copolymer; VP/DMAPA Acrylates Copolymer; Diphenyl(2,4,6-trimethylbenzoyl)phosphine Oxide; 2-Hydroxyethyl Methacrylate",
         "description": "Кристально-прозрачный топ без синего отлива. Идеально передает глубину темных цветов, мерцание шиммера и гель-лаков с эффектом «кошачий глаз».",
-        "recommended_upsell": "гель YaSoKo серии «Кошачий глаз» (арт. 1701) или гели с шиммером (арт. 1202, 1204, 1206)",
+        "recommended_upsell": "соседние оттенки серии (базы и топы YaSoKo — в разработке, как товар не предлагать)",
     },
     "22002": {
         "art": "22002", "model": "Milky Top",
@@ -378,7 +377,7 @@ PRODUCTS_CATALOG: Dict[str, Dict[str, Any]] = {
         "ozon_sku": None, "wb_sku": None, "barcode": "4638944332282", "gtin": "04638944332282",
         "composition": "Acrylates/Carbamate Copolymer; Acrylates/VP Copolymer; Acrylates Copolymer; CI 77891",
         "description": "Полупрозрачный молочный топ. Мягко сглаживает переход у кутикулы, идеален для создания градиента (бэбибумер) и френч-дизайна.",
-        "recommended_upsell": "камуфлирующие гели YaSoKo #01 Ванильный Крем или #02 Зефирная Мечта",
+        "recommended_upsell": "соседние оттенки серии (базы и топы YaSoKo — в разработке, как товар не предлагать)",
     },
 }
 

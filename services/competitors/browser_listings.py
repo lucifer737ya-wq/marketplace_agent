@@ -44,7 +44,22 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
 
-WB_SEARCH_RE = re.compile(r"search\.wb\.ru/.*/search\?")
+# С осени 2026 сайт ходит за выдачей не на search.wb.ru, а на собственный путь
+# www.wildberries.ru/__internal/u-search/... (источник: открытый wb-serp-tracker). Прежний
+# регэксп его не ловил — перехват ответа не срабатывал, и отчёт писал «антибот не пройден».
+WB_SEARCH_RE = re.compile(r"(?:search\.wb\.ru/.*/search\?|/__internal/u-search/.*/search\?)")
+WB_INPAGE_SEARCH = (
+    "/__internal/u-search/exactmatch/ru/common/v18/search"
+    "?ab_testing=false&appType=1&curr=rub&dest=-1257786&lang=ru&page={page}"
+    "&query={query}&resultset=catalog&sort=popular&spp=30&suppressSpellcheck=false"
+)
+
+STEALTH_INIT_SCRIPT = """
+Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+Object.defineProperty(navigator, 'languages', {get: () => ['ru-RU', 'ru', 'en-US', 'en']});
+Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+window.chrome = window.chrome || {runtime: {}};
+"""
 WB_CARD_RE = re.compile(r"card\.wb\.ru/.*/detail")
 OZON_ITEM_RE = re.compile(r"/product/[^\"\\?#]*-([1-9]\d{5,})(?:/|[?#]|$)")
 
@@ -262,6 +277,89 @@ def parse_ozon_widget_states(
     return items
 
 
+def _walk_dicts(node: Any, depth: int = 0):
+    if depth > 10:
+        return
+    if isinstance(node, dict):
+        yield node
+        for value in node.values():
+            yield from _walk_dicts(value, depth + 1)
+    elif isinstance(node, list):
+        for value in node:
+            yield from _walk_dicts(value, depth + 1)
+
+
+def parse_ozon_tile_grid(payload: Any, limit: int = 15) -> List[Dict[str, Any]]:
+    """Карточки из tileGrid/searchResults виджетов Ozon: цена, название, рейтинг, отзывы.
+
+    В плитках цена лежит в mainState → priceV2 → price[], название — в textAtom, рейтинг и
+    число отзывов — в labelList (testInfo.automatizationId). Прежний разбор искал price на
+    верхнем уровне и находил 1 карточку из 36, а рейтинг всегда был «нет данных».
+    """
+    widgets = payload.get("widgetStates") if isinstance(payload, dict) else None
+    if not isinstance(widgets, dict):
+        return []
+    items: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for key, raw in widgets.items():
+        if not any(m in str(key) for m in ("tileGrid", "searchResults", "megaPagination")):
+            continue
+        try:
+            data = json.loads(raw) if isinstance(raw, str) else raw
+        except (ValueError, TypeError):
+            continue
+        for tile in (data or {}).get("items") or []:
+            if not isinstance(tile, dict):
+                continue
+            link = str(((tile.get("action") or {}).get("link")) or "")
+            match = OZON_ITEM_RE.search(link)
+            sku = str(tile.get("sku") or (match.group(1) if match else "")).strip()
+            if not sku or sku in seen:
+                continue
+            price = 0.0
+            name = ""
+            rating = 0.0
+            reviews = 0
+            for node in _walk_dicts(tile.get("mainState") or []):
+                if "priceV2" in node and not price:
+                    for entry in (node["priceV2"] or {}).get("price") or []:
+                        if isinstance(entry, dict) and entry.get("textStyle") in (None, "PRICE"):
+                            price = _num(entry.get("text"))
+                            if price > 0:
+                                break
+                if "textAtom" in node and isinstance(node["textAtom"], dict):
+                    text = str(node["textAtom"].get("text") or "").strip()
+                    if len(text) > len(name) and not _CARD_NOISE_RE.fullmatch(text):
+                        name = text
+                if isinstance(node.get("labelList"), dict):
+                    for label in node["labelList"].get("items") or []:
+                        if not isinstance(label, dict):
+                            continue
+                        aid = str((label.get("testInfo") or {}).get("automatizationId") or "").lower()
+                        title = str(label.get("title") or "")
+                        if "rating" in aid:
+                            rating = _num(title)
+                        elif "comment" in aid or "review" in aid:
+                            reviews = int(_num(re.sub(r"[^\d]", "", title) or "0"))
+            if price <= 0 or not name:
+                continue
+            seen.add(sku)
+            items.append(
+                {
+                    "mp": "OZON",
+                    "sku": sku,
+                    "name": name[:180],
+                    "brand": str(tile.get("brand") or "").strip() or "Без бренда",
+                    "rating": round(min(max(rating, 0.0), 5.0), 1),
+                    "feedbacks": max(reviews, 0),
+                    "buyer_price": round(price, 2),
+                }
+            )
+            if len(items) >= max(int(limit), 1):
+                return items
+    return items
+
+
 _CARD_NOISE_RE = re.compile(
     r"(?:\+\s*\d+\s*морков\w*|бренд проверен|чёрная пятница|черная пятница|"
     r"стало дешевле|новинка|хит продаж|распродажа|опция|осталось\s+\d+\s*шт\.?|"
@@ -331,18 +429,49 @@ class _BrowserUnavailable(RuntimeError):
     """Playwright или его браузер не установлен на этом хосте."""
 
 
+def _playwright_factory():
+    """patchright (сборка Playwright, устойчивая к детекту) — если установлен, иначе playwright."""
+    try:
+        from patchright.async_api import async_playwright  # type: ignore
+
+        return async_playwright
+    except Exception:  # noqa: BLE001
+        from playwright.async_api import async_playwright
+
+        return async_playwright
+
+
 async def _launch(p):
+    """Запуск с установленным Chrome/Edge (канал), затем встроенный Chromium как резерв."""
     LISTING_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
-    return await p.chromium.launch_persistent_context(
-        user_data_dir=str(LISTING_PROFILE_DIR),
-        headless=True,
-        args=BROWSER_ARGS,
-        env=_direct_env(),
-        viewport=VIEWPORT,
-        user_agent=USER_AGENT,
-        locale="ru-RU",
-        timezone_id="Europe/Moscow",
-    )
+    channel = str(getattr(settings, "LISTINGS_BROWSER_CHANNEL", "chrome") or "").strip()
+    headless = bool(getattr(settings, "LISTINGS_BROWSER_HEADLESS", True))
+    channels = [c for c in (channel, "msedge" if channel == "chrome" else "") if c] + [""]
+    last_exc: Exception | None = None
+    for ch in channels:
+        kwargs = dict(
+            user_data_dir=str(LISTING_PROFILE_DIR),
+            headless=headless,
+            args=BROWSER_ARGS,
+            env=_direct_env(),
+            viewport=VIEWPORT,
+            user_agent=USER_AGENT,
+            locale="ru-RU",
+            timezone_id="Europe/Moscow",
+        )
+        if ch:
+            kwargs["channel"] = ch
+        try:
+            context = await p.chromium.launch_persistent_context(**kwargs)
+        except Exception as exc:  # noqa: BLE001 — пробуем следующий канал
+            last_exc = exc
+            continue
+        try:
+            await context.add_init_script(STEALTH_INIT_SCRIPT)
+        except Exception:  # noqa: BLE001
+            pass
+        return context
+    raise last_exc or RuntimeError("браузер не запустился")
 
 
 async def _close(context) -> None:
@@ -377,7 +506,7 @@ async def _wb_search_uncached(
     query: str, limit: int = 15
 ) -> Tuple[List[Dict[str, Any]], Optional[str]]:
     try:
-        from playwright.async_api import async_playwright
+        async_playwright = _playwright_factory()
     except Exception as exc:  # noqa: BLE001
         raise _BrowserUnavailable(f"Playwright недоступен: {exc}") from exc
 
@@ -420,6 +549,31 @@ async def _wb_search_uncached(
                 await asyncio.sleep(0.5)
             if not captured:
                 await asyncio.sleep(POST_CHALLENGE_PAUSE_SEC)
+            if not captured:
+                # Запрос из контекста страницы (приём krein15/marketplace-parser): браузер уже
+                # решил JVO1, куки токена на месте, TLS-отпечаток и заголовки настоящие.
+                pages_needed = max(1, min(-(-int(limit) // 100), 3))
+                for page_no in range(1, pages_needed + 1):
+                    try:
+                        payload = await page.evaluate(
+                            """async (url) => {
+                                const r = await fetch(url, {credentials: 'include',
+                                    headers: {'Accept': '*/*'}});
+                                if (!r.ok) return {__status: r.status};
+                                return await r.json();
+                            }""",
+                            WB_INPAGE_SEARCH.format(page=page_no, query=_quote(query)),
+                        )
+                    except Exception:  # noqa: BLE001
+                        break
+                    body = (payload or {}).get("data") or payload
+                    if isinstance(body, dict) and isinstance(body.get("products"), list):
+                        captured.append(body["products"])
+                    else:
+                        break
+                if len(captured) > 1:
+                    merged = [pr for chunk in captured for pr in chunk]
+                    captured[:] = [merged]
             if captured:
                 items = parse_wb_products(captured[0], limit)
                 if items:
@@ -487,7 +641,7 @@ async def _ozon_search_uncached(
     query: str, limit: int = 15
 ) -> Tuple[List[Dict[str, Any]], Optional[str]]:
     try:
-        from playwright.async_api import async_playwright
+        async_playwright = _playwright_factory()
     except Exception as exc:  # noqa: BLE001
         raise _BrowserUnavailable(f"Playwright недоступен: {exc}") from exc
 
@@ -508,6 +662,38 @@ async def _ozon_search_uncached(
             except Exception as exc:  # noqa: BLE001
                 return [], f"Ozon: главная не открылась ({exc})"
             await asyncio.sleep(3.0)  # прогрев антибот-сессии
+
+            # Основной путь — JSON entrypoint-api (страницы по ~36 плиток), запрос из контекста
+            # страницы ozon.ru. HTML-страница поиска остаётся резервом ниже.
+            tile_items: List[Dict[str, Any]] = []
+            pages_needed = max(1, min(-(-int(limit) // 36), 3))
+            for page_no in range(1, pages_needed + 1):
+                api_url = (
+                    "/api/entrypoint-api.bx/page/json/v2?url="
+                    + _quote(
+                        f"/search/?text={_quote(query)}&from_global=true"
+                        + (f"&page={page_no}" if page_no > 1 else "")
+                    )
+                )
+                try:
+                    api_payload = await page.evaluate(
+                        """async (url) => {
+                            const r = await fetch(url, {credentials: 'include',
+                                headers: {'x-o3-app-name': 'dweb_client'}});
+                            if (!r.ok) return null;
+                            return await r.json();
+                        }""",
+                        api_url,
+                    )
+                except Exception:  # noqa: BLE001
+                    break
+                chunk = parse_ozon_tile_grid(api_payload, limit) if api_payload else []
+                known = {i["sku"] for i in tile_items}
+                tile_items.extend(i for i in chunk if i["sku"] not in known)
+                if not chunk or len(tile_items) >= int(limit):
+                    break
+            if tile_items:
+                return tile_items[: max(int(limit), 1)], None
 
             search_path = (
                 "https://www.ozon.ru/search/?text=" + _quote(query) + "&from_global=true"

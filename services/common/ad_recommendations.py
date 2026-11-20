@@ -498,6 +498,7 @@ def analyze_ozon_campaigns(
     zero_stock_promoted: Set[str] = set()
     low_stock_promoted: Set[str] = set()
 
+    skipped_empty = 0
     for camp in raw_campaigns:
         if not isinstance(camp, dict) or not _is_campaign_active(camp):
             continue
@@ -524,6 +525,17 @@ def analyze_ozon_campaigns(
         drr_raw = camp.get("drr_in_promo_pct")
         if drr_raw is None:
             drr_raw = camp.get("drr_pct")
+
+        # Аудит — только по реально работающим кампаниям: «пустая» РК (нет товаров и нет расхода
+        # за период) — это хвост истории кабинета; из-за неё раньше отчёт показывал 290+ кампаний,
+        # а все SKU считались «с неподтверждённым статусом рекламы».
+        try:
+            has_spend = spend_raw is not None and float(spend_raw) > 0.0
+        except (TypeError, ValueError):
+            has_spend = False
+        if not resolved_skus and not has_spend:
+            skipped_empty += 1
+            continue
 
         spend_rub = _round_rub(spend_raw) if spend_raw is not None else None
         revenue_rub = _round_rub(rev_raw) if rev_raw is not None else None
@@ -589,6 +601,7 @@ def analyze_ozon_campaigns(
         "campaigns_available": True,
         "campaigns_error": None,
         "campaigns": parsed_campaigns,
+        "skipped_empty_campaigns": skipped_empty,
         "promoted_skus": sorted(promoted_set),
         "organic_items": organic_items,
         "unclassified_items": unclassified_items,
@@ -696,6 +709,12 @@ def _render_factual_ads_header(
                     f"  ├ Арт. <code>{safe_sku}</code>: FBO {card['stock_fbo']} / FBS {card['stock_fbs']} шт. | "
                     f"{_format_unit_profit_brief(card)}"
                 )
+
+    if oz_analysis.get("skipped_empty_campaigns"):
+        lines.append(
+            f"\nℹ️ <i>Скрыто кампаний без товаров и без расхода за 7 дн.: "
+            f"{oz_analysis['skipped_empty_campaigns']} (хвост истории кабинета, в аудит не входят).</i>"
+        )
 
     if oz_analysis["organic_items"]:
         lines.append(
@@ -909,9 +928,15 @@ async def generate_weekly_ads_report_and_recommendations(ozon_api, wb_api) -> st
     acq_pct = _safe_nonneg(getattr(settings, "ACQUIRING_RATE", 0.015), 0.015) * 100.0
     high_comm_pct = _safe_nonneg(getattr(settings, "OZON_HIGH_COMMISSION_RATE", 0.52), 0.52) * 100.0
 
+    from services.common.expert_profiles import build_expert_preamble
+
+    expert_preamble = await build_expert_preamble(("ads", "cfo"), with_cabinets=True)
+
     prompt = (
         "Ты — финансовый аналитик и performance-директор бренда YaSoKo "
         "(моделирующие гели, базы и топы для ногтей 15 г, ИП на УСН).\n\n"
+        + expert_preamble
+        + "\n\n"
         "СТРОГИЕ ФИНАНСОВЫЕ ПРАВИЛА (ЗАПРЕЩЕНО НАРУШАТЬ ИЛИ ВЫДУМЫВАТЬ ЦИФРЫ):\n"
         f"- Налог УСН = {tax_pct:.0f}%, эквайринг = {acq_pct:.1f}%, комиссия Ozon до 300 ₽ — из API (22–23%), "
         f"свыше 300 ₽ — {high_comm_pct:.0f}% (не советовать ловушку 301–450 ₽).\n"
@@ -925,13 +950,21 @@ async def generate_weekly_ads_report_and_recommendations(ozon_api, wb_api) -> st
         "3. АКТИВНЫЕ ТОВАРЫ И ОСТАТКИ WILDBERRIES (FBO и FBS):\n"
         + ("\n".join(wb_summary) or "Нет подтвержденных остатков WB.")
         + "\n\n"
-        "СОСТАВЬ КРАТКИЙ ПЛАН ДЕЙСТВИЙ ПО 4 РАЗДЕЛАМ БЕЗ ВОДЫ:\n"
-        "1. Раздельный аудит каждой активной кампании Ozon (состав SKU, фактический ДРР в продвижении, "
-        "поштучная прибыль против безубыточного ДРР, корректировка целевой ставки и защита остатков < 2 дней).\n"
-        "2. Органические SKU Ozon вне рекламы (какие артикулы оставить в органике, а какие тестировать в РК при достаточном остатке).\n"
-        "3. План по ВБ.Продвижению с учетом текущих остатков FBO/FBS и фактического ДРР.\n"
-        "4. Контрольные точки проверки через 24 ч, 72 ч и 7 дней.\n"
-        "Форматирование: только HTML-теги <b>, <i>, <code>. Не используй Markdown (**, ###) и таблицы."
+        "В JSON — ТОЛЬКО АКТИВНЫЕ кампании (пустые и остановленные уже отфильтрованы). "
+        "СОСТАВЬ ПЛАН ДЕЙСТВИЙ ПО 4 РАЗДЕЛАМ БЕЗ ВОДЫ:\n"
+        "1. Аудит каждой активной кампании Ozon: состав SKU, фактический ДРР, поштучная прибыль против безубыточного ДРР, "
+        "защита остатков < 2 дней.\n"
+        "2. КЕЙСЫ (2–4 штуки, по убыванию эффекта). Формат каждого кейса:\n"
+        "   • Кейс N: какой SKU/кампания и какая цель.\n"
+        "   • Какая кампания и тип (как называется в ЛК), какой бюджет/ставка и ОТКУДА число (формула: безубыточный ДРР × цена × запас, "
+        "ставка за клик = цена × конверсия × целевой ДРР и т.п.; если конверсии нет в данных — «н/д»).\n"
+        "   • ПОЧЕМУ эта кампания, ПОЧЕМУ НЕ другие типы (одной фразой на каждый альтернативный тип).\n"
+        "   • Пошагово в ЛК: раздел → кнопка → поле → значение.\n"
+        "   • Ожидаемый результат в ₽/нед и порог отката.\n"
+        "3. Органические SKU Ozon вне рекламы: какие оставить в органике, какие тестировать при остатке 14+ дней.\n"
+        "4. План по ВБ.Продвижению с учётом остатков, комиссии и факта продаж + контрольные точки 24 ч / 72 ч / 7 дн.\n"
+        "Форматирование: только HTML-теги <b>, <i>, <code>. Не используй Markdown (**, ###) и таблицы.\n"
+        "Названия кнопок ЛК бери из блока «СХЕМЫ ЛК»; если сомневаешься — пиши «сверьте название в ЛК»."
     )
 
     ai_block = await _call_gemini_unlimited(prompt)

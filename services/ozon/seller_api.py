@@ -102,6 +102,18 @@ def _collect_item_fee_skus(node) -> set[str]:
     return found
 
 
+
+def _campaign_in_window(campaign: Dict[str, Any], today: str) -> bool:
+    """Кампания «действует сегодня»: fromDate <= сегодня <= toDate (пустые даты — без ограничения)."""
+    start = str(campaign.get("fromDate") or "")[:10]
+    finish = str(campaign.get("toDate") or "")[:10]
+    if start and start > today:
+        return False
+    if finish and finish < today:
+        return False
+    return True
+
+
 class OzonSellerAPI(MarketplaceClient):
     BASE_URL = "https://api-seller.ozon.ru"
     PERF_URL = "https://api-performance.ozon.ru"
@@ -418,6 +430,9 @@ class OzonSellerAPI(MarketplaceClient):
                 "/api/client/campaign", "list", state="CAMPAIGN_STATE_RUNNING"
             )
             if c.get("state") in {"CAMPAIGN_STATE_RUNNING", "RUNNING", "ACTIVE"}
+            # RUNNING по документации не гарантирует окно показов: у кампаний с истёкшим
+            # toDate или будущим fromDate показов нет — в активные их не берём.
+            and _campaign_in_window(c, end.isoformat())
         ]
         cpo_count = sum(c.get("advObjectType") == "SEARCH_PROMO" for c in running)
         for c in running:

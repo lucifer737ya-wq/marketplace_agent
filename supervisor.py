@@ -280,11 +280,14 @@ class WorkerSupervisor:
             verify=self.verify_patch,
             after_rollback=lambda: asyncio.to_thread(self.start_worker),
         )
+        # Тихий ночной режим молчит, если нет ошибок КОДА; предупреждения среды (лимит API и т.п.)
+        # не повод будить владельца.
         if result["total_issues"] or not silent_if_healthy:
             await notify(
-                f"Диагностика: ошибок {result['total_issues']}, исправлено {result['healed_count']}"
+                result.get("summary")
+                or f"Диагностика: ошибок {result['total_issues']}, исправлено {result['healed_count']}"
             )
-            for line in result["details"]:
+            for line in result.get("details_plain") or result["details"]:
                 await notify(str(line))
 
     def _schedule_restart_backoff(self, exc: BaseException) -> None:

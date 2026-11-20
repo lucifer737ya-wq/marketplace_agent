@@ -699,6 +699,7 @@ async def sync_and_generate_orders_report(
             f" | факт. <b>{_div_rub(wb_log, wb_count):.2f} ₽/заказ</b>" if wb_count > 0 else ""
         )
         wb_missing_note = _format_missing_cogs_note(wb_missing_cogs, wb_missing_skus)
+        wb_comm_tag = " (оценка по Sales API)" if wb_fin.get("commission_estimated") else ""
 
         wb_block = (
             f"🟣 <b>WILDBERRIES ({wb_source}):</b>\n"
@@ -707,7 +708,7 @@ async def sync_and_generate_orders_report(
             f"• <b>Цена для покупателя с СПП (база УСН): {_fmt_money(wb_rev_b)} ₽</b>\n"
             f"• <b>Удержания WB (всего): {_fmt_expense(wb_ded_tot)}</b> ({_pct(wb_ded_tot, wb_rev_s)})\n\n"
             f"<b>Детализация расходов Wildberries:</b>\n"
-            f"• <b>Вознаграждение WB (с НДС): {_fmt_expense(wb_comm)}</b> ({_pct(wb_comm, wb_rev_s)})\n"
+            f"• <b>Вознаграждение WB (с НДС){wb_comm_tag}: {_fmt_expense(wb_comm)}</b> ({_pct(wb_comm, wb_rev_s)})\n"
             f"• <b>{wb_acq_title}: {_fmt_expense(wb_acq)}</b> ({_pct(wb_acq, wb_rev_s)})\n"
             f"• <b>Услуги логистики WB: {_fmt_expense(wb_log)}</b> ({_pct(wb_log, wb_rev_s)}{wb_log_unit_str})\n"
             f"  ├ Прямая доставка до покупателя: {_fmt_expense(wb_log_dir)}\n"

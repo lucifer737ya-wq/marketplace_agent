@@ -617,6 +617,29 @@ async def cmd_top5_report(message: Message) -> None:
         )
 
 
+def _split_plain_text(text: str, limit: int = 3800) -> List[str]:
+    """Делит длинный текст на сообщения Telegram по абзацам/строкам, не обрывая фразы."""
+    parts: List[str] = []
+    current = ""
+    for block in text.split("\n"):
+        while len(block) > limit:  # одна сверхдлинная строка
+            cut = block.rfind(" ", 0, limit)
+            cut = cut if cut > limit // 2 else limit
+            if current:
+                parts.append(current)
+                current = ""
+            parts.append(block[:cut])
+            block = block[cut:].lstrip()
+        if len(current) + len(block) + 1 > limit:
+            parts.append(current)
+            current = block
+        else:
+            current = f"{current}\n{block}" if current else block
+    if current.strip():
+        parts.append(current)
+    return [p for p in parts if p.strip()] or [text[:limit]]
+
+
 @dp.message(F.text == "🧠 ИИ-Советник (Разбор)")
 @dp.message(Command("ai_board"))
 async def cmd_ai_board(message: Message) -> None:
@@ -632,7 +655,8 @@ async def cmd_ai_board(message: Message) -> None:
         await _safe_delete_message(status_msg)
         if not str(summary_text).strip():
             summary_text = "⚠️ Совет ИИ вернул пустой ответ. Полный HTML-отчёт ниже."
-        await _tg_retry(lambda: message.answer(summary_text))
+        for part in _split_plain_text(str(summary_text)):
+            await _tg_retry(lambda part=part: message.answer(part))
         if file_path is not None and Path(file_path).exists():
             await _tg_retry(
                 lambda: message.answer_document(
@@ -821,21 +845,27 @@ async def cmd_manual_self_heal(message: Message) -> None:
         await wait_msg.edit_text(f"❌ Ошибка самодиагностики: <code>{html.escape(str(exc))}</code>", parse_mode="HTML")
         return
 
-    await wait_msg.delete()
+    await _safe_delete_message(wait_msg)
+    warn_note = (
+        f"\nℹ️ Предупреждений среды/API: <b>{res.get('env_warnings', 0)}</b> (не требуют правки кода)"
+        if res.get("env_warnings")
+        else ""
+    )
+    details_txt = "\n".join(res["details"])
     if res["total_issues"] == 0:
-        await message.answer(
-            "✅ <b>Все модули работают исправно:</b> ошибок не обнаружено, вмешательство ИИ не требуется.",
-            parse_mode="HTML",
+        text = (
+            "✅ <b>Ошибок кода не обнаружено</b>, вмешательство ИИ не требуется." + warn_note
+            + (f"\n\n{details_txt}" if details_txt else "")
         )
     else:
-        details_txt = "\n".join(res["details"])
-        await message.answer(
+        text = (
             f"🛠 <b>Результаты самодиагностики и починки:</b>\n\n"
-            f"Обнаружено сбоев: <b>{res['total_issues']}</b>\n"
-            f"Исправлено: <b>{res['healed_count']}</b>\n\n"
-            f"{details_txt}",
-            parse_mode="HTML",
+            f"Ошибок кода: <b>{res['total_issues']}</b>\n"
+            f"Исправлено: <b>{res['healed_count']}</b>{warn_note}\n\n"
+            f"{details_txt}"
         )
+    for chunk in _split_html_chunks(text):
+        await _tg_retry(lambda chunk=chunk: message.answer(chunk, parse_mode="HTML"))
 
 
 async def setup_bot_commands(bot_instance: Bot) -> None:

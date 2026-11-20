@@ -26,7 +26,10 @@ class QuestionRetry(unittest.IsolatedAsyncioTestCase):
     async def test_negated_mention_is_published_without_retry(self):
         reply = "Здравствуйте! Гель средне-вязкий; не разбавляйте его спиртом."
         with patch.object(buyer_questions, "call_fast_gemini", AsyncMock(return_value=reply)) as mock:
-            self.assertEqual(await buyer_questions.generate_buyer_question_answer("Густой?", "1010"), reply)
+            answer = await buyer_questions.generate_buyer_question_answer("Густой?", "1010")
+        # К ответу добавляется ненавязчивый анонс баз и топов (в разработке) — исходный текст сохранён.
+        self.assertTrue(answer.startswith(reply))
+        self.assertIn("топ", answer.lower())
         self.assertEqual(mock.await_count, 1)
 
     async def test_unsafe_then_safe_reply_is_retried_with_strict_prompt(self):

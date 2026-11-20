@@ -163,23 +163,28 @@ def _cogs(row: Any) -> float:
     )
 
 
+def _pct_ru(value: float) -> str:
+    """18.2 → «18,2%» (десятичная запятая, знак для убытка)."""
+    return f"{value:+.1f}%".replace(".", ",") if value < 0 else f"{value:.1f}%".replace(".", ",")
+
+
 def _line(label: str, art: str, current: float, cogs: float, rates: Rates, *,
           tiered: bool, ratio: float) -> str:
+    """Строка «Цены в ЛК»: фактическая чистая прибыль и её процент от цены, цена «в ноль»."""
     cur_profit = profit_at(current, cogs, rates, limit=float(settings.OZON_LOW_PRICE_LIMIT) if tiered else None,
                            tax_base_ratio=ratio) if current > 0 else None
     be = solve_price(cogs, rates, 0.0, tiered=tiered, tax_base_ratio=ratio)
-    goal = solve_price(cogs, rates, settings.PRICE_TARGET_MARGIN, tiered=tiered, tax_base_ratio=ratio)
-
-    def fmt(adv: Optional[PriceAdvice]) -> str:
-        if adv is None:
-            return "недостижима"
-        mark = " (тариф выше порога)" if adv.tier == "high" else ""
-        return f"<b>{adv.price} ₽</b>{mark}"
-
-    now = "н/д" if cur_profit is None else f"{cur_profit:+.0f} ₽/шт"
+    be_text = "недостижима" if be is None else f"<b>{be.price} ₽</b>" + (
+        " (тариф выше порога)" if be.tier == "high" else ""
+    )
+    if cur_profit is None:
+        now = "чистая прибыль н/д"
+    else:
+        pct = cur_profit / current * 100.0
+        now = f"чистая прибыль {cur_profit:+.0f} ₽/шт (<b>{_pct_ru(pct)}</b>)"
     return (
-        f"• [{label}] <code>{html.escape(art)}</code>: в ЛК {current:.0f} ₽ ({now}) → "
-        f"в ноль: {fmt(be)}; цель {settings.PRICE_TARGET_MARGIN * 100:.0f}%: {fmt(goal)}"
+        f"• [{label}] <code>{html.escape(art)}</code>: в ЛК {current:.0f} ₽ → {now} → "
+        f"в ноль: {be_text}"
     )
 
 
@@ -256,7 +261,9 @@ async def build_price_report(ozon_api: Any, wb_api: Any) -> str:
         f"порог Ozon {settings.OZON_LOW_PRICE_LIMIT:.0f} ₽ (выше — комиссия {settings.OZON_HIGH_COMMISSION_RATE * 100:.0f}%).\n"
     )
     tail = (
-        "\nℹ️ «в ноль» — цена ЛК, при которой чистая прибыль с заказа = 0 после комиссии, логистики, рекламы, "
-        "налога и себестоимости. Это оценка: перед изменением цены сверьте её с калькулятором ЛК."
+        "\nℹ️ «чистая прибыль» — по цене в ЛК после комиссии, логистики, рекламы, налога и себестоимости; "
+        "«в ноль» — цена, при которой она равна 0. Это оценка по цене ЛК: если в P&L фактическая прибыль ниже, "
+        "значит реальная цена реализации ниже цены ЛК (акции, скидки за счёт продавца, возвраты) — сверьте "
+        "средний чек P&L с ценой в ЛК и калькулятор ЛК перед изменением цены."
     )
     return head + "\n".join(notes + lines) + tail
