@@ -153,17 +153,38 @@ async def generate(
     if not settings.GEMINI_API_KEY:
         raise RuntimeError("Не задан ключ Gemini")
     total = timeout or settings.GEMINI_TIMEOUT
-    # Жёсткий потолок на весь вызов: маршруты × модели × таймауты раньше могли
-    # занимать минуты, и автоответы Ozon упирались в бюджет задания.
-    overall = max(total * 2, 30)
-    try:
-        return await asyncio.wait_for(
-            _generate(prompt, max_tokens, temperature, fast, total), timeout=overall
-        )
-    except asyncio.TimeoutError as exc:
-        raise GeminiUnavailable(
-            f"Gemini не ответил за {overall} с (маршруты/модели исчерпаны по времени)"
-        ) from exc
+    # Жёсткий потолок на весь вызов. Быстрые вызовы (автоответы) — 2×таймаут,
+    # длинные (Совет ИИ, аудит рекламы) — 3×: второй круг после паузы спасает
+    # от кратковременного обрыва локального прокси.
+    overall = max(total * (2 if fast else 3), 30)
+    rounds = 1 if fast else max(int(settings.GEMINI_RETRY_ROUNDS), 1)
+    deadline = time.monotonic() + overall
+    last_error: GeminiUnavailable | None = None
+    for round_no in range(rounds):
+        remaining = deadline - time.monotonic()
+        if remaining < 10:
+            break
+        try:
+            return await asyncio.wait_for(
+                _generate(prompt, max_tokens, temperature, fast, total), timeout=remaining
+            )
+        except asyncio.TimeoutError as exc:
+            last_error = GeminiUnavailable(
+                f"Gemini не ответил за {overall} с (маршруты/модели исчерпаны по времени)"
+            )
+            last_error.__cause__ = exc
+            break
+        except GeminiUnavailable as exc:
+            last_error = exc
+            if round_no + 1 < rounds:
+                logger.warning("Gemini: круг %d не удался (%s), повтор через 5 с", round_no + 1, exc)
+                await asyncio.sleep(5)
+    raise last_error or GeminiUnavailable("Gemini: время на запрос исчерпано")
+
+
+def _is_transient(exc: BaseException) -> bool:
+    """Обрыв соединения/таймаут: виноват канал (прокси), а не модель или ключ."""
+    return isinstance(exc, (aiohttp.ClientError, asyncio.TimeoutError, OSError))
 
 
 async def _generate(
@@ -179,6 +200,10 @@ async def _generate(
         raise GeminiUnavailable(str(exc)) from exc
     available = [r for r in raw_routes if route_available("gemini", r)]
     routes = available + [r for r in raw_routes if r not in available]
+    if settings.GEMINI_DIRECT_FALLBACK and DIRECT not in routes:
+        # Последняя попытка без прокси: при геоблоке Google ответит сразу
+        # (FAILED_PRECONDITION), при упавшем прокси — это единственный шанс.
+        routes.append(DIRECT)
 
     errors: list[str] = []
     for route in routes:
@@ -187,9 +212,14 @@ async def _generate(
         route_broken = False
         model_5xx = 0
         model_tries = 0
+        # Прямой маршрут как запасной не ждём долго: в РФ он обычно режется геоблоком.
+        net_retries = 2 if route == DIRECT and len(routes) > 1 else 0
         try:
+            # force_close: без keep-alive. Локальный прокси закрывает простаивающее
+            # соединение, и повторное использование давало ServerDisconnectedError.
             async with aiohttp.ClientSession(
                 trust_env=False,
+                connector=aiohttp.TCPConnector(force_close=True, enable_cleanup_closed=True),
                 timeout=aiohttp.ClientTimeout(total=total, connect=15),
                 headers=headers,
             ) as session:
@@ -208,7 +238,8 @@ async def _generate(
                 for name in chain:
                     url = f"{BASE_URL}/{name}:generateContent"
                     tokens = max_tokens
-                    for attempt in range(2):
+                    doubled = False
+                    for attempt in range(4):
                         payload = {
                             "contents": [{"parts": [{"text": prompt}]}],
                             "generationConfig": {
@@ -251,8 +282,14 @@ async def _generate(
                             ValueError,
                         ) as exc:
                             errors.append(f"{route_label}: {type(exc).__name__}")
-                            route_broken = True
                             data = None
+                            if _is_transient(exc) and net_retries < 3:
+                                # Обрыв канала: повторяем на НОВОМ соединении, а не
+                                # объявляем маршрут мёртвым после первого сбоя.
+                                net_retries += 1
+                                await asyncio.sleep(settings.GEMINI_NET_RETRY_DELAY * net_retries)
+                                continue
+                            route_broken = True
                         if data is None:
                             break  # к следующей модели (или маршруту при route_broken)
                         truncated = False
@@ -262,7 +299,8 @@ async def _generate(
                                 mark_route_ok("gemini", route)
                                 return text, name
                             truncated = truncated or _truncated(candidate)
-                        if truncated and attempt == 0 and tokens < 8192:
+                        if truncated and not doubled and tokens < 8192:
+                            doubled = True
                             # Модели 3.x тратят часть лимита на «размышления»: короткий
                             # лимит давал пустой ответ. Повторяем с удвоенным лимитом.
                             tokens = min(tokens * 2, 8192)

@@ -524,7 +524,7 @@ class Adapters(unittest.IsolatedAsyncioTestCase):
         result = await self.wb.fetch_active_ad_campaigns()
         self.assertEqual(
             [c.args[1].split("/adv/v1/")[-1] for c in self.wb._request.await_args_list],
-            ["promotion/count", "promotion/adverts", "upd"],
+            ["promotion/count", "https://advert-api.wildberries.ru/api/advert/v3/adverts", "upd"],
         )
         self.assertEqual(
             [(c["nms"], c["spend_rub"]) for c in result], [(["99"], 10), ([], 3)]
@@ -623,7 +623,7 @@ class Adapters(unittest.IsolatedAsyncioTestCase):
         monthly = await sync_and_generate_orders_report(oz, wb)
         weekly = await generate_weekly_top_and_unprofitable_report(oz, wb)
         # 300 − 66 − 39 − эквайринг 1.5% (4.50) − себестоимость 10 − налог 18 = 162.50
-        self.assertIn("Чистая прибыль Ozon:</b> <b>н/д", monthly)
+        self.assertIn("Чистая прибыль Ozon:</b> <code>162.50 ₽</code>", monthly)
         self.assertIn("162.50 ₽", weekly)
 
     async def test_signed_wb_adjustments_and_explicit_zero_acquiring(self):
@@ -665,7 +665,7 @@ class Adapters(unittest.IsolatedAsyncioTestCase):
             "deliveryService": "40",
         }
         self.wb._request = AsyncMock(
-            side_effect=[[row, row], [], []]
+            side_effect=[[row, row], [], [], []]
         )
         report = await self.wb.fetch_real_finance_breakdown()
         self.assertEqual(report["logistics_direct"], 40)

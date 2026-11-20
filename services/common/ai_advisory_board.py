@@ -1,5 +1,6 @@
 import asyncio
 import html
+import re
 import time
 from datetime import datetime
 from pathlib import Path
@@ -12,6 +13,7 @@ from database.crud import get_all_products
 from products_catalog import PRODUCTS_CATALOG
 from services.common.financial_pnl import generate_weekly_top_and_unprofitable_report
 from services.common.orders_report import sync_and_generate_orders_report
+from services.common.price_calculator import build_price_report
 from services.ozon.seller_api import OzonSellerAPI
 from services.wb.statistics_api import WBStatisticsAPI
 
@@ -26,12 +28,37 @@ async def check_gemini_api_health() -> Dict[str, Any]:
             'latency_ms': int((time.perf_counter() - start) * 1000), 'detail': reply}
 
 
-async def _call_gemini_advisory(prompt: str) -> str:
+async def _call_gemini_advisory(prompt: str) -> Tuple[str, bool]:
+    """(текст, ИИ ответил). Сбой ИИ — не результат: вызывающий код включает расчётный режим."""
     try:
         text, _ = await generate(prompt, max_tokens=8192, temperature=0.35)
-        return text
+        return text, bool(text.strip())
     except RuntimeError as exc:
-        return f'Совет ИИ недоступен: {exc}'
+        return f'Совет ИИ недоступен: {exc}', False
+
+
+def _plain(text: str) -> str:
+    return html.unescape(re.sub(r"<[^>]+>", "", text))
+
+
+async def _rules_based_board(
+    ozon_service: OzonSellerAPI, wb_service: WBStatisticsAPI, reason: str
+) -> str:
+    """Резерв без ИИ: цены ЛК «в ноль» и по целевой марже из фактических ставок."""
+    try:
+        prices = _plain(await build_price_report(ozon_service, wb_service))
+    except Exception as exc:  # noqa: BLE001 — резерв сам не должен падать
+        prices = f"Расчёт цен недоступен: {type(exc).__name__}: {exc}"
+    return (
+        "⚠️ ИИ-Советник временно недоступен — ниже расчётный разбор по вашим фактическим ставкам "
+        "(без текстовых рекомендаций ИИ).\n"
+        f"Причина: {reason[:300]}\n\n"
+        "Что делать сейчас:\n"
+        "1) Артикулы с ценой ЛК ниже «в ноль» — поднять цену или вывести из рекламы.\n"
+        "2) Проверьте «Аудит API» — маршрут Gemini/прокси.\n"
+        "3) Повторите разбор позже кнопкой «🧠 ИИ-Советник».\n\n"
+        + prices
+    )
 
 
 async def generate_monday_ai_board_report(
@@ -129,7 +156,9 @@ async def generate_monday_ai_board_report(
 🚀 ДИРЕКТОР ПО РАЗВИТИЮ: Создание сетов и комбо (база 15г + гель 15г + топ 15г) с расчётом доли доставки по данным отчёта.
 """
 
-    ai_analysis = await _call_gemini_advisory(prompt)
+    ai_analysis, ai_ok = await _call_gemini_advisory(prompt)
+    if not ai_ok:
+        ai_analysis = await _rules_based_board(ozon_service, wb_service, ai_analysis)
 
     now_str = datetime.now().strftime("%Y-%m-%d_%H-%M")
     report_file = LOGS_DIR / f"AI_Board_Report_{now_str}.html"

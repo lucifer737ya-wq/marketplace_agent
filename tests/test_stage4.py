@@ -228,7 +228,7 @@ class TestStage4GeminiAndAdvisory(unittest.IsolatedAsyncioTestCase):
 
             with patch("services.common.orders_report.sync_and_generate_orders_report", AsyncMock(return_value="P&L")), \
                  patch("services.common.price_auditor.run_daily_price_audit", AsyncMock(side_effect=RuntimeError("audit err"))), \
-                 patch("services.common.ai_advisory_board._call_gemini_advisory", AsyncMock(return_value="Вывод <script>alert(1)</script> & итог")):
+                 patch("services.common.ai_advisory_board._call_gemini_advisory", AsyncMock(return_value=("Вывод <script>alert(1)</script> & итог", True))):
                 tg_summary, html_path = await advisory_mod.generate_monday_ai_board_report(oz_mock, wb_mock)
 
             self.assertNotIn("<i>", tg_summary)

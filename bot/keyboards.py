@@ -31,6 +31,10 @@ def get_main_menu_keyboard() -> ReplyKeyboardMarkup:
             KeyboardButton(text="📑 Массовая загрузка себестоимости"),
             KeyboardButton(text="🛠 Редактировать код"),
         ],
+        [
+            KeyboardButton(text="💲 Цены в ЛК"),
+            KeyboardButton(text="📈 Аудит рекламы"),
+        ],
     ]
     return ReplyKeyboardMarkup(
         keyboard=kb,

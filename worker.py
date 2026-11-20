@@ -42,6 +42,7 @@ from database.models import close_db, init_db
 from maintenance.api_inspector import run_monthly_api_audit
 from maintenance.self_healer import run_full_self_check_and_heal
 from services.common.ad_recommendations import generate_weekly_ads_report_and_recommendations
+from services.common.price_calculator import build_price_report
 from services.common.ai_advisory_board import generate_monday_ai_board_report
 from services.common.financial_pnl import (
     generate_monthly_pnl_report,
@@ -255,6 +256,27 @@ def _split_html_chunks(text: str, limit: int = 3900) -> List[str]:
     if parts:
         chunks.append(''.join(parts))
     return chunks
+
+
+async def _tg_retry(factory, attempts: int = 4):
+    """Повтор отправки в Telegram при обрыве канала (прокси закрыл соединение).
+
+    ``factory`` — функция без аргументов, создающая корутину заново на каждую попытку.
+    """
+    from aiogram.exceptions import TelegramNetworkError, TelegramRetryAfter
+
+    last: BaseException | None = None
+    for attempt in range(attempts):
+        try:
+            return await factory()
+        except TelegramRetryAfter as exc:
+            last = exc
+            await asyncio.sleep(min(float(exc.retry_after) + 1, 30))
+        except (TelegramNetworkError, ConnectionError, asyncio.TimeoutError, OSError) as exc:
+            last = exc
+            await asyncio.sleep(1.5 * (attempt + 1))
+    assert last is not None
+    raise last
 
 
 async def _safe_delete_message(status_msg: Message) -> None:
@@ -610,21 +632,65 @@ async def cmd_ai_board(message: Message) -> None:
         await _safe_delete_message(status_msg)
         if not str(summary_text).strip():
             summary_text = "⚠️ Совет ИИ вернул пустой ответ. Полный HTML-отчёт ниже."
-        await message.answer(summary_text)
+        await _tg_retry(lambda: message.answer(summary_text))
         if file_path is not None and Path(file_path).exists():
-            await message.answer_document(
-                document=FSInputFile(str(file_path)),
-                caption="📎 Полный стратегический отчет Совета ИИ-специалистов (откройте в браузере)",
+            await _tg_retry(
+                lambda: message.answer_document(
+                    document=FSInputFile(str(file_path)),
+                    caption="📎 Полный стратегический отчет Совета ИИ-специалистов (откройте в браузере)",
+                )
             )
         else:
-            await message.answer(
-                "⚠️ HTML-файл разбора не сохранился (диск/права). Краткий итог выше."
+            await _tg_retry(
+                lambda: message.answer(
+                    "⚠️ HTML-файл разбора не сохранился (диск/права). Краткий итог выше."
+                )
             )
     except Exception as exc:
         print(f"[Worker] ИИ-Советник: {type(exc).__name__}: {exc}", flush=True)
         await _show_status_result(
             status_msg,
             f"❌ Ошибка ИИ-Советника:\n<code>{html.escape(str(exc))}</code>",
+        )
+
+
+@dp.message(F.text == "💲 Цены в ЛК")
+@dp.message(Command("prices"))
+async def cmd_price_calculator(message: Message) -> None:
+    if not message.from_user or message.from_user.id != settings.TG_ADMIN_ID:
+        return
+    status_msg = await message.answer("⏳ Считаю цены ЛК по вашим фактическим комиссиям и логистике...")
+    try:
+        report = await build_price_report(ozon_service, wb_service)
+        await _safe_delete_message(status_msg)
+        for chunk in _split_html_chunks(report):
+            await _tg_retry(lambda chunk=chunk: message.answer(chunk, parse_mode="HTML"))
+    except Exception as exc:
+        print(f"[Worker] Цены ЛК: {type(exc).__name__}: {exc}", flush=True)
+        await _show_status_result(
+            status_msg,
+            f"❌ <b>Ошибка расчёта цен:</b>\n<code>{type(exc).__name__}: {html.escape(str(exc))}</code>",
+        )
+
+
+@dp.message(F.text == "📈 Аудит рекламы")
+@dp.message(Command("ads_audit"))
+async def cmd_ads_audit(message: Message) -> None:
+    """Ручной запуск еженедельного аудита рекламы — проверка, что понедельничное задание работает."""
+    if not message.from_user or message.from_user.id != settings.TG_ADMIN_ID:
+        return
+    status_msg = await message.answer("⏳ Собираю кампании Ozon/WB, остатки и финансы за 7 дней...")
+    try:
+        report = await generate_weekly_ads_report_and_recommendations(ozon_service, wb_service)
+        await _safe_delete_message(status_msg)
+        text = f"📈 <b>Аудит и план рекламы Ozon & WB</b>\n\n{report}"
+        for chunk in _split_html_chunks(text):
+            await _tg_retry(lambda chunk=chunk: message.answer(chunk, parse_mode="HTML"))
+    except Exception as exc:
+        print(f"[Worker] Аудит рекламы: {type(exc).__name__}: {exc}", flush=True)
+        await _show_status_result(
+            status_msg,
+            f"❌ <b>Ошибка аудита рекламы:</b>\n<code>{type(exc).__name__}: {html.escape(str(exc))}</code>",
         )
 
 
@@ -785,6 +851,8 @@ async def setup_bot_commands(bot_instance: Bot) -> None:
         BotCommand(command="costs", description="Себестоимость товара (поштучно)"),
         BotCommand(command="bulk_costs", description="Массовая загрузка себестоимости"),
         BotCommand(command="first_mile", description="Затраты первой мили"),
+        BotCommand(command="prices", description="Ориентировочные цены в ЛК с вашими комиссиями"),
+        BotCommand(command="ads_audit", description="Аудит рекламы Ozon и WB"),
         BotCommand(command="audit", description="Аудит API Ozon, WB и ИИ"),
         BotCommand(command="heal", description="Самопроверка и автопочинка"),
     ]
@@ -859,6 +927,7 @@ def configure_scheduler() -> AsyncIOScheduler:
     scheduler.add_job(
         functools.partial(_guarded_job, "weekly_ads_audit_job", scheduled_weekly_ads_job),
         CronTrigger(day_of_week="mon", hour=10, minute=30, timezone=MSK_TZ),
+        misfire_grace_time=6 * 3600,  # перезапуск воркера утром в понедельник не должен терять неделю
         id="weekly_ads_audit_job",
         replace_existing=True,
     )

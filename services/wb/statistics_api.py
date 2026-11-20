@@ -569,10 +569,19 @@ class WBStatisticsAPI(MarketplaceClient):
                     self.ADVERT_URL + path,
                     params={"ids": ",".join(map(str, batch))},
                 )
-                return data["adverts"]
+                # v3/v2 отдают {"adverts": [...]}; отсутствие ключа — не KeyError.
+                rows = data.get("adverts") if isinstance(data, dict) else data
+                return rows if isinstance(rows, list) else []
 
+            # v3 — актуальная версия (v2 помечена WB как deprecated и будет отключена),
+            # старый POST /adv/v1/promotion/adverts оставлен последним резервом.
             for row in await read_versions(
-                ("/adv/v1/promotion/adverts", "/api/advert/v2/adverts"), details
+                (
+                    "/api/advert/v3/adverts",
+                    "/api/advert/v2/adverts",
+                    "/adv/v1/promotion/adverts",
+                ),
+                details,
             ):
                 if not isinstance(row, dict):
                     continue
@@ -961,8 +970,54 @@ class WBStatisticsAPI(MarketplaceClient):
                     )
                 if errors:
                     report["source"] += "; " + "; ".join(dict.fromkeys(errors))
+                if not report.get("orders_count"):
+                    # Строки есть, а продаж/возвратов нет: чаще всего неделя ещё не закрыта
+                    # (отчёт реализации формируется после воскресенья) или WB сменил название
+                    # операции. Показываем, что именно пришло, и сверяем с Sales API.
+                    ops = report.get("operation_counts") or {}
+                    shown = ", ".join(f"{k}×{v}" for k, v in sorted(ops.items())[:8]) or "нет"
+                    report["source"] += f"; в отчёте нет строк «Продажа/Возврат» (операции: {shown})"
+                    try:
+                        hint = await self._sales_api_summary(date_from, date_to)
+                    except (APIStatusError, RuntimeError, ValueError, TypeError) as exc:
+                        report["source"] += f"; Sales API: {_exc_label(exc)}"
+                    else:
+                        report["sales_api"] = hint
+                        if hint["count"]:
+                            report["source"] += (
+                                f"; ⚠ Sales API видит {hint['count']} продаж на "
+                                f"{hint['price_with_disc']:.0f} ₽ — отчёт реализации ещё не закрыт"
+                            )
             self._write_disk_cache(key, report)
             return report
+
+    async def _sales_api_summary(self, date_from: str, date_to: str) -> dict:
+        """Сверка: GET /api/v1/supplier/sales (оперативные продажи, без удержаний)."""
+        rows = await self._request(
+            "GET",
+            self.STATS_URL + "/api/v1/supplier/sales",
+            params={"dateFrom": date_from, "flag": 0},
+        )
+        if rows is None:
+            rows = []
+        if not isinstance(rows, list):
+            raise RuntimeError("WB: неверный формат Sales API")
+        count = 0
+        total = 0.0
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            day = str(row.get("date") or "")[:10]
+            if day and not (date_from <= day <= date_to):
+                continue
+            sale_id = str(row.get("saleID") or "")
+            if sale_id.startswith("R"):  # возврат
+                total -= _num(row.get("priceWithDisc"))
+                count -= 1
+                continue
+            total += _num(row.get("priceWithDisc"))
+            count += 1
+        return {"count": max(count, 0), "price_with_disc": round(max(total, 0.0), 2)}
 
     async def _finance_from_summaries(
         self, date_from: str, date_to: str, level: str
@@ -1042,6 +1097,7 @@ class WBStatisticsAPI(MarketplaceClient):
         delivery = reverse = storage = acceptance = other = 0.0
         estimated = False
         seen = set()
+        op_counts: Dict[str, int] = {}
         for r in rows:
             if not isinstance(r, dict):
                 continue
@@ -1049,7 +1105,8 @@ class WBStatisticsAPI(MarketplaceClient):
             if rid in seen:
                 continue
             seen.add(rid)
-            operation = str(_pick(r, "supplierOperName", "supplier_oper_name") or "").lower()
+            operation = str(_pick(r, "supplierOperName", "supplier_oper_name") or "").strip().lower()
+            op_counts[operation or "—"] = op_counts.get(operation or "—", 0) + 1
             logistics = _num(_pick(r, "deliveryService", "delivery_rub"))
             returned = _num(_pick(r, "returnAmount", "return_amount"))
             if returned or "возврат" in operation:
@@ -1119,6 +1176,8 @@ class WBStatisticsAPI(MarketplaceClient):
         )
         return {
             "source": f"Отчёт реализации WB ({start}..{end})",
+            "operation_counts": op_counts,
+            "rows_total": len(seen),
             "orders": orders,
             "orders_count": len(orders),
             "revenue_seller": seller,

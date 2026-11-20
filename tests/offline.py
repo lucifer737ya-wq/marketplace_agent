@@ -38,6 +38,9 @@ os.environ.update(
     GEMINI_MODEL="gemini-3.1-flash-lite",
     GEMINI_FAST_MODEL="gemini-3.1-flash-lite",
     RATE_LIMIT_RETRIES="0",
+    GEMINI_RETRY_ROUNDS="1",
+    GEMINI_NET_RETRY_DELAY="0",
+    GEMINI_DIRECT_FALLBACK="false",
 )
 
 

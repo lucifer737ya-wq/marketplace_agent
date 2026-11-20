@@ -50,7 +50,7 @@ class Settings(BaseSettings):
         default="gemini-3.8-flash", description="Базовая модель Gemini"
     )
     GEMINI_FAST_MODEL: str = Field(
-        default="gemini-3.1-flash-lite",
+        default="gemini-3.5-flash-lite",
         description="Эконом-модель для отзывов, вопросов и коротких задач",
     )
     # Прямой адрес API Google. Работает без посредников и без локального прокси.
@@ -132,6 +132,11 @@ class Settings(BaseSettings):
     ACQUIRING_RATE: float = Field(default=0.015, description="Эквайринг (1.5%)")
     OZON_LOW_PRICE_LIMIT: float = Field(default=300.0, description="Порог льготной комиссии Ozon (до 300 ₽)")
     OZON_HIGH_COMMISSION_RATE: float = Field(default=0.52, description="Комиссия Ozon свыше 300 ₽ (52%)")
+    PRICE_TARGET_MARGIN: float = Field(default=0.15, description="Целевая чистая маржа для расчёта цен ЛК (доля цены)")
+    PRICE_CALC_PERIOD_DAYS: int = Field(default=30, description="За сколько дней брать фактические ставки для расчёта цен")
+    GEMINI_DIRECT_FALLBACK: bool = Field(default=True, description="Если все прокси Gemini недоступны — последняя попытка напрямую")
+    GEMINI_NET_RETRY_DELAY: float = Field(default=1.5, description="Пауза между повторами Gemini после обрыва соединения, сек (растёт линейно)")
+    GEMINI_RETRY_ROUNDS: int = Field(default=2, description="Сколько полных кругов маршрутов/моделей пробовать для Gemini")
     WB_MIN_PRICE_RATIO: float = Field(default=0.92, description="Коэффициент минимальной цены для акций WB")
     OZON_REVIEWS_MIN_DATE: str = Field(default="13.11.2026", description="Минимальная дата автоответов Ozon")
 

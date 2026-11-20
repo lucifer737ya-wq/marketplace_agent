@@ -328,7 +328,7 @@ class ReportDegradation(unittest.IsolatedAsyncioTestCase):
              patch.object(advisory, "sync_and_generate_orders_report", AsyncMock(return_value="P&L")), \
              patch.object(advisory, "generate_weekly_top_and_unprofitable_report", AsyncMock(return_value="TOP5")), \
              patch.object(advisory, "get_all_products", AsyncMock(return_value=[])), \
-             patch.object(advisory, "_call_gemini_advisory", AsyncMock(return_value="Итог")):
+             patch.object(advisory, "_call_gemini_advisory", AsyncMock(return_value=("Итог", True))):
             oz = MagicMock()
             oz.fetch_stocks_and_prices = AsyncMock(return_value=[])
             wb = MagicMock()
