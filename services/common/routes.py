@@ -31,8 +31,9 @@ logger = logging.getLogger(__name__)
 
 DIRECT = "direct"
 _cache = DiskCache(LOGS_DIR / "routes")
-# service -> (route, monotonic deadline)
-_cooldown: dict[str, tuple[str, float]] = {}
+# (service, route) -> monotonic deadline. Раньше карантин хранился одним слотом на
+# сервис: падение прокси стирало карантин прямого маршрута и наоборот.
+_cooldown: dict[tuple[str, str], float] = {}
 # monotonic timestamps of consecutive failures per route fingerprint
 _failures: dict[str, int] = {}
 
@@ -105,6 +106,13 @@ def request_routes(service: str) -> list[str]:
     proxies = _configured_proxies()
     if key in MARKETPLACE_SERVICES and settings.MARKETPLACES_DIRECT_ONLY:
         return [DIRECT]
+    if key == "gemini" and settings.GEMINI_PROXY_ONLY:
+        if not proxies:
+            raise ValueError(
+                "GEMINI_PROXY_ONLY=true, но LOCAL_PROXY_URL не задан: "
+                "укажите локальный HTTP-прокси"
+            )
+        return _prefer_last_working(service, proxies)
     if key == "telegram" and settings.TELEGRAM_PROXY_ONLY:
         if not proxies:
             raise ValueError(
@@ -164,7 +172,7 @@ def mark_route_failed(service: str, route: str, reason: str = "") -> None:
     cooldown = max(int(settings.ROUTE_COOLDOWN_SECONDS), 0)
     _failures[_fingerprint(route)] = _failures.get(_fingerprint(route), 0) + 1
     if cooldown:
-        _cooldown[service] = (route, time.monotonic() + cooldown)
+        _cooldown[(service, route)] = time.monotonic() + cooldown
         logger.warning(
             "Маршрут %s для %s в карантине %s с: %s",
             route,
@@ -176,17 +184,13 @@ def mark_route_failed(service: str, route: str, reason: str = "") -> None:
 
 def mark_route_ok(service: str, route: str) -> None:
     _failures[_fingerprint(route)] = 0
-    current = _cooldown.get(service)
-    if current and current[0] == route:
-        _cooldown.pop(service, None)
+    _cooldown.pop((service, route), None)
     remember_route(service, route)
 
 
 def route_available(service: str, route: str) -> bool:
-    current = _cooldown.get(service)
-    if not current or current[0] != route:
-        return True
-    return time.monotonic() >= current[1]
+    deadline = _cooldown.get((service, route))
+    return deadline is None or time.monotonic() >= deadline
 
 
 def _ordered_available(service: str) -> list[str]:

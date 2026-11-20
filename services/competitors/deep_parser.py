@@ -89,6 +89,11 @@ async def _fetch_json(
             trust_env=False,
             timeout=timeout,
             headers=headers,
+            # Антибот WB отдаёт огромные Set-Cookie/служебные заголовки; при лимите
+            # 8190 байт aiohttp бросал ClientResponseError(status=0, message='') —
+            # именно эта «ошибка 0» с длинным URL попадала в Telegram.
+            max_line_size=65536,
+            max_field_size=65536,
         ) as session:
             for _ in range(max_redirects + 1):
                 async with session.get(current, allow_redirects=False) as resp:
@@ -126,8 +131,13 @@ async def _fetch_json(
             return None, "Слишком много редиректов", False
     except asyncio.TimeoutError:
         return None, f"Таймаут запроса ({timeout.total} сек.)", True
+    except aiohttp.ClientResponseError as exc:
+        return None, (
+            f"HTTP-ответ витрины не разобран (status={exc.status}); "
+            "вероятно, антибот-защита"
+        ), False
     except aiohttp.ClientError as exc:
-        return None, f"Сетевая ошибка aiohttp ({type(exc).__name__}: {exc})", True
+        return None, f"Сетевая ошибка aiohttp ({type(exc).__name__})", True
     except OSError as exc:
         return None, f"Ошибка сокета ({type(exc).__name__}: {exc})", True
     finally:
@@ -247,7 +257,7 @@ async def _parse_wb_competitors_with_status(
                 err_msg = "WB: пустая выдача"
             else:
                 err_msg = "WB: неизвестный формат выдачи"
-        errors.append(f"{url.split('?')[1][:40]}…: {err_msg}")
+        errors.append(str(err_msg))
         logger.warning("[Competitors WB] %s", err_msg)
         if err_msg and ("403" in err_msg or "498" in err_msg):
             antibot_hits += 1
@@ -261,7 +271,7 @@ async def _parse_wb_competitors_with_status(
         # решил JVO1, поэтому воспроизведение из httpx не работает.
         err_msg = (
             "витрина WB не отдала карточки (антибот-защита поиска): "
-            + "; ".join(errors[-2:])
+            + "; ".join(dict.fromkeys(errors)) [:300]
         )
         browser_items, browser_err = await _wb_browser_fallback(clean_query, safe_count)
         if browser_items:
@@ -585,9 +595,11 @@ async def run_full_competitor_deep_audit(category_query: str) -> Tuple[str, Dict
             buyer_price = _safe_float(comp.get("buyer_price"), 0.0)
             rating = _safe_float(comp.get("rating"), 0.0)
             feedbacks = _safe_int(comp.get("feedbacks"), 0)
+            # DOM-резерв не видит рейтинг: «⭐ 0.0 (0)» выглядел как реальная оценка.
+            rating_lbl = "⭐ нет данных" if rating <= 0.0 and feedbacks <= 0 else f"⭐ {rating:.1f} ({feedbacks})"
             html_rows.append(
                 f"• [{mp_lbl}] Арт. <code>{sku_lbl}</code> | <b>{brand_lbl}</b> — {name_lbl}\n"
-                f"   Витрина: <b>{buyer_price:.0f} ₽</b> | ⭐ {rating:.1f} ({feedbacks})"
+                f"   Витрина: <b>{buyer_price:.0f} ₽</b> | {rating_lbl}"
             )
         return html_rows
 

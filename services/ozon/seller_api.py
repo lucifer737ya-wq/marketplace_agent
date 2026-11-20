@@ -6,6 +6,7 @@ from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
 from config import settings
+from services.common.timeutil import now_local, today_local
 from products_catalog import PRODUCTS_CATALOG
 from services.ozon.finance import (
     accrual_category,
@@ -206,7 +207,7 @@ class OzonSellerAPI(MarketplaceClient):
 
         sales_7d_map = self._read_disk_cache("ordered_units", 1800)
         if sales_7d_map is None:
-            end = datetime.utcnow().date()
+            end = today_local()
             try:
                 sales_7d_map = {}
                 offset = 0
@@ -381,7 +382,7 @@ class OzonSellerAPI(MarketplaceClient):
         return str(data["access_token"])
 
     async def fetch_active_ad_campaigns(self, days: int = 7) -> List[Dict[str, Any]]:
-        end = datetime.utcnow().date()
+        end = today_local()
         key = f"campaigns:{settings.OZON_PERF_CLIENT_ID}:{end}:{days}"
         cached = self._read_disk_cache(key, 900)
         if cached is not None:
@@ -518,7 +519,7 @@ class OzonSellerAPI(MarketplaceClient):
         `/v1/analytics/data` по измерению `sku`: количество и выручка.
         Возвращает (строки заказов, подпись источника).
         """
-        end = datetime.utcnow().date()
+        end = today_local()
         start = end - timedelta(days=max(int(days), 1) - 1)
         key = f"sales_by_sku:{start.isoformat()}:{end.isoformat()}"
         cached = self._read_disk_cache(key, 1800)
@@ -705,7 +706,7 @@ class OzonSellerAPI(MarketplaceClient):
         /v1/finance/accrual/by-day (обход по суткам, курсор last_id), и при
         доступности /v1/finance/cash-flow-statement/list для сверки периодов.
         """
-        now_utc = datetime.utcnow()
+        now_utc = now_local().replace(tzinfo=None)
         if custom_date_from and custom_date_to:
             start_dt = datetime.strptime(custom_date_from, "%Y-%m-%d")
             end_dt = datetime.strptime(custom_date_to, "%Y-%m-%d").replace(

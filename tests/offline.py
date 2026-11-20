@@ -30,6 +30,14 @@ os.environ.update(
     LOCAL_PROXY_URL="http://127.0.0.1:3066",
     LOCAL_PROXY_FALLBACK_URL="",
     OZON_REPLY_DRY_RUN="false",
+    # Старые тесты проверяют перебор «прямой → прокси»; продовые умолчания
+    # (Gemini/Telegram через прокси, площадки напрямую) проверяет tests/test_audit_20261120.py.
+    GEMINI_PROXY_ONLY="false",
+    TELEGRAM_PROXY_ONLY="false",
+    MARKETPLACES_DIRECT_ONLY="false",
+    GEMINI_MODEL="gemini-3.1-flash-lite",
+    GEMINI_FAST_MODEL="gemini-3.1-flash-lite",
+    RATE_LIMIT_RETRIES="0",
 )
 
 

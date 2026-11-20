@@ -15,8 +15,7 @@ from config import settings
 from database.crud import get_db_session
 from database.models import Product
 from products_catalog import get_catalog_product
-from services.common.buyer_questions import BRAND_MATRIX_RULES
-from services.common.gemini import generate
+from services.common.buyer_questions import generate_review_reply
 
 reviews_router = Router()
 
@@ -67,23 +66,19 @@ def _build_review_fallback_reply(product_meta: dict) -> str:
 
 
 async def generate_review_reply_llm(sku: str, product_meta: dict, review_text: str) -> str:
-    art = product_meta.get("art", sku)
-    title = product_meta.get("title") or product_meta.get("name") or "товар YaSoKo"
-    prompt = (
-        "Ты — специалист контроля качества бренда YaSoKo. Вежливо и по делу ответь на отзыв покупателя.\n"
-        f"{BRAND_MATRIX_RULES}\n"
-        "Не советуй спирт, растворители, нагрев или непроверенные процедуры. "
-        "Выведи только готовый текст ответа (3–4 предложения).\n"
-        f"Артикул: {art}; название: {title}\nОтзыв: {review_text}"
-    )
+    """Тот же генератор, что у автоответов Ozon: единый тон, приветствие и пожелание.
 
+    Раньше бот использовал отдельный сокращённый промпт, и ответы в Telegram
+    расходились с опубликованными (без приветствия/завершения, с советом «присмотреться
+    к другим линейкам»).
+    """
+    art = product_meta.get("art", sku)
     try:
-        text, _ = await generate(prompt, max_tokens=1500, fast=True)
-        if any(term in text.lower() for term in ("спирт", "растворител", "подогре", "нагре")):
-            raise RuntimeError("В ответе обнаружен неподтверждённый совет")
-        return text
+        return await generate_review_reply(review_text, None, str(art or sku))
     except RuntimeError as exc:
-        raise RuntimeError("Не удалось подготовить безопасный ответ; попробуйте позже") from exc
+        raise RuntimeError(
+            f"Не удалось подготовить безопасный ответ: {exc}"
+        ) from exc
 
 
 @reviews_router.message(F.text == "💬 Ответ на отзыв")

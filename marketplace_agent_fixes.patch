@@ -1,0 +1,1376 @@
+diff --git a/.env.example b/.env.example
+index 0b3e055..7a232ad 100644
+--- a/.env.example
++++ b/.env.example
+@@ -18,7 +18,9 @@ GEMINI_API_KEY=
+ 
+ # ==== Gemini =================================================================
+ # Актуальное поколение моделей Google (ноябрь 2026).
+-GEMINI_MODEL=gemini-3.1-flash-lite
++# gemini-3.8-flash — основная (с 02.09.2026), gemini-3.1-flash-lite — эконом (до 07.05.2027).
++# gemini-2.5-* устарели (02.11.2026) и с 01.12.2026 перенаправляются Google.
++GEMINI_MODEL=gemini-3.8-flash
+ GEMINI_FAST_MODEL=gemini-3.1-flash-lite
+ GEMINI_DIRECT_URL=https://generativelanguage.googleapis.com
+ GEMINI_TIMEOUT=90
+@@ -38,6 +40,18 @@ LOCAL_PROXY_LIST=
+ # Сколько секунд не трогать упавший маршрут.
+ ROUTE_COOLDOWN_SECONDS=120
+ 
++# Раздельный выход (рекомендуется): Telegram и Gemini — только через локальный
++# прокси/VPN (Google блокирует российский IP: HTTP 400 FAILED_PRECONDITION),
++# Ozon и Wildberries — только напрямую с российского IP.
++TELEGRAM_PROXY_ONLY=true
++GEMINI_PROXY_ONLY=true
++MARKETPLACES_DIRECT_ONLY=true
++
++# HTTP 429: сколько раз повторять и максимум секунд ожидания по X-Ratelimit-Retry
++# (WB finance-api /sales-reports/detailed: 1 запрос в минуту).
++RATE_LIMIT_RETRIES=2
++RATE_LIMIT_MAX_WAIT_SEC=70
++
+ # ==== Прочее =================================================================
+ # Устаревший /v3/finance/transaction/list отключён Ozon 08.09.2026.
+ # Включайте только для разового сравнения исторических данных.
+@@ -46,6 +60,7 @@ TIMEZONE=Europe/Moscow
+ 
+ # Автоответы на отзывы Ozon без публикации (безопасный первый запуск).
+ # true — только генерирует и показывает ответ; false — публикует.
++# ВНИМАНИЕ: при true ничего не публикуется. Для боевого режима поставьте false.
+ OZON_REPLY_DRY_RUN=true
+ 
+ # ==== Раздельный выход: Telegram через VPN, Ozon/WB с российского IP =========
+diff --git a/bot/handlers/reviews_fsm.py b/bot/handlers/reviews_fsm.py
+index 3f10787..ae72ebf 100644
+--- a/bot/handlers/reviews_fsm.py
++++ b/bot/handlers/reviews_fsm.py
+@@ -15,8 +15,7 @@ from config import settings
+ from database.crud import get_db_session
+ from database.models import Product
+ from products_catalog import get_catalog_product
+-from services.common.buyer_questions import BRAND_MATRIX_RULES
+-from services.common.gemini import generate
++from services.common.buyer_questions import generate_review_reply
+ 
+ reviews_router = Router()
+ 
+@@ -67,23 +66,19 @@ def _build_review_fallback_reply(product_meta: dict) -> str:
+ 
+ 
+ async def generate_review_reply_llm(sku: str, product_meta: dict, review_text: str) -> str:
+-    art = product_meta.get("art", sku)
+-    title = product_meta.get("title") or product_meta.get("name") or "товар YaSoKo"
+-    prompt = (
+-        "Ты — специалист контроля качества бренда YaSoKo. Вежливо и по делу ответь на отзыв покупателя.\n"
+-        f"{BRAND_MATRIX_RULES}\n"
+-        "Не советуй спирт, растворители, нагрев или непроверенные процедуры. "
+-        "Выведи только готовый текст ответа (3–4 предложения).\n"
+-        f"Артикул: {art}; название: {title}\nОтзыв: {review_text}"
+-    )
++    """Тот же генератор, что у автоответов Ozon: единый тон, приветствие и пожелание.
+ 
++    Раньше бот использовал отдельный сокращённый промпт, и ответы в Telegram
++    расходились с опубликованными (без приветствия/завершения, с советом «присмотреться
++    к другим линейкам»).
++    """
++    art = product_meta.get("art", sku)
+     try:
+-        text, _ = await generate(prompt, max_tokens=1500, fast=True)
+-        if any(term in text.lower() for term in ("спирт", "растворител", "подогре", "нагре")):
+-            raise RuntimeError("В ответе обнаружен неподтверждённый совет")
+-        return text
++        return await generate_review_reply(review_text, None, str(art or sku))
+     except RuntimeError as exc:
+-        raise RuntimeError("Не удалось подготовить безопасный ответ; попробуйте позже") from exc
++        raise RuntimeError(
++            f"Не удалось подготовить безопасный ответ: {exc}"
++        ) from exc
+ 
+ 
+ @reviews_router.message(F.text == "💬 Ответ на отзыв")
+diff --git a/config.py b/config.py
+index d985d39..d35ea55 100644
+--- a/config.py
++++ b/config.py
+@@ -44,8 +44,10 @@ class Settings(BaseSettings):
+ 
+     # Gemini API
+     GEMINI_API_KEY: str = Field(..., description="API ключ Google Gemini")
++    # gemini-3.8-flash — актуальная флагманская Flash-модель (с 02.09.2026);
++    # gemini-3.1-flash-lite остаётся эконом-моделью до 07.05.2027 и служит запасной.
+     GEMINI_MODEL: str = Field(
+-        default="gemini-3.1-flash-lite", description="Базовая модель Gemini"
++        default="gemini-3.8-flash", description="Базовая модель Gemini"
+     )
+     GEMINI_FAST_MODEL: str = Field(
+         default="gemini-3.1-flash-lite",
+@@ -67,6 +69,12 @@ class Settings(BaseSettings):
+         description="Локальный HTTP-прокси (резервный маршрут для Telegram и Gemini)",
+     )
+     LOCAL_PROXY_FALLBACK_URL: str = ""
++    # Google блокирует российский IP (HTTP 400 FAILED_PRECONDITION «location is not
++    # supported»), поэтому Gemini ходит только через локальный прокси.
++    GEMINI_PROXY_ONLY: bool = Field(
++        default=True,
++        description="Gemini только через локальный прокси (без прямого маршрута)",
++    )
+     # Список дополнительных прокси через запятую: http://127.0.0.1:3067,...
+     LOCAL_PROXY_LIST: str = Field(
+         default="", description="Дополнительные локальные прокси через запятую"
+@@ -78,13 +86,13 @@ class Settings(BaseSettings):
+     # Telegram в РФ доступен только через прокси: прямой маршрут для него
+     # отключается, чтобы не тратить 45 с на заведомо мёртвую попытку.
+     TELEGRAM_PROXY_ONLY: bool = Field(
+-        default=False,
++        default=True,
+         description="Telegram только через локальный прокси (без прямого маршрута)",
+     )
+     # Ozon и WB должны видеть российский IP продавца. При включении площадки
+     # ходят только напрямую и никогда не используют VPN/прокси.
+     MARKETPLACES_DIRECT_ONLY: bool = Field(
+-        default=False,
++        default=True,
+         description="Ozon и WB только напрямую, без прокси (российский IP)",
+     )
+     # Сколько секунд держать в карантине упавший маршрут.
+@@ -92,6 +100,12 @@ class Settings(BaseSettings):
+         default=120, description="Карантин недоступного маршрута, сек"
+     )
+     OZON_REPLY_DRY_RUN: bool = False
++    # Сколько раз повторять запрос после HTTP 429 и максимум секунд ожидания
++    # по заголовку X-Ratelimit-Retry (WB finance-api: 1 запрос в минуту).
++    RATE_LIMIT_RETRIES: int = Field(default=2, description="Повторы после HTTP 429")
++    RATE_LIMIT_MAX_WAIT_SEC: int = Field(
++        default=70, description="Максимальное ожидание по X-Ratelimit-Retry, сек"
++    )
+     # Бюджет браузерного разбора витрин (сек): WB/Ozon отвечают медленно,
+     # но отчёт не должен ждать браузер дольше этого значения.
+     LISTINGS_BROWSER_BUDGET_SEC: int = Field(
+diff --git a/services/common/buyer_questions.py b/services/common/buyer_questions.py
+index 5e22aea..71179df 100644
+--- a/services/common/buyer_questions.py
++++ b/services/common/buyer_questions.py
+@@ -1,8 +1,9 @@
+ import asyncio
++import re
+ from typing import Optional
+ 
+ from products_catalog import get_catalog_product
+-from services.common.gemini import generate
++from services.common.gemini import GeminiUnavailable, generate
+ 
+ BRAND_MATRIX_RULES = """
+ ПОДТВЕРЖДЁННАЯ БАЗА ЗНАНИЙ ПО СЕРИЯМ БРЕНДА YASOKO (банки 15 г):
+@@ -27,7 +28,58 @@ BRAND_MATRIX_RULES = """
+ 
+ async def call_fast_gemini(prompt: str, raise_on_error: bool = False) -> str:
+     # Параметр сохранён для совместимости, но фиктивный ответ недопустим.
+-    text, _ = await generate(prompt, max_tokens=800, fast=True, timeout=30)
++    # Лимит 1200: модели 3.x тратят часть токенов на «размышления», при 800
++    # ответ обрезался по MAX_TOKENS и отбрасывался как пустой.
++    text, _ = await generate(prompt, max_tokens=1200, fast=True, timeout=30)
++    return text
++
++
++# --- Фильтр опасных советов -------------------------------------------------
++# Прежний фильтр искал подстроки «спирт/нагре» во всём ответе и отклонял
++# безопасные фразы вида «не разбавляйте гель спиртом» или «в лампе гель может
++# нагреваться — это нормально». Теперь проверяется каждое предложение отдельно:
++# отрицание («не», «нельзя», «без») снимает флаг, а «нагре*» рядом с лампой
++# и полимеризацией — описание процесса, а не совет подогревать продукт.
++_HARD_RISK_RE = re.compile(
++    r"спирт|растворител|ацетон|разбав|подогре|подогрев|обезжирь", re.IGNORECASE
++)
++_HEAT_RE = re.compile(r"нагре|нагрев|прогре|прогрев", re.IGNORECASE)
++_NEGATION_RE = re.compile(
++    r"\b(?:не|нельзя|запрещ\w*|избегайте|избегать|без|никогда|ни в коем случае)\b",
++    re.IGNORECASE,
++)
++_LAMP_CONTEXT_RE = re.compile(
++    r"лампа|лампе|лампы|полимериз|тепл|жж[её]т|печ[её]т|ощущени|ощущать|реакци",
++    re.IGNORECASE,
++)
++
++
++def has_unsafe_advice(text: str) -> bool:
++    """True, если в ответе есть совет разбавлять/подогревать/протирать продукт."""
++    for sentence in re.split(r"(?<=[.!?…])\s+|\n+", text or ""):
++        if not sentence.strip() or _NEGATION_RE.search(sentence):
++            continue
++        if _HARD_RISK_RE.search(sentence):
++            return True
++        if _HEAT_RE.search(sentence) and not _LAMP_CONTEXT_RE.search(sentence):
++            return True
++    return False
++
++
++_STRICT_SUFFIX = (
++    "\n\nВАЖНО: в ответе вообще не упоминай спирт, растворители, разбавление, "
++    "подогрев и нагрев продукта. Только факты из базы знаний выше."
++)
++_REVIEW_CLOSING = "Желаем красивого маникюра и отличного настроения! Будем рады видеть вас снова."
++
++
++def _ensure_review_shape(reply: str) -> str:
++    """Приветствие и завершающее пожелание обязательны по ТЗ (раньше терялись)."""
++    text = reply.strip()
++    if not text.lower().startswith("здравствуйте"):
++        text = "Здравствуйте! " + text
++    if "желаем" not in text.lower()[-200:]:
++        text = text.rstrip() + " " + _REVIEW_CLOSING
+     return text
+ 
+ 
+@@ -61,14 +113,22 @@ async def generate_buyer_question_answer(question_text: str, sku: Optional[str]
+ ГЛАВНЫЕ ТРЕБОВАНИЯ:
+ 1. Поздоровайся и дай конкретный, полезный ответ по матрице YaSoKo и данным карточки выше.
+ 2. Если вопрос выходит за рамки известных характеристик, честно попроси уточнить у продавца; не обещай конкретные даты поставок.
+-3. Не советуй спирт, растворители или нагрев. Объём: 2–4 предложения.
++3. Не упоминай спирт, растворители, разбавление и нагрев продукта. Объём: 2–4 предложения.
++4. Не предлагай другие линейки и товары, если об этом не спросили.
+ """
+-    reply = await call_fast_gemini(prompt, raise_on_error=True)
+-    if not reply.strip():
+-        raise RuntimeError("Gemini вернул пустой ответ; публикация отменена")
+-    if any(term in reply.lower() for term in ("спирт", "растворител", "подогре", "нагре")):
+-        raise RuntimeError("Ответ содержит неподтверждённый совет; публикация отменена")
+-    return reply
++    last_problem = "Gemini вернул пустой ответ; публикация отменена"
++    for attempt in range(3):
++        reply = await call_fast_gemini(
++            prompt + (_STRICT_SUFFIX if attempt else ""), raise_on_error=True
++        )
++        if not reply.strip():
++            last_problem = "Gemini вернул пустой ответ; публикация отменена"
++            continue
++        if has_unsafe_advice(reply):
++            last_problem = "Ответ содержит неподтверждённый совет; публикация отменена"
++            continue
++        return reply
++    raise RuntimeError(last_problem)
+ 
+ 
+ async def generate_review_reply(review_text: str, rating: Optional[int], sku: Optional[str] = None) -> str:
+@@ -85,22 +145,30 @@ async def generate_review_reply(review_text: str, rating: Optional[int], sku: Op
+ «{review_text}»
+ 
+ ТРЕБОВАНИЯ:
+-0. Не рекомендуй спирт, растворители, нагрев продукта или неподтверждённые процедуры.
++0. Не упоминай спирт, растворители, разбавление, подогрев и нагрев продукта.
+ 1. Начни с вежливого приветствия: «Здравствуйте!», поблагодари за выбор бренда YaSoKo и обратную связь.
+ 2. Персонализируй ответ: учти серию товара по артикулу ({sku or ''}) и конкретные детали из комментария покупателя (оттенок, консистенция, результат).
+ 3. Если покупатель отмечает плотность/густоту — тактично поясни особенность серии (средне-вязкий гель 1001–1408 или плотное желе 1501–1512) без запрещённых советов.
+-4. Заверши тёплым пожеланием: «Желаем красивого маникюра и отличного настроения! Будем рады видеть вас снова.».
+-5. Объём: 3–4 предложения.
++4. Если оценка 1–3 — выскажи сожаление и предложи написать в чат магазина для разбора; не спорь и не обвиняй покупателя.
++5. Не предлагай другие линейки и товары: упоминай только то, что есть в базе знаний и нужно по сути отзыва.
++6. Заверши тёплым пожеланием: «{_REVIEW_CLOSING}».
++7. Объём: 3–4 предложения.
+ """
++    last_error: Optional[RuntimeError] = None
+     for attempt in range(3):
+         try:
+-            reply = await call_fast_gemini(prompt, raise_on_error=True)
+-            if any(term in reply.lower() for term in ("спирт", "растворител", "подогре", "нагре")):
+-                raise RuntimeError("Ответ содержит неподтвержденный совет; публикация отменена")
++            reply = await call_fast_gemini(
++                prompt + (_STRICT_SUFFIX if attempt else ""), raise_on_error=True
++            )
+             if not reply.strip():
+                 raise RuntimeError("Gemini вернул пустой ответ")
+-            return reply
+-        except RuntimeError:
+-            if attempt == 2:
+-                raise
+-            await asyncio.sleep(2 ** attempt)
+\ No newline at end of file
++            if has_unsafe_advice(reply):
++                raise RuntimeError("Ответ содержит неподтвержденный совет; публикация отменена")
++            return _ensure_review_shape(reply)
++        except GeminiUnavailable:
++            raise  # все маршруты уже перебраны внутри generate(); повторы только тратят время
++        except RuntimeError as exc:
++            last_error = exc
++            if attempt < 2:
++                await asyncio.sleep(2 ** attempt)
++    raise last_error or RuntimeError("Не удалось подготовить ответ")
+diff --git a/services/common/gemini.py b/services/common/gemini.py
+index 50efd00..31e518f 100644
+--- a/services/common/gemini.py
++++ b/services/common/gemini.py
+@@ -8,6 +8,7 @@ to the next route — this is what makes the module survive a dead proxy.
+ import asyncio
+ import logging
+ import re
++import time
+ from typing import Any
+ 
+ import aiohttp
+@@ -23,22 +24,37 @@ from services.common.routes import (
+ 
+ logger = logging.getLogger(__name__)
+ 
+-# Актуальные текстовые модели Google (проверено по документации 11.2026).
+-# Старые gemini-2.5-* автоматически переадресуются Google с 01.12.2026,
+-# поэтому фолбэк-цепочка начинается с текущего поколения.
++# Статусы, при которых виновата модель/квота/перегрузка, а не маршрут: пробуем
++# следующую модель на том же маршруте. Раньше 503 (перегрузка модели) объявлял
++# маршрут мёртвым, и рабочий прокси уходил в карантин.
++_MODEL_LEVEL_STATUSES = frozenset({400, 401, 403, 404, 408, 409, 429, 500, 502, 503, 504})
++_CATALOG_TTL_SEC = 3600
++_catalog_cache: dict[str, tuple[float, list[str]]] = {}
++
++
++class GeminiUnavailable(RuntimeError):
++    """Gemini недоступен по всем маршрутам/моделям. Повторять сразу бессмысленно."""
++
++# Актуальные текстовые модели Google (сверено с документацией на 20.11.2026):
++# * gemini-3.8-flash (02.09.2026) — текущая Flash-модель;
++# * gemini-3.6-flash — без объявленной даты отключения в Gemini API;
++# * gemini-3.5-flash / 3.5-flash-lite — действуют (3.5-flash маршрутизируется на 3.6);
++# * gemini-3.1-flash-lite — действует до 07.05.2027 (эконом-модель).
++# gemini-2.5-* объявлены устаревшими 02.11.2026 («только существующим
++# пользователям», с 01.12.2026 перенаправляются Google) — в цепочке их больше нет:
++# новому ключу они отвечают 404/403 и только тратят время.
+ FALLBACK_MODELS = [
+-    "gemini-3.1-flash-lite",
+     "gemini-3.8-flash",
++    "gemini-3.6-flash",
+     "gemini-3.5-flash",
+     "gemini-3.5-flash-lite",
+-    "gemini-3.6-flash",
+-    "gemini-2.5-flash",
++    "gemini-3.1-flash-lite",
+ ]
+ FAST_MODELS = [
+     "gemini-3.1-flash-lite",
+     "gemini-3.5-flash-lite",
+-    "gemini-2.5-flash-lite",
+     "gemini-3.8-flash",
++    "gemini-3.6-flash",
+ ]
+ _NON_TEXT_TAGS = (
+     "tts",
+@@ -85,7 +101,10 @@ def _model_chain(fast: bool) -> list[str]:
+ 
+ 
+ async def _get_available_models(session, route: str = DIRECT) -> list[str]:
+-    """Server-reported models; a failure here must not kill generation."""
++    """Server-reported models (кэш на час); a failure here must not kill generation."""
++    cached = _catalog_cache.get(route)
++    if cached and time.monotonic() - cached[0] < _CATALOG_TTL_SEC:
++        return list(cached[1])
+     try:
+         async with (
+             await session.get(
+@@ -97,13 +116,20 @@ async def _get_available_models(session, route: str = DIRECT) -> list[str]:
+             data = await resp.json()
+     except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, OSError):
+         return []
+-    return [
++    models = [
+         _extract_model_name(item)
+         for item in data.get("models", [])
+         if isinstance(item, dict)
+         and "generateContent" in item.get("supportedGenerationMethods", [])
+         and _is_supported_text_model(_extract_model_name(item))
+     ]
++    if models:
++        _catalog_cache[route] = (time.monotonic(), models)
++    return models
++
++
++def _truncated(candidate: dict) -> bool:
++    return candidate.get("finishReason") == "MAX_TOKENS"
+ 
+ 
+ def _text_from_candidate(candidate: dict) -> str:
+@@ -126,12 +152,23 @@ async def generate(
+ ) -> tuple[str, str]:
+     if not settings.GEMINI_API_KEY:
+         raise RuntimeError("Не задан ключ Gemini")
+-
+-    payload = {
+-        "contents": [{"parts": [{"text": prompt}]}],
+-        "generationConfig": {"temperature": temperature, "maxOutputTokens": max_tokens},
+-    }
+     total = timeout or settings.GEMINI_TIMEOUT
++    # Жёсткий потолок на весь вызов: маршруты × модели × таймауты раньше могли
++    # занимать минуты, и автоответы Ozon упирались в бюджет задания.
++    overall = max(total * 2, 30)
++    try:
++        return await asyncio.wait_for(
++            _generate(prompt, max_tokens, temperature, fast, total), timeout=overall
++        )
++    except asyncio.TimeoutError as exc:
++        raise GeminiUnavailable(
++            f"Gemini не ответил за {overall} с (маршруты/модели исчерпаны по времени)"
++        ) from exc
++
++
++async def _generate(
++    prompt: str, max_tokens: int, temperature: float, fast: bool, total: int
++) -> tuple[str, str]:
+     headers = {
+         "x-goog-api-key": settings.GEMINI_API_KEY,
+         "Content-Type": "application/json",
+@@ -139,7 +176,7 @@ async def generate(
+     try:
+         raw_routes = request_routes("gemini")
+     except ValueError as exc:
+-        raise RuntimeError(str(exc)) from exc
++        raise GeminiUnavailable(str(exc)) from exc
+     available = [r for r in raw_routes if route_available("gemini", r)]
+     routes = available + [r for r in raw_routes if r not in available]
+ 
+@@ -148,6 +185,8 @@ async def generate(
+         proxy = {} if route == DIRECT else {"proxy": route}
+         route_label = "напрямую" if route == DIRECT else route
+         route_broken = False
++        model_5xx = 0
++        model_tries = 0
+         try:
+             async with aiohttp.ClientSession(
+                 trust_env=False,
+@@ -156,64 +195,93 @@ async def generate(
+             ) as session:
+                 models = await _get_available_models(session, route)
+                 preferred = _model_chain(fast)
+-                # При доступном каталоге используем только модели с поддержкой
+-                # generateContent, отдавая приоритет стабильной модели и настройке.
+-                chain = ([n for n in preferred if n in models] +
+-                         [n for n in models if n not in preferred]) if models else preferred
++                if models:
++                    extras = [
++                        n for n in models
++                        if n not in preferred
++                        and re.match(r"gemini-[3-9]", n)
++                        and "pro" not in n
++                    ][:2]
++                    chain = [n for n in preferred if n in models] + extras
++                else:
++                    chain = preferred
+                 for name in chain:
+                     url = f"{BASE_URL}/{name}:generateContent"
+-                    try:
+-                        async with session.post(url, json=payload, **proxy) as resp:
+-                            if resp.status != 200:
+-                                # Не выводим текст ошибки: в нём могут быть ключи,
+-                                # входные данные или прочая конфиденциальная информация.
+-                                api_status = ""
+-                                try:
+-                                    error_data = await resp.json()
+-                                    status = (error_data.get("error") or {}).get("status")
+-                                    if status in {"INVALID_ARGUMENT", "FAILED_PRECONDITION", "PERMISSION_DENIED", "UNAUTHENTICATED", "NOT_FOUND", "RESOURCE_EXHAUSTED"}:
+-                                        api_status = f" ({status})"
+-                                except (ValueError, TypeError, AttributeError, aiohttp.ClientError):
+-                                    pass
+-                                errors.append(f"{name}: HTTP {resp.status}{api_status}")
+-                                if resp.status == 400 and api_status == " (FAILED_PRECONDITION)":
+-                                    # Геоблок маршрута (например, прямой РФ-IP): в карантин и сразу на прокси.
+-                                    route_broken = True
+-                                    break
+-                                if resp.status in (400, 401, 403, 404, 429):
+-                                    # Ошибка модели, прав или квоты (429): пробуем следующую модель
+-                                    # на том же рабочем маршруте, не блокируя локальный прокси.
+-                                    continue
+-                                route_broken = resp.status in (408, 425, 498, 500, 502, 503, 504)
+-                                break  # route problem, next route
+-                            data = await resp.json()
+-                    except (
+-                        aiohttp.ClientError,
+-                        asyncio.TimeoutError,
+-                        OSError,
+-                        ValueError,
+-                    ) as exc:
+-                        errors.append(f"{route_label}: {type(exc).__name__}")
+-                        route_broken = True
++                    tokens = max_tokens
++                    for attempt in range(2):
++                        payload = {
++                            "contents": [{"parts": [{"text": prompt}]}],
++                            "generationConfig": {
++                                "temperature": temperature,
++                                "maxOutputTokens": tokens,
++                            },
++                        }
++                        try:
++                            async with session.post(url, json=payload, **proxy) as resp:
++                                if resp.status != 200:
++                                    # Тело ошибки не выводим: там могут быть ключи и данные.
++                                    api_status = ""
++                                    try:
++                                        error_data = await resp.json()
++                                        status = (error_data.get("error") or {}).get("status")
++                                        if status in {
++                                            "INVALID_ARGUMENT", "FAILED_PRECONDITION",
++                                            "PERMISSION_DENIED", "UNAUTHENTICATED",
++                                            "NOT_FOUND", "RESOURCE_EXHAUSTED", "UNAVAILABLE",
++                                        }:
++                                            api_status = f" ({status})"
++                                    except (ValueError, TypeError, AttributeError, aiohttp.ClientError):
++                                        pass
++                                    model_tries += 1
++                                    errors.append(f"{name}: HTTP {resp.status}{api_status}")
++                                    if resp.status == 400 and api_status == " (FAILED_PRECONDITION)":
++                                        # Геоблок маршрута (РФ-IP): в карантин, сразу на прокси.
++                                        route_broken = True
++                                    elif resp.status >= 500:
++                                        model_5xx += 1
++                                    elif resp.status not in _MODEL_LEVEL_STATUSES:
++                                        route_broken = True
++                                    data = None
++                                else:
++                                    data = await resp.json()
++                        except (
++                            aiohttp.ClientError,
++                            asyncio.TimeoutError,
++                            OSError,
++                            ValueError,
++                        ) as exc:
++                            errors.append(f"{route_label}: {type(exc).__name__}")
++                            route_broken = True
++                            data = None
++                        if data is None:
++                            break  # к следующей модели (или маршруту при route_broken)
++                        truncated = False
++                        for candidate in data.get("candidates") or []:
++                            text = _text_from_candidate(candidate)
++                            if text:
++                                mark_route_ok("gemini", route)
++                                return text, name
++                            truncated = truncated or _truncated(candidate)
++                        if truncated and attempt == 0 and tokens < 8192:
++                            # Модели 3.x тратят часть лимита на «размышления»: короткий
++                            # лимит давал пустой ответ. Повторяем с удвоенным лимитом.
++                            tokens = min(tokens * 2, 8192)
++                            continue
++                        errors.append(f"{name}: пустой или незавершённый ответ")
++                        break
++                    if route_broken:
+                         break
+-                    for candidate in data.get("candidates") or []:
+-                        text = _text_from_candidate(candidate)
+-                        if text:
+-                            mark_route_ok("gemini", route)
+-                            return text, name
+-                    errors.append(f"{name}: пустой или незавершённый ответ")
+         except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+             mark_route_failed("gemini", route, type(exc).__name__)
+             errors.append(f"{route_label}: {type(exc).__name__}")
+             continue
++        if not route_broken and model_tries and model_5xx >= model_tries:
++            route_broken = True  # шлюз отвечает только 5xx по всем моделям
+         if route_broken:
+-            # Транспорт или шлюз маршрута: карантин, следующий маршрут.
+             mark_route_failed("gemini", route, errors[-1] if errors else "route")
+             continue
+-        # Route answered; a model-level failure here is not a route failure but
+-        # the next route may still have a different model catalogue.
+         logger.warning("Gemini через %s не дал ответа: %s", route_label, errors[-3:])
+ 
+-    raise RuntimeError(
++    raise GeminiUnavailable(
+         "Gemini недоступен ни по одному маршруту: " + ("; ".join(errors[-4:]) or "нет ответа")
+     )
+diff --git a/services/common/market_api.py b/services/common/market_api.py
+index 6c252f5..7d14782 100644
+--- a/services/common/market_api.py
++++ b/services/common/market_api.py
+@@ -11,7 +11,7 @@ from urllib.parse import urlsplit
+ 
+ import aiohttp
+ 
+-from config import LOGS_DIR
++from config import LOGS_DIR, settings
+ from services.common.routes import (
+     DIRECT,
+     request_routes,
+@@ -106,7 +106,7 @@ class MarketplaceClient:
+             if not route_available(self._service, route):
+                 continue
+             try:
+-                result = await self._request_once(
++                result = await self._request_with_rate_limit(
+                     method, url, headers, body, params, route
+                 )
+             except aiohttp.ClientResponseError as exc:  # pragma: no cover - internal
+@@ -138,6 +138,33 @@ class MarketplaceClient:
+             f"({'; '.join(transport_errors)})"
+         )
+ 
++    async def _request_with_rate_limit(
++        self, method: str, url: str, headers: dict, body: Any, params: Any, route: str
++    ) -> Any:
++        """Один маршрут + ожидание по HTTP 429.
++
++        WB/Ozon присылают в 429 точное время ожидания (X-Ratelimit-Retry /
++        Retry-After). Раньше его читали, но не ждали: отчёты WB падали с
++        «HTTP 429», хотя finance-api разрешает лишь 1 запрос в минуту и
++        достаточно подождать 60 с. Ждём ровно столько, сколько просит площадка
++        (не дольше RATE_LIMIT_MAX_WAIT_SEC), и повторяем на том же маршруте.
++        """
++        retries = max(int(settings.RATE_LIMIT_RETRIES), 0)
++        cap = max(int(settings.RATE_LIMIT_MAX_WAIT_SEC), 1)
++        for attempt in range(retries + 1):
++            try:
++                return await self._request_once(method, url, headers, body, params, route)
++            except APIStatusError as exc:
++                if exc.status != 429 or attempt >= retries or exc.retry_after > cap:
++                    raise
++                wait = max(exc.retry_after, 1) + 1
++                logging.getLogger(__name__).warning(
++                    "%s HTTP 429 %s: ожидание %s с (попытка %s/%s)",
++                    self._service, urlsplit(url).path, wait, attempt + 1, retries,
++                )
++                await asyncio.sleep(wait)
++        raise RuntimeError("unreachable")  # pragma: no cover
++
+     async def _request_once(
+         self,
+         method: str,
+diff --git a/services/common/routes.py b/services/common/routes.py
+index 5c35c78..53ab6be 100644
+--- a/services/common/routes.py
++++ b/services/common/routes.py
+@@ -31,8 +31,9 @@ logger = logging.getLogger(__name__)
+ 
+ DIRECT = "direct"
+ _cache = DiskCache(LOGS_DIR / "routes")
+-# service -> (route, monotonic deadline)
+-_cooldown: dict[str, tuple[str, float]] = {}
++# (service, route) -> monotonic deadline. Раньше карантин хранился одним слотом на
++# сервис: падение прокси стирало карантин прямого маршрута и наоборот.
++_cooldown: dict[tuple[str, str], float] = {}
+ # monotonic timestamps of consecutive failures per route fingerprint
+ _failures: dict[str, int] = {}
+ 
+@@ -105,6 +106,13 @@ def request_routes(service: str) -> list[str]:
+     proxies = _configured_proxies()
+     if key in MARKETPLACE_SERVICES and settings.MARKETPLACES_DIRECT_ONLY:
+         return [DIRECT]
++    if key == "gemini" and settings.GEMINI_PROXY_ONLY:
++        if not proxies:
++            raise ValueError(
++                "GEMINI_PROXY_ONLY=true, но LOCAL_PROXY_URL не задан: "
++                "укажите локальный HTTP-прокси"
++            )
++        return _prefer_last_working(service, proxies)
+     if key == "telegram" and settings.TELEGRAM_PROXY_ONLY:
+         if not proxies:
+             raise ValueError(
+@@ -164,7 +172,7 @@ def mark_route_failed(service: str, route: str, reason: str = "") -> None:
+     cooldown = max(int(settings.ROUTE_COOLDOWN_SECONDS), 0)
+     _failures[_fingerprint(route)] = _failures.get(_fingerprint(route), 0) + 1
+     if cooldown:
+-        _cooldown[service] = (route, time.monotonic() + cooldown)
++        _cooldown[(service, route)] = time.monotonic() + cooldown
+         logger.warning(
+             "Маршрут %s для %s в карантине %s с: %s",
+             route,
+@@ -176,17 +184,13 @@ def mark_route_failed(service: str, route: str, reason: str = "") -> None:
+ 
+ def mark_route_ok(service: str, route: str) -> None:
+     _failures[_fingerprint(route)] = 0
+-    current = _cooldown.get(service)
+-    if current and current[0] == route:
+-        _cooldown.pop(service, None)
++    _cooldown.pop((service, route), None)
+     remember_route(service, route)
+ 
+ 
+ def route_available(service: str, route: str) -> bool:
+-    current = _cooldown.get(service)
+-    if not current or current[0] != route:
+-        return True
+-    return time.monotonic() >= current[1]
++    deadline = _cooldown.get((service, route))
++    return deadline is None or time.monotonic() >= deadline
+ 
+ 
+ def _ordered_available(service: str) -> list[str]:
+diff --git a/services/common/timeutil.py b/services/common/timeutil.py
+new file mode 100644
+index 0000000..5aebd63
+--- /dev/null
++++ b/services/common/timeutil.py
+@@ -0,0 +1,22 @@
++"""Единый источник «сегодня» по московскому времени.
++
++``datetime.utcnow().date()`` отставал от Москвы на 3 часа: с 00:00 до 03:00 MSK
++отчёты «за 7 дней» заканчивались вчерашним днём, а запросы к WB/Ozon за «сегодня»
++получали пустой период. К тому же ``utcnow`` объявлен устаревшим в Python 3.12.
++"""
++
++from datetime import date, datetime
++from zoneinfo import ZoneInfo
++
++from config import settings
++
++
++def now_local() -> datetime:
++    try:
++        return datetime.now(ZoneInfo(settings.TIMEZONE))
++    except Exception:  # noqa: BLE001 — неверный TIMEZONE не должен ронять отчёты
++        return datetime.now(ZoneInfo("Europe/Moscow"))
++
++
++def today_local() -> date:
++    return now_local().date()
+diff --git a/services/competitors/browser_listings.py b/services/competitors/browser_listings.py
+index 4dae773..f245ed4 100644
+--- a/services/competitors/browser_listings.py
++++ b/services/competitors/browser_listings.py
+@@ -262,6 +262,25 @@ def parse_ozon_widget_states(
+     return items
+ 
+ 
++_CARD_NOISE_RE = re.compile(
++    r"(?:\+\s*\d+\s*морков\w*|бренд проверен|чёрная пятница|черная пятница|"
++    r"стало дешевле|новинка|хит продаж|распродажа|опция|осталось\s+\d+\s*шт\.?|"
++    r"\d[\d\s\u00a0\u2009]*(?:[.,]\d+)?\s*[₽%]|\b\d+\s*бал+(?:ов|а)?\b)",
++    re.IGNORECASE,
++)
++
++
++def clean_card_name(text: str, limit: int = 120) -> str:
++    """Название из текста DOM-карточки без цен, акционных плашек и счётчиков.
++
++    Раньше в название попадал весь innerText («+210 морковок 688 ₽ Стало де...»),
++    и отчёт конкурентов показывал мусор вместо наименования.
++    """
++    cleaned = _CARD_NOISE_RE.sub(" ", str(text or ""))
++    cleaned = re.sub(r"\s+", " ", cleaned).strip(" -—·|,.")
++    return cleaned[:limit]
++
++
+ def parse_ozon_dom_cards(cards: List[Dict[str, Any]], limit: int = 15) -> List[Dict[str, Any]]:
+     """DOM-резерв: берёт текст карточек и вытаскивает цену и ссылку на товар."""
+     items: List[Dict[str, Any]] = []
+@@ -285,7 +304,7 @@ def parse_ozon_dom_cards(cards: List[Dict[str, Any]], limit: int = 15) -> List[D
+         prices = {v for v in prices if v > 0}
+         if len(prices) != 1:
+             continue
+-        name = re.sub(r"\s+", " ", text).strip()[:180] or f"Товар Ozon {sku}"
++        name = clean_card_name(text) or f"Товар Ozon {sku}"
+         seen.add(sku)
+         items.append(
+             {
+diff --git a/services/competitors/deep_parser.py b/services/competitors/deep_parser.py
+index a03c482..3a723d5 100644
+--- a/services/competitors/deep_parser.py
++++ b/services/competitors/deep_parser.py
+@@ -89,6 +89,11 @@ async def _fetch_json(
+             trust_env=False,
+             timeout=timeout,
+             headers=headers,
++            # Антибот WB отдаёт огромные Set-Cookie/служебные заголовки; при лимите
++            # 8190 байт aiohttp бросал ClientResponseError(status=0, message='') —
++            # именно эта «ошибка 0» с длинным URL попадала в Telegram.
++            max_line_size=65536,
++            max_field_size=65536,
+         ) as session:
+             for _ in range(max_redirects + 1):
+                 async with session.get(current, allow_redirects=False) as resp:
+@@ -126,8 +131,13 @@ async def _fetch_json(
+             return None, "Слишком много редиректов", False
+     except asyncio.TimeoutError:
+         return None, f"Таймаут запроса ({timeout.total} сек.)", True
++    except aiohttp.ClientResponseError as exc:
++        return None, (
++            f"HTTP-ответ витрины не разобран (status={exc.status}); "
++            "вероятно, антибот-защита"
++        ), False
+     except aiohttp.ClientError as exc:
+-        return None, f"Сетевая ошибка aiohttp ({type(exc).__name__}: {exc})", True
++        return None, f"Сетевая ошибка aiohttp ({type(exc).__name__})", True
+     except OSError as exc:
+         return None, f"Ошибка сокета ({type(exc).__name__}: {exc})", True
+     finally:
+@@ -247,7 +257,7 @@ async def _parse_wb_competitors_with_status(
+                 err_msg = "WB: пустая выдача"
+             else:
+                 err_msg = "WB: неизвестный формат выдачи"
+-        errors.append(f"{url.split('?')[1][:40]}…: {err_msg}")
++        errors.append(str(err_msg))
+         logger.warning("[Competitors WB] %s", err_msg)
+         if err_msg and ("403" in err_msg or "498" in err_msg):
+             antibot_hits += 1
+@@ -261,7 +271,7 @@ async def _parse_wb_competitors_with_status(
+         # решил JVO1, поэтому воспроизведение из httpx не работает.
+         err_msg = (
+             "витрина WB не отдала карточки (антибот-защита поиска): "
+-            + "; ".join(errors[-2:])
++            + "; ".join(dict.fromkeys(errors)) [:300]
+         )
+         browser_items, browser_err = await _wb_browser_fallback(clean_query, safe_count)
+         if browser_items:
+@@ -585,9 +595,11 @@ async def run_full_competitor_deep_audit(category_query: str) -> Tuple[str, Dict
+             buyer_price = _safe_float(comp.get("buyer_price"), 0.0)
+             rating = _safe_float(comp.get("rating"), 0.0)
+             feedbacks = _safe_int(comp.get("feedbacks"), 0)
++            # DOM-резерв не видит рейтинг: «⭐ 0.0 (0)» выглядел как реальная оценка.
++            rating_lbl = "⭐ нет данных" if rating <= 0.0 and feedbacks <= 0 else f"⭐ {rating:.1f} ({feedbacks})"
+             html_rows.append(
+                 f"• [{mp_lbl}] Арт. <code>{sku_lbl}</code> | <b>{brand_lbl}</b> — {name_lbl}\n"
+-                f"   Витрина: <b>{buyer_price:.0f} ₽</b> | ⭐ {rating:.1f} ({feedbacks})"
++                f"   Витрина: <b>{buyer_price:.0f} ₽</b> | {rating_lbl}"
+             )
+         return html_rows
+ 
+diff --git a/services/ozon/browser_reviews.py b/services/ozon/browser_reviews.py
+index de44325..c4c9d8c 100644
+--- a/services/ozon/browser_reviews.py
++++ b/services/ozon/browser_reviews.py
+@@ -91,6 +91,20 @@ _RU_MONTH_PREFIXES: Tuple[Tuple[str, int], ...] = (
+ )
+ 
+ 
++def _deadline(max_runtime_sec: Optional[float]) -> Optional[float]:
++    return time.monotonic() + max_runtime_sec if max_runtime_sec else None
++
++
++def _expired(deadline: Optional[float]) -> bool:
++    """Мягкий дедлайн: останавливаемся между действиями, а не посреди публикации.
++
++    Внешний asyncio.wait_for отменял задачу на полуоткрытой шторке отзыва
++    (бюджет 10 мин превышался каждые 30 минут), поэтому модуль сам завершает
++    обход заранее и закрывает браузер штатно.
++    """
++    return deadline is not None and time.monotonic() >= deadline
++
++
+ def _get_min_target_date() -> datetime:
+     raw = str(getattr(settings, "OZON_REVIEWS_MIN_DATE", "") or "").strip()
+     if raw:
+@@ -882,6 +896,7 @@ async def _visit_review(
+     tracker, dry_run, records, attempted,
+ ) -> None:
+     from services.common.buyer_questions import generate_review_reply
++    from services.common.gemini import GeminiUnavailable
+ 
+     if await _overlays(page).count():
+         raise RuntimeError("Перед открытием отзыва уже видна другая панель; обход остановлен")
+@@ -914,6 +929,10 @@ async def _visit_review(
+                 reply = _clean_text_for_input(
+                     await generate_review_reply(comment or "Без комментария", stars, sku)
+                 )
++            except GeminiUnavailable:
++                # Gemini лежит целиком: остановить цикл, а не перебирать остальные
++                # отзывы по 3 попытки на каждый (так выбирался весь бюджет).
++                raise
+             except RuntimeError as exc:
+                 raise _SkipReview(str(exc)) from exc
+             if _complete(reply):
+@@ -995,7 +1014,9 @@ async def _row_has_table_answers(cells, cell_count: int, ans_col_idx: Optional[i
+     return ans_str.isdigit() and int(ans_str) > 0
+ 
+ 
+-async def _scan_reviews(page, tracker, dry_run: bool, max_per_run: int) -> dict:
++async def _scan_reviews(
++    page, tracker, dry_run: bool, max_per_run: int, deadline: Optional[float] = None
++) -> dict:
+     records, failures, attempted = [], [], set()
+     start = tracker["replied_count"]
+     budget = min(max_per_run, MAX_DAILY_REPLIES - start)
+@@ -1011,7 +1032,7 @@ async def _scan_reviews(page, tracker, dry_run: bool, max_per_run: int) -> dict:
+ 
+     max_pages_per_tab = 5
+     for title, names in tabs:
+-        if len(records) >= budget:
++        if len(records) >= budget or _expired(deadline):
+             break
+         if names and not await _review_tab(page, names):
+             failures.append(f"Не найдена вкладка «{title}»")
+@@ -1024,6 +1045,9 @@ async def _scan_reviews(page, tracker, dry_run: bool, max_per_run: int) -> dict:
+         page_saw_fresh_or_undated = False
+ 
+         while idle < 2 and len(records) < budget:
++            if _expired(deadline):
++                failures.append("Обход остановлен по бюджету времени; продолжится в следующем цикле")
++                break
+             rows = page.locator("tbody tr")
+             opened = False
+             for i in range(await rows.count()):
+@@ -1118,6 +1142,7 @@ async def auto_reply_unanswered_reviews(
+     headless: bool = True,
+     dry_run: bool = False,
+     max_per_run: int = 1,
++    max_runtime_sec: Optional[float] = None,
+ ) -> Dict[str, Any]:
+     if not PLAYWRIGHT_AVAILABLE:
+         return {"status": "error", "replied": 0, "message": PLAYWRIGHT_MISSING_MESSAGE}
+@@ -1143,7 +1168,9 @@ async def auto_reply_unanswered_reviews(
+                 if "login" in page.url.lower():
+                     return {"status": "need_auth", "replied": 0, "message": "Необходима авторизация Ozon"}
+                 await page.wait_for_timeout(1500)
+-                return await _scan_reviews(page, tracker, dry_run, max_per_run)
++                return await _scan_reviews(
++                    page, tracker, dry_run, max_per_run, _deadline(max_runtime_sec)
++                )
+             finally:
+                 await _close_browser_context_safe(context)
+     except Exception as exc:
+@@ -1162,6 +1189,7 @@ async def auto_reply_unanswered_questions(
+     headless: bool = True,
+     dry_run: bool = False,
+     max_per_run: int = 1,
++    max_runtime_sec: Optional[float] = None,
+ ) -> Dict[str, Any]:
+     if not PLAYWRIGHT_AVAILABLE:
+         return {"status": "error", "replied": 0, "message": PLAYWRIGHT_MISSING_MESSAGE}
+@@ -1177,6 +1205,7 @@ async def auto_reply_unanswered_questions(
+         }
+ 
+     replied_count = 0
++    deadline = _deadline(max_runtime_sec)
+     questions_found: List[Dict[str, Any]] = []
+     processed_q_keys: Set[str] = set()
+ 
+@@ -1216,7 +1245,7 @@ async def auto_reply_unanswered_questions(
+                     }
+ 
+                 for sub_title, sub_variants in QUESTION_SUBTABS:
+-                    if tracker.get("replied_count", 0) >= MAX_DAILY_REPLIES or replied_count >= max_per_run:
++                    if tracker.get("replied_count", 0) >= MAX_DAILY_REPLIES or replied_count >= max_per_run or _expired(deadline):
+                         break
+ 
+                     await _close_question_drawer(page)
+@@ -1225,7 +1254,7 @@ async def auto_reply_unanswered_questions(
+ 
+                     no_new_rows_count = 0
+                     while no_new_rows_count < 3:
+-                        if tracker.get("replied_count", 0) >= MAX_DAILY_REPLIES or replied_count >= max_per_run:
++                        if tracker.get("replied_count", 0) >= MAX_DAILY_REPLIES or replied_count >= max_per_run or _expired(deadline):
+                             break
+ 
+                         rows = page.locator("tbody tr")
+@@ -1233,7 +1262,7 @@ async def auto_reply_unanswered_questions(
+                         new_rows_in_pass = 0
+ 
+                         for i in range(row_count):
+-                            if tracker.get("replied_count", 0) >= MAX_DAILY_REPLIES or replied_count >= max_per_run:
++                            if tracker.get("replied_count", 0) >= MAX_DAILY_REPLIES or replied_count >= max_per_run or _expired(deadline):
+                                 break
+ 
+                             await _close_question_drawer(page)
+diff --git a/services/ozon/seller_api.py b/services/ozon/seller_api.py
+index b8d925a..1bbcbed 100644
+--- a/services/ozon/seller_api.py
++++ b/services/ozon/seller_api.py
+@@ -6,6 +6,7 @@ from decimal import Decimal
+ from typing import Any, Dict, List, Optional
+ 
+ from config import settings
++from services.common.timeutil import now_local, today_local
+ from products_catalog import PRODUCTS_CATALOG
+ from services.ozon.finance import (
+     accrual_category,
+@@ -206,7 +207,7 @@ class OzonSellerAPI(MarketplaceClient):
+ 
+         sales_7d_map = self._read_disk_cache("ordered_units", 1800)
+         if sales_7d_map is None:
+-            end = datetime.utcnow().date()
++            end = today_local()
+             try:
+                 sales_7d_map = {}
+                 offset = 0
+@@ -381,7 +382,7 @@ class OzonSellerAPI(MarketplaceClient):
+         return str(data["access_token"])
+ 
+     async def fetch_active_ad_campaigns(self, days: int = 7) -> List[Dict[str, Any]]:
+-        end = datetime.utcnow().date()
++        end = today_local()
+         key = f"campaigns:{settings.OZON_PERF_CLIENT_ID}:{end}:{days}"
+         cached = self._read_disk_cache(key, 900)
+         if cached is not None:
+@@ -518,7 +519,7 @@ class OzonSellerAPI(MarketplaceClient):
+         `/v1/analytics/data` по измерению `sku`: количество и выручка.
+         Возвращает (строки заказов, подпись источника).
+         """
+-        end = datetime.utcnow().date()
++        end = today_local()
+         start = end - timedelta(days=max(int(days), 1) - 1)
+         key = f"sales_by_sku:{start.isoformat()}:{end.isoformat()}"
+         cached = self._read_disk_cache(key, 1800)
+@@ -705,7 +706,7 @@ class OzonSellerAPI(MarketplaceClient):
+         /v1/finance/accrual/by-day (обход по суткам, курсор last_id), и при
+         доступности /v1/finance/cash-flow-statement/list для сверки периодов.
+         """
+-        now_utc = datetime.utcnow()
++        now_utc = now_local().replace(tzinfo=None)
+         if custom_date_from and custom_date_to:
+             start_dt = datetime.strptime(custom_date_from, "%Y-%m-%d")
+             end_dt = datetime.strptime(custom_date_to, "%Y-%m-%d").replace(
+diff --git a/services/wb/statistics_api.py b/services/wb/statistics_api.py
+index 6b6a877..851d554 100644
+--- a/services/wb/statistics_api.py
++++ b/services/wb/statistics_api.py
+@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
+ from typing import Any, Dict, List, Optional
+ 
+ from config import settings
++from services.common.timeutil import today_local
+ from services.common.market_api import APIStatusError, MarketplaceClient, read_versions
+ 
+ logger = logging.getLogger(__name__)
+@@ -22,6 +23,10 @@ def _exc_label(exc: BaseException) -> str:
+         return f"HTTP {exc.status}"
+     if isinstance(exc, AmbiguousFinancePeriod):
+         return str(exc)
++    # Собственные диагностические строки модуля («WB: ...») не содержат ключей и
++    # данных; раньше вместо них в отчёт попадало безликое «RuntimeError».
++    if isinstance(exc, RuntimeError) and str(exc).startswith("WB"):
++        return str(exc)[:200]
+     return type(exc).__name__
+ 
+ 
+@@ -89,7 +94,7 @@ class WBStatisticsAPI(MarketplaceClient):
+ 
+     async def fetch_wb_tariffs(self) -> dict:
+         """Тарифы WB. Недоступность тарифов не должна отменять синхронизацию остатков."""
+-        today = datetime.utcnow().date().isoformat()
++        today = today_local().isoformat()
+         key = "tariffs:" + today
+         async with self._tariffs_lock:
+             cached = self._read_disk_cache(key, 21600)
+@@ -340,7 +345,7 @@ class WBStatisticsAPI(MarketplaceClient):
+ 
+         buyer_price_map: Dict[int, float] = {}
+         sales_count_7d = {}
+-        end = datetime.utcnow().date()
++        end = today_local()
+         end_date = end.isoformat()
+         date_7d = (end - timedelta(days=6)).isoformat()
+ 
+@@ -528,7 +533,7 @@ class WBStatisticsAPI(MarketplaceClient):
+         return quantities, locations
+ 
+     async def fetch_active_ad_campaigns(self, days: int = 7) -> list:
+-        end = datetime.utcnow().date()
++        end = today_local()
+         start = end - timedelta(days=days - 1)
+         key = f"campaigns:{start}:{end}"
+         cached = self._read_disk_cache(key, 900)
+@@ -802,7 +807,7 @@ class WBStatisticsAPI(MarketplaceClient):
+         путь; при пустой детализации берётся «Лента заказов», где есть только
+         цена и количество. Возвращает (строки заказов, подпись источника).
+         """
+-        end = datetime.utcnow().date()
++        end = today_local()
+         date_from = (end - timedelta(days=max(int(days), 1) - 1)).isoformat()
+         date_to = end.isoformat()
+         key = f"sales_by_sku:{date_from}:{date_to}"
+@@ -880,7 +885,7 @@ class WBStatisticsAPI(MarketplaceClient):
+         Если детализация за период пуста (отчёт ещё не сформирован), берутся
+         итоги закрытых отчётов из /sales-reports/list с явной пометкой источника.
+         """
+-        end = datetime.utcnow().date()
++        end = today_local()
+         date_from = custom_date_from or (end - timedelta(days=days - 1)).isoformat()
+         date_to = custom_date_to or end.isoformat()
+         key = f"finance_v2:{date_from}:{date_to}"
+diff --git a/tests/offline.py b/tests/offline.py
+index 349d1de..2c1881d 100644
+--- a/tests/offline.py
++++ b/tests/offline.py
+@@ -30,6 +30,14 @@ os.environ.update(
+     LOCAL_PROXY_URL="http://127.0.0.1:3066",
+     LOCAL_PROXY_FALLBACK_URL="",
+     OZON_REPLY_DRY_RUN="false",
++    # Старые тесты проверяют перебор «прямой → прокси»; продовые умолчания
++    # (Gemini/Telegram через прокси, площадки напрямую) проверяет tests/test_audit_20261120.py.
++    GEMINI_PROXY_ONLY="false",
++    TELEGRAM_PROXY_ONLY="false",
++    MARKETPLACES_DIRECT_ONLY="false",
++    GEMINI_MODEL="gemini-3.1-flash-lite",
++    GEMINI_FAST_MODEL="gemini-3.1-flash-lite",
++    RATE_LIMIT_RETRIES="0",
+ )
+ 
+ 
+diff --git a/tests/test_audit_20261120.py b/tests/test_audit_20261120.py
+new file mode 100644
+index 0000000..11d57ce
+--- /dev/null
++++ b/tests/test_audit_20261120.py
+@@ -0,0 +1,197 @@
++"""Регрессии по аудиту 20.11.2026: Gemini, 429, фильтр советов, маршруты."""
++
++import time
++import unittest
++from unittest.mock import AsyncMock, patch
++
++import aiohttp
++
++from services.common import buyer_questions, gemini, market_api, routes
++from services.common.buyer_questions import has_unsafe_advice
++
++
++class UnsafeAdviceFilter(unittest.TestCase):
++    def test_negated_and_lamp_sentences_are_allowed(self):
++        self.assertFalse(has_unsafe_advice("Не разбавляйте гель спиртом, он уже готов к работе."))
++        self.assertFalse(has_unsafe_advice("В лампе гель может нагреваться — это нормальная реакция."))
++        self.assertFalse(has_unsafe_advice("Гель средне-вязкий и самовыравнивается за 3–5 секунд."))
++
++    def test_real_advice_is_blocked(self):
++        self.assertTrue(has_unsafe_advice("Добавьте спирт."))
++        self.assertTrue(has_unsafe_advice("Подогрейте банку перед работой."))
++        self.assertTrue(has_unsafe_advice("Разбавьте ацетоном."))
++
++
++class QuestionRetry(unittest.IsolatedAsyncioTestCase):
++    async def test_negated_mention_is_published_without_retry(self):
++        reply = "Здравствуйте! Гель средне-вязкий; не разбавляйте его спиртом."
++        with patch.object(buyer_questions, "call_fast_gemini", AsyncMock(return_value=reply)) as mock:
++            self.assertEqual(await buyer_questions.generate_buyer_question_answer("Густой?", "1010"), reply)
++        self.assertEqual(mock.await_count, 1)
++
++    async def test_unsafe_then_safe_reply_is_retried_with_strict_prompt(self):
++        mock = AsyncMock(side_effect=["Добавьте спирт", "Здравствуйте! Гель средне-вязкий."])
++        with patch.object(buyer_questions, "call_fast_gemini", mock):
++            text = await buyer_questions.generate_buyer_question_answer("Густой?", "1010")
++        self.assertIn("средне-вязкий", text)
++        self.assertIn("ВАЖНО", mock.await_args_list[1].args[0])
++
++    async def test_review_reply_gets_greeting_and_closing(self):
++        with patch.object(buyer_questions, "call_fast_gemini", AsyncMock(return_value="Спасибо за отзыв.")):
++            text = await buyer_questions.generate_review_reply("Густой", 3, "1010")
++        self.assertTrue(text.startswith("Здравствуйте!"))
++        self.assertIn("Желаем красивого маникюра", text)
++
++    async def test_gemini_outage_is_not_retried(self):
++        mock = AsyncMock(side_effect=gemini.GeminiUnavailable("down"))
++        with patch.object(buyer_questions, "call_fast_gemini", mock):
++            with self.assertRaises(gemini.GeminiUnavailable):
++                await buyer_questions.generate_review_reply("x", 5, "1001")
++        self.assertEqual(mock.await_count, 1)
++
++
++class RouteDefaultsAndCooldown(unittest.TestCase):
++    def setUp(self):
++        routes.reset_routes()
++        # Не записываем «последний рабочий маршрут» в общий кэш тестов.
++        patcher = patch.object(routes, "remember_route")
++        patcher.start()
++        self.addCleanup(patcher.stop)
++
++    def test_gemini_and_telegram_proxy_only_marketplaces_direct(self):
++        proxy = "http://127.0.0.1:3066"
++        with patch.object(routes.settings, "GEMINI_PROXY_ONLY", True), \
++             patch.object(routes.settings, "TELEGRAM_PROXY_ONLY", True), \
++             patch.object(routes.settings, "MARKETPLACES_DIRECT_ONLY", True), \
++             patch.object(routes.settings, "LOCAL_PROXY_URL", proxy), \
++             patch.object(routes.settings, "LOCAL_PROXY_FALLBACK_URL", ""), \
++             patch.object(routes.settings, "LOCAL_PROXY_LIST", ""):
++            self.assertEqual(routes.request_routes("gemini"), [proxy])
++            self.assertEqual(routes.request_routes("telegram"), [proxy])
++            self.assertEqual(routes.request_routes("ozon"), [routes.DIRECT])
++            self.assertEqual(routes.request_routes("wb"), [routes.DIRECT])
++
++    def test_cooldown_is_tracked_per_route(self):
++        proxy = "http://127.0.0.1:3066"
++        routes.mark_route_failed("gemini", routes.DIRECT, "geo")
++        routes.mark_route_failed("gemini", proxy, "503")
++        self.assertFalse(routes.route_available("gemini", routes.DIRECT))
++        self.assertFalse(routes.route_available("gemini", proxy))
++        routes.mark_route_ok("gemini", proxy)
++        self.assertTrue(routes.route_available("gemini", proxy))
++        self.assertFalse(routes.route_available("gemini", routes.DIRECT))
++
++
++class _Resp:
++    def __init__(self, status, payload):
++        self.status, self._payload = status, payload
++
++    async def __aenter__(self):
++        return self
++
++    async def __aexit__(self, *a):
++        return False
++
++    async def json(self, **kw):
++        return self._payload
++
++
++def _session_factory(responses, seen):
++    class Session:
++        def __init__(self, *a, **k):
++            pass
++
++        async def __aenter__(self):
++            return self
++
++        async def __aexit__(self, *a):
++            return False
++
++        def get(self, *a, **k):
++            raise aiohttp.ServerDisconnectedError()
++
++        def post(self, url, **kw):
++            seen.append((url.rsplit("/", 1)[-1], kw.get("proxy"), kw["json"]["generationConfig"]["maxOutputTokens"]))
++            return responses.pop(0)
++
++    return Session
++
++
++OK = {"candidates": [{"finishReason": "STOP", "content": {"parts": [{"text": "ответ"}]}}]}
++CUT = {"candidates": [{"finishReason": "MAX_TOKENS", "content": {"parts": []}}]}
++
++
++class GeminiModelFallback(unittest.IsolatedAsyncioTestCase):
++    def setUp(self):
++        routes.reset_routes()
++        patcher = patch.object(routes, "remember_route")
++        patcher.start()
++        self.addCleanup(patcher.stop)
++
++    async def _run(self, responses, seen, fast=True):
++        proxy = "http://127.0.0.1:3066"
++        with patch.object(gemini.aiohttp, "ClientSession", _session_factory(responses, seen)), \
++             patch.object(gemini, "request_routes", return_value=[proxy]), \
++             patch.object(gemini, "_get_available_models", AsyncMock(return_value=[])):
++            return await gemini.generate("p", max_tokens=100, fast=fast)
++
++    async def test_503_on_one_model_moves_to_next_model_on_same_route(self):
++        seen = []
++        text, model = await self._run(
++            [_Resp(503, {"error": {"status": "UNAVAILABLE"}}), _Resp(200, OK)], seen
++        )
++        self.assertEqual(text, "ответ")
++        self.assertEqual(len(seen), 2)
++        self.assertNotEqual(seen[0][0], seen[1][0])
++        # Рабочий прокси не должен попасть в карантин из-за перегрузки модели.
++        self.assertTrue(routes.route_available("gemini", "http://127.0.0.1:3066"))
++
++    async def test_max_tokens_is_retried_with_larger_limit(self):
++        seen = []
++        text, _ = await self._run([_Resp(200, CUT), _Resp(200, OK)], seen)
++        self.assertEqual(text, "ответ")
++        self.assertEqual([s[2] for s in seen], [100, 200])
++        self.assertEqual(seen[0][0], seen[1][0])
++
++    async def test_deprecated_gemini_25_models_are_not_in_chains(self):
++        for name in gemini.FALLBACK_MODELS + gemini.FAST_MODELS:
++            self.assertNotIn("2.5", name)
++
++
++class RateLimitWait(unittest.IsolatedAsyncioTestCase):
++    async def test_429_waits_for_retry_header_and_succeeds(self):
++        client = market_api.MarketplaceClient("WB", "acct-test")
++        calls = []
++
++        async def once(*args):
++            calls.append(time.monotonic())
++            if len(calls) == 1:
++                raise market_api.APIStatusError(429, "limit", retry_after=3)
++            return {"ok": True}
++
++        sleeps = []
++
++        async def fake_sleep(sec):
++            sleeps.append(sec)
++
++        with patch.object(client, "_request_once", once), \
++             patch.object(market_api.settings, "RATE_LIMIT_RETRIES", 2), \
++             patch.object(market_api.asyncio, "sleep", fake_sleep):
++            result = await client.request_json("POST", "https://finance-api.wildberries.ru/x", {})
++        self.assertEqual(result, {"ok": True})
++        self.assertEqual(sleeps, [4])
++
++    async def test_429_with_huge_wait_is_not_hammered(self):
++        client = market_api.MarketplaceClient("WB", "acct-test2")
++
++        async def once(*args):
++            raise market_api.APIStatusError(429, "limit", retry_after=3600)
++
++        with patch.object(client, "_request_once", once), \
++             patch.object(market_api.settings, "RATE_LIMIT_RETRIES", 2):
++            with self.assertRaises(market_api.APIStatusError):
++                await client.request_json("POST", "https://finance-api.wildberries.ru/x", {})
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_resilience.py b/tests/test_resilience.py
+index abb447e..a17ac28 100644
+--- a/tests/test_resilience.py
++++ b/tests/test_resilience.py
+@@ -401,6 +401,8 @@ class SchedulerBudget(unittest.IsolatedAsyncioTestCase):
+         """Цикл автоответов не занимает 30 минут и не блокирует следующий запуск."""
+         import worker
+ 
++        worker._NOTIFY_SEEN.clear()  # дедупликация уведомлений — состояние процесса
++
+         async def slow(*args, **kwargs):
+             await asyncio.sleep(5)
+ 
+diff --git a/worker.py b/worker.py
+index 997f311..f998ca0 100644
+--- a/worker.py
++++ b/worker.py
+@@ -413,6 +413,26 @@ async def scheduled_marketplaces_poll() -> None:
+     )
+ 
+ 
++_NOTIFY_SEEN: dict[str, float] = {}
++NOTIFY_DEDUP_SEC = 6 * 3600
++
++
++async def notify_admin_once(text: str) -> None:
++    """Одинаковое служебное сообщение не чаще раза в 6 часов.
++
++    Цикл отзывов идёт каждые 30 минут: пока причина сбоя (Gemini, бюджет, вход
++    в ЛК) не устранена, администратор получал одно и то же сообщение 48 раз в сутки.
++    """
++    now = time.monotonic()
++    for key in [k for k, ts in _NOTIFY_SEEN.items() if now - ts > NOTIFY_DEDUP_SEC]:
++        _NOTIFY_SEEN.pop(key, None)
++    if text in _NOTIFY_SEEN:
++        print(f"[Worker] Повторное уведомление подавлено: {text[:80]}", flush=True)
++        return
++    _NOTIFY_SEEN[text] = now
++    await notify_admin(text)
++
++
+ async def scheduled_reviews_and_questions_job() -> None:
+     """Запуск при старте и каждые 30 минут, один persistent-контекст за раз."""
+     if _BROWSER_JOB_LOCK.locked():
+@@ -423,21 +443,33 @@ async def scheduled_reviews_and_questions_job() -> None:
+         # Половина общего бюджета отведена каждому модулю: зависший обход
+         # отзывов не лишает вопросы их запуска в этом же цикле.
+         job_budget = BROWSER_JOB_BUDGET_SEC / 2
++        # Модуль завершается сам за 90 с до жёсткого лимита (мягкий дедлайн), а
++        # asyncio.wait_for остаётся страховкой от зависшего браузера.
++        soft_budget = max(job_budget - 90, job_budget * 0.5)
+         for job in (auto_reply_unanswered_reviews, auto_reply_unanswered_questions):
+             try:
+                 result = await asyncio.wait_for(
+-                    job(headless=True, dry_run=settings.OZON_REPLY_DRY_RUN, max_per_run=5),
++                    job(
++                        headless=True,
++                        dry_run=settings.OZON_REPLY_DRY_RUN,
++                        max_per_run=5,
++                        max_runtime_sec=soft_budget,
++                    ),
+                     timeout=job_budget,
+                 )
+                 if result["status"] not in {"success", "limit_reached"}:
+-                    await notify_admin(html.escape(str(result.get("message") or result["status"])))
++                    message = str(result.get("message") or result["status"])
++                    if result["status"] == "partial" and not result.get("replied") and "бюджету времени" in message:
++                        print(f"[Worker] {job.__name__}: {message}", flush=True)
++                    else:
++                        await notify_admin_once(html.escape(message))
+             except (TimeoutError, asyncio.TimeoutError):
+-                await notify_admin(
++                await notify_admin_once(
+                     f"⚠️ Ozon {job.__name__}: остановлен, превышен бюджет {int(job_budget // 60)} мин. "
+                     "Не все записи могли быть проверены; состояние публикации проверьте в ЛК."
+                 )
+             except Exception as exc:
+-                await notify_admin(f"Ozon {job.__name__}: {html.escape(str(exc))}")
++                await notify_admin_once(f"Ozon {job.__name__}: {html.escape(str(exc))}")
+ 
+ 
+ async def scheduled_daily_price_audit_job() -> None:

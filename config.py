@@ -44,8 +44,10 @@ class Settings(BaseSettings):
 
     # Gemini API
     GEMINI_API_KEY: str = Field(..., description="API ключ Google Gemini")
+    # gemini-3.8-flash — актуальная флагманская Flash-модель (с 02.09.2026);
+    # gemini-3.1-flash-lite остаётся эконом-моделью до 07.05.2027 и служит запасной.
     GEMINI_MODEL: str = Field(
-        default="gemini-3.1-flash-lite", description="Базовая модель Gemini"
+        default="gemini-3.8-flash", description="Базовая модель Gemini"
     )
     GEMINI_FAST_MODEL: str = Field(
         default="gemini-3.1-flash-lite",
@@ -67,6 +69,12 @@ class Settings(BaseSettings):
         description="Локальный HTTP-прокси (резервный маршрут для Telegram и Gemini)",
     )
     LOCAL_PROXY_FALLBACK_URL: str = ""
+    # Google блокирует российский IP (HTTP 400 FAILED_PRECONDITION «location is not
+    # supported»), поэтому Gemini ходит только через локальный прокси.
+    GEMINI_PROXY_ONLY: bool = Field(
+        default=True,
+        description="Gemini только через локальный прокси (без прямого маршрута)",
+    )
     # Список дополнительных прокси через запятую: http://127.0.0.1:3067,...
     LOCAL_PROXY_LIST: str = Field(
         default="", description="Дополнительные локальные прокси через запятую"
@@ -78,13 +86,13 @@ class Settings(BaseSettings):
     # Telegram в РФ доступен только через прокси: прямой маршрут для него
     # отключается, чтобы не тратить 45 с на заведомо мёртвую попытку.
     TELEGRAM_PROXY_ONLY: bool = Field(
-        default=False,
+        default=True,
         description="Telegram только через локальный прокси (без прямого маршрута)",
     )
     # Ozon и WB должны видеть российский IP продавца. При включении площадки
     # ходят только напрямую и никогда не используют VPN/прокси.
     MARKETPLACES_DIRECT_ONLY: bool = Field(
-        default=False,
+        default=True,
         description="Ozon и WB только напрямую, без прокси (российский IP)",
     )
     # Сколько секунд держать в карантине упавший маршрут.
@@ -92,6 +100,12 @@ class Settings(BaseSettings):
         default=120, description="Карантин недоступного маршрута, сек"
     )
     OZON_REPLY_DRY_RUN: bool = False
+    # Сколько раз повторять запрос после HTTP 429 и максимум секунд ожидания
+    # по заголовку X-Ratelimit-Retry (WB finance-api: 1 запрос в минуту).
+    RATE_LIMIT_RETRIES: int = Field(default=2, description="Повторы после HTTP 429")
+    RATE_LIMIT_MAX_WAIT_SEC: int = Field(
+        default=70, description="Максимальное ожидание по X-Ratelimit-Retry, сек"
+    )
     # Бюджет браузерного разбора витрин (сек): WB/Ozon отвечают медленно,
     # но отчёт не должен ждать браузер дольше этого значения.
     LISTINGS_BROWSER_BUDGET_SEC: int = Field(

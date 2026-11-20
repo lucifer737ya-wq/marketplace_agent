@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 from config import settings
+from services.common.timeutil import today_local
 from services.common.market_api import APIStatusError, MarketplaceClient, read_versions
 
 logger = logging.getLogger(__name__)
@@ -22,6 +23,10 @@ def _exc_label(exc: BaseException) -> str:
         return f"HTTP {exc.status}"
     if isinstance(exc, AmbiguousFinancePeriod):
         return str(exc)
+    # Собственные диагностические строки модуля («WB: ...») не содержат ключей и
+    # данных; раньше вместо них в отчёт попадало безликое «RuntimeError».
+    if isinstance(exc, RuntimeError) and str(exc).startswith("WB"):
+        return str(exc)[:200]
     return type(exc).__name__
 
 
@@ -89,7 +94,7 @@ class WBStatisticsAPI(MarketplaceClient):
 
     async def fetch_wb_tariffs(self) -> dict:
         """Тарифы WB. Недоступность тарифов не должна отменять синхронизацию остатков."""
-        today = datetime.utcnow().date().isoformat()
+        today = today_local().isoformat()
         key = "tariffs:" + today
         async with self._tariffs_lock:
             cached = self._read_disk_cache(key, 21600)
@@ -340,7 +345,7 @@ class WBStatisticsAPI(MarketplaceClient):
 
         buyer_price_map: Dict[int, float] = {}
         sales_count_7d = {}
-        end = datetime.utcnow().date()
+        end = today_local()
         end_date = end.isoformat()
         date_7d = (end - timedelta(days=6)).isoformat()
 
@@ -528,7 +533,7 @@ class WBStatisticsAPI(MarketplaceClient):
         return quantities, locations
 
     async def fetch_active_ad_campaigns(self, days: int = 7) -> list:
-        end = datetime.utcnow().date()
+        end = today_local()
         start = end - timedelta(days=days - 1)
         key = f"campaigns:{start}:{end}"
         cached = self._read_disk_cache(key, 900)
@@ -802,7 +807,7 @@ class WBStatisticsAPI(MarketplaceClient):
         путь; при пустой детализации берётся «Лента заказов», где есть только
         цена и количество. Возвращает (строки заказов, подпись источника).
         """
-        end = datetime.utcnow().date()
+        end = today_local()
         date_from = (end - timedelta(days=max(int(days), 1) - 1)).isoformat()
         date_to = end.isoformat()
         key = f"sales_by_sku:{date_from}:{date_to}"
@@ -880,7 +885,7 @@ class WBStatisticsAPI(MarketplaceClient):
         Если детализация за период пуста (отчёт ещё не сформирован), берутся
         итоги закрытых отчётов из /sales-reports/list с явной пометкой источника.
         """
-        end = datetime.utcnow().date()
+        end = today_local()
         date_from = custom_date_from or (end - timedelta(days=days - 1)).isoformat()
         date_to = custom_date_to or end.isoformat()
         key = f"finance_v2:{date_from}:{date_to}"

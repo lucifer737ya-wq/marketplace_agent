@@ -91,6 +91,20 @@ _RU_MONTH_PREFIXES: Tuple[Tuple[str, int], ...] = (
 )
 
 
+def _deadline(max_runtime_sec: Optional[float]) -> Optional[float]:
+    return time.monotonic() + max_runtime_sec if max_runtime_sec else None
+
+
+def _expired(deadline: Optional[float]) -> bool:
+    """Мягкий дедлайн: останавливаемся между действиями, а не посреди публикации.
+
+    Внешний asyncio.wait_for отменял задачу на полуоткрытой шторке отзыва
+    (бюджет 10 мин превышался каждые 30 минут), поэтому модуль сам завершает
+    обход заранее и закрывает браузер штатно.
+    """
+    return deadline is not None and time.monotonic() >= deadline
+
+
 def _get_min_target_date() -> datetime:
     raw = str(getattr(settings, "OZON_REVIEWS_MIN_DATE", "") or "").strip()
     if raw:
@@ -882,6 +896,7 @@ async def _visit_review(
     tracker, dry_run, records, attempted,
 ) -> None:
     from services.common.buyer_questions import generate_review_reply
+    from services.common.gemini import GeminiUnavailable
 
     if await _overlays(page).count():
         raise RuntimeError("Перед открытием отзыва уже видна другая панель; обход остановлен")
@@ -914,6 +929,10 @@ async def _visit_review(
                 reply = _clean_text_for_input(
                     await generate_review_reply(comment or "Без комментария", stars, sku)
                 )
+            except GeminiUnavailable:
+                # Gemini лежит целиком: остановить цикл, а не перебирать остальные
+                # отзывы по 3 попытки на каждый (так выбирался весь бюджет).
+                raise
             except RuntimeError as exc:
                 raise _SkipReview(str(exc)) from exc
             if _complete(reply):
@@ -995,7 +1014,9 @@ async def _row_has_table_answers(cells, cell_count: int, ans_col_idx: Optional[i
     return ans_str.isdigit() and int(ans_str) > 0
 
 
-async def _scan_reviews(page, tracker, dry_run: bool, max_per_run: int) -> dict:
+async def _scan_reviews(
+    page, tracker, dry_run: bool, max_per_run: int, deadline: Optional[float] = None
+) -> dict:
     records, failures, attempted = [], [], set()
     start = tracker["replied_count"]
     budget = min(max_per_run, MAX_DAILY_REPLIES - start)
@@ -1011,7 +1032,7 @@ async def _scan_reviews(page, tracker, dry_run: bool, max_per_run: int) -> dict:
 
     max_pages_per_tab = 5
     for title, names in tabs:
-        if len(records) >= budget:
+        if len(records) >= budget or _expired(deadline):
             break
         if names and not await _review_tab(page, names):
             failures.append(f"Не найдена вкладка «{title}»")
@@ -1024,6 +1045,9 @@ async def _scan_reviews(page, tracker, dry_run: bool, max_per_run: int) -> dict:
         page_saw_fresh_or_undated = False
 
         while idle < 2 and len(records) < budget:
+            if _expired(deadline):
+                failures.append("Обход остановлен по бюджету времени; продолжится в следующем цикле")
+                break
             rows = page.locator("tbody tr")
             opened = False
             for i in range(await rows.count()):
@@ -1118,6 +1142,7 @@ async def auto_reply_unanswered_reviews(
     headless: bool = True,
     dry_run: bool = False,
     max_per_run: int = 1,
+    max_runtime_sec: Optional[float] = None,
 ) -> Dict[str, Any]:
     if not PLAYWRIGHT_AVAILABLE:
         return {"status": "error", "replied": 0, "message": PLAYWRIGHT_MISSING_MESSAGE}
@@ -1143,7 +1168,9 @@ async def auto_reply_unanswered_reviews(
                 if "login" in page.url.lower():
                     return {"status": "need_auth", "replied": 0, "message": "Необходима авторизация Ozon"}
                 await page.wait_for_timeout(1500)
-                return await _scan_reviews(page, tracker, dry_run, max_per_run)
+                return await _scan_reviews(
+                    page, tracker, dry_run, max_per_run, _deadline(max_runtime_sec)
+                )
             finally:
                 await _close_browser_context_safe(context)
     except Exception as exc:
@@ -1162,6 +1189,7 @@ async def auto_reply_unanswered_questions(
     headless: bool = True,
     dry_run: bool = False,
     max_per_run: int = 1,
+    max_runtime_sec: Optional[float] = None,
 ) -> Dict[str, Any]:
     if not PLAYWRIGHT_AVAILABLE:
         return {"status": "error", "replied": 0, "message": PLAYWRIGHT_MISSING_MESSAGE}
@@ -1177,6 +1205,7 @@ async def auto_reply_unanswered_questions(
         }
 
     replied_count = 0
+    deadline = _deadline(max_runtime_sec)
     questions_found: List[Dict[str, Any]] = []
     processed_q_keys: Set[str] = set()
 
@@ -1216,7 +1245,7 @@ async def auto_reply_unanswered_questions(
                     }
 
                 for sub_title, sub_variants in QUESTION_SUBTABS:
-                    if tracker.get("replied_count", 0) >= MAX_DAILY_REPLIES or replied_count >= max_per_run:
+                    if tracker.get("replied_count", 0) >= MAX_DAILY_REPLIES or replied_count >= max_per_run or _expired(deadline):
                         break
 
                     await _close_question_drawer(page)
@@ -1225,7 +1254,7 @@ async def auto_reply_unanswered_questions(
 
                     no_new_rows_count = 0
                     while no_new_rows_count < 3:
-                        if tracker.get("replied_count", 0) >= MAX_DAILY_REPLIES or replied_count >= max_per_run:
+                        if tracker.get("replied_count", 0) >= MAX_DAILY_REPLIES or replied_count >= max_per_run or _expired(deadline):
                             break
 
                         rows = page.locator("tbody tr")
@@ -1233,7 +1262,7 @@ async def auto_reply_unanswered_questions(
                         new_rows_in_pass = 0
 
                         for i in range(row_count):
-                            if tracker.get("replied_count", 0) >= MAX_DAILY_REPLIES or replied_count >= max_per_run:
+                            if tracker.get("replied_count", 0) >= MAX_DAILY_REPLIES or replied_count >= max_per_run or _expired(deadline):
                                 break
 
                             await _close_question_drawer(page)

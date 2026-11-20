@@ -413,6 +413,26 @@ async def scheduled_marketplaces_poll() -> None:
     )
 
 
+_NOTIFY_SEEN: dict[str, float] = {}
+NOTIFY_DEDUP_SEC = 6 * 3600
+
+
+async def notify_admin_once(text: str) -> None:
+    """Одинаковое служебное сообщение не чаще раза в 6 часов.
+
+    Цикл отзывов идёт каждые 30 минут: пока причина сбоя (Gemini, бюджет, вход
+    в ЛК) не устранена, администратор получал одно и то же сообщение 48 раз в сутки.
+    """
+    now = time.monotonic()
+    for key in [k for k, ts in _NOTIFY_SEEN.items() if now - ts > NOTIFY_DEDUP_SEC]:
+        _NOTIFY_SEEN.pop(key, None)
+    if text in _NOTIFY_SEEN:
+        print(f"[Worker] Повторное уведомление подавлено: {text[:80]}", flush=True)
+        return
+    _NOTIFY_SEEN[text] = now
+    await notify_admin(text)
+
+
 async def scheduled_reviews_and_questions_job() -> None:
     """Запуск при старте и каждые 30 минут, один persistent-контекст за раз."""
     if _BROWSER_JOB_LOCK.locked():
@@ -423,21 +443,33 @@ async def scheduled_reviews_and_questions_job() -> None:
         # Половина общего бюджета отведена каждому модулю: зависший обход
         # отзывов не лишает вопросы их запуска в этом же цикле.
         job_budget = BROWSER_JOB_BUDGET_SEC / 2
+        # Модуль завершается сам за 90 с до жёсткого лимита (мягкий дедлайн), а
+        # asyncio.wait_for остаётся страховкой от зависшего браузера.
+        soft_budget = max(job_budget - 90, job_budget * 0.5)
         for job in (auto_reply_unanswered_reviews, auto_reply_unanswered_questions):
             try:
                 result = await asyncio.wait_for(
-                    job(headless=True, dry_run=settings.OZON_REPLY_DRY_RUN, max_per_run=5),
+                    job(
+                        headless=True,
+                        dry_run=settings.OZON_REPLY_DRY_RUN,
+                        max_per_run=5,
+                        max_runtime_sec=soft_budget,
+                    ),
                     timeout=job_budget,
                 )
                 if result["status"] not in {"success", "limit_reached"}:
-                    await notify_admin(html.escape(str(result.get("message") or result["status"])))
+                    message = str(result.get("message") or result["status"])
+                    if result["status"] == "partial" and not result.get("replied") and "бюджету времени" in message:
+                        print(f"[Worker] {job.__name__}: {message}", flush=True)
+                    else:
+                        await notify_admin_once(html.escape(message))
             except (TimeoutError, asyncio.TimeoutError):
-                await notify_admin(
+                await notify_admin_once(
                     f"⚠️ Ozon {job.__name__}: остановлен, превышен бюджет {int(job_budget // 60)} мин. "
                     "Не все записи могли быть проверены; состояние публикации проверьте в ЛК."
                 )
             except Exception as exc:
-                await notify_admin(f"Ozon {job.__name__}: {html.escape(str(exc))}")
+                await notify_admin_once(f"Ozon {job.__name__}: {html.escape(str(exc))}")
 
 
 async def scheduled_daily_price_audit_job() -> None:

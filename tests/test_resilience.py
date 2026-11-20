@@ -401,6 +401,8 @@ class SchedulerBudget(unittest.IsolatedAsyncioTestCase):
         """Цикл автоответов не занимает 30 минут и не блокирует следующий запуск."""
         import worker
 
+        worker._NOTIFY_SEEN.clear()  # дедупликация уведомлений — состояние процесса
+
         async def slow(*args, **kwargs):
             await asyncio.sleep(5)
 

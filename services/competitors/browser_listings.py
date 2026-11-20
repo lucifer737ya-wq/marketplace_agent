@@ -262,6 +262,25 @@ def parse_ozon_widget_states(
     return items
 
 
+_CARD_NOISE_RE = re.compile(
+    r"(?:\+\s*\d+\s*морков\w*|бренд проверен|чёрная пятница|черная пятница|"
+    r"стало дешевле|новинка|хит продаж|распродажа|опция|осталось\s+\d+\s*шт\.?|"
+    r"\d[\d\s\u00a0\u2009]*(?:[.,]\d+)?\s*[₽%]|\b\d+\s*бал+(?:ов|а)?\b)",
+    re.IGNORECASE,
+)
+
+
+def clean_card_name(text: str, limit: int = 120) -> str:
+    """Название из текста DOM-карточки без цен, акционных плашек и счётчиков.
+
+    Раньше в название попадал весь innerText («+210 морковок 688 ₽ Стало де...»),
+    и отчёт конкурентов показывал мусор вместо наименования.
+    """
+    cleaned = _CARD_NOISE_RE.sub(" ", str(text or ""))
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" -—·|,.")
+    return cleaned[:limit]
+
+
 def parse_ozon_dom_cards(cards: List[Dict[str, Any]], limit: int = 15) -> List[Dict[str, Any]]:
     """DOM-резерв: берёт текст карточек и вытаскивает цену и ссылку на товар."""
     items: List[Dict[str, Any]] = []
@@ -285,7 +304,7 @@ def parse_ozon_dom_cards(cards: List[Dict[str, Any]], limit: int = 15) -> List[D
         prices = {v for v in prices if v > 0}
         if len(prices) != 1:
             continue
-        name = re.sub(r"\s+", " ", text).strip()[:180] or f"Товар Ozon {sku}"
+        name = clean_card_name(text) or f"Товар Ozon {sku}"
         seen.add(sku)
         items.append(
             {

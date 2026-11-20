@@ -11,7 +11,7 @@ from urllib.parse import urlsplit
 
 import aiohttp
 
-from config import LOGS_DIR
+from config import LOGS_DIR, settings
 from services.common.routes import (
     DIRECT,
     request_routes,
@@ -106,7 +106,7 @@ class MarketplaceClient:
             if not route_available(self._service, route):
                 continue
             try:
-                result = await self._request_once(
+                result = await self._request_with_rate_limit(
                     method, url, headers, body, params, route
                 )
             except aiohttp.ClientResponseError as exc:  # pragma: no cover - internal
@@ -137,6 +137,33 @@ class MarketplaceClient:
             f"{self._service} {endpoint}: все маршруты недоступны "
             f"({'; '.join(transport_errors)})"
         )
+
+    async def _request_with_rate_limit(
+        self, method: str, url: str, headers: dict, body: Any, params: Any, route: str
+    ) -> Any:
+        """Один маршрут + ожидание по HTTP 429.
+
+        WB/Ozon присылают в 429 точное время ожидания (X-Ratelimit-Retry /
+        Retry-After). Раньше его читали, но не ждали: отчёты WB падали с
+        «HTTP 429», хотя finance-api разрешает лишь 1 запрос в минуту и
+        достаточно подождать 60 с. Ждём ровно столько, сколько просит площадка
+        (не дольше RATE_LIMIT_MAX_WAIT_SEC), и повторяем на том же маршруте.
+        """
+        retries = max(int(settings.RATE_LIMIT_RETRIES), 0)
+        cap = max(int(settings.RATE_LIMIT_MAX_WAIT_SEC), 1)
+        for attempt in range(retries + 1):
+            try:
+                return await self._request_once(method, url, headers, body, params, route)
+            except APIStatusError as exc:
+                if exc.status != 429 or attempt >= retries or exc.retry_after > cap:
+                    raise
+                wait = max(exc.retry_after, 1) + 1
+                logging.getLogger(__name__).warning(
+                    "%s HTTP 429 %s: ожидание %s с (попытка %s/%s)",
+                    self._service, urlsplit(url).path, wait, attempt + 1, retries,
+                )
+                await asyncio.sleep(wait)
+        raise RuntimeError("unreachable")  # pragma: no cover
 
     async def _request_once(
         self,
