@@ -32,7 +32,11 @@ class PriceCalculator(unittest.TestCase):
     def test_rates_follow_real_report(self):
         rates = ozon_rates_from_finance(FIN)
         self.assertAlmostEqual(rates.commission_low, 0.2254, places=3)
-        self.assertAlmostEqual(rates.fixed_per_order, (64469.98 + 7900 + 1140) / 2789, places=2)
+        # Логистика Ozon считается формулой по объёму (0,18 л → 25/97 ₽), в fixed — прочие постоянные.
+        self.assertIsNotNone(rates.volume_l)
+        self.assertAlmostEqual(rates.volume_l, 0.18)
+        self.assertEqual(rates.fixed_for(False) - rates.fixed_per_order, 25.0)
+        self.assertEqual(rates.fixed_for(True) - rates.fixed_per_order, 97.0)
 
     def test_break_even_is_zero_profit_and_tier_jump(self):
         rates = ozon_rates_from_finance(FIN)

@@ -9,12 +9,12 @@ from typing import Any, Dict, List, Optional, Tuple
 from services.common.expert_profiles import build_expert_preamble
 from services.common.gemini import generate
 
-from config import LOGS_DIR
+from config import LOGS_DIR, settings
 from database.crud import get_all_products
 from products_catalog import PRODUCTS_CATALOG
 from services.common.financial_pnl import generate_weekly_top_and_unprofitable_report
 from services.common.orders_report import sync_and_generate_orders_report
-from services.common.price_calculator import build_price_report
+from services.common.price_calculator import build_ozon_guard, build_price_report, check_ai_ozon_prices
 from services.ozon.seller_api import OzonSellerAPI
 from services.wb.statistics_api import WBStatisticsAPI
 
@@ -36,6 +36,14 @@ async def _call_gemini_advisory(prompt: str) -> Tuple[str, bool]:
         return text, bool(text.strip())
     except RuntimeError as exc:
         return f'Совет ИИ недоступен: {exc}', False
+
+
+# Модель иногда вставляет в русский текст символы чужих письменностей («4 ফ на FBO» в логе 20.11).
+_FOREIGN_SCRIPTS_RE = re.compile(r"[\u0900-\u0DFF\u0E00-\u0EFF\u0600-\u06FF\u3040-\u30FF\u4E00-\u9FFF\uAC00-\uD7AF]+")
+
+
+def strip_foreign_scripts(text: str) -> str:
+    return _FOREIGN_SCRIPTS_RE.sub("", text or "")
 
 
 def _plain(text: str) -> str:
@@ -74,7 +82,7 @@ async def generate_monday_ai_board_report(
         except Exception as exc:  # noqa: BLE001
             return RuntimeError(f"{label}: {exc}")
 
-    fin_res, top5_res, oz_items, wb_items, db_prods = await asyncio.gather(
+    fin_res, top5_res, oz_items, wb_items, db_prods, oz_fin30 = await asyncio.gather(
         _safe("финансы 7 дней", sync_and_generate_orders_report(ozon_service, wb_service, days=7)),
         _safe(
             "ТОП-5",
@@ -83,7 +91,13 @@ async def generate_monday_ai_board_report(
         _safe("остатки Ozon", ozon_service.fetch_stocks_and_prices()),
         _safe("остатки WB", wb_service.fetch_stocks_and_prices()),
         _safe("каталог БД", get_all_products()),
+        _safe("финансы Ozon для расчёта цен",
+              ozon_service.fetch_real_finance_breakdown(days=int(settings.PRICE_CALC_PERIOD_DAYS))),
         return_exceptions=True,
+    )
+    ozon_guard = build_ozon_guard(
+        db_prods if isinstance(db_prods, list) else [],
+        oz_fin30 if isinstance(oz_fin30, dict) else None,
     )
 
     fin_7d_text = (
@@ -137,11 +151,15 @@ async def generate_monday_ai_board_report(
 
 УСЛОВИЯ АНАЛИЗА:
 1. Сравни фактические затраты FBS и FBO по данным ниже. Если нет тарифа ПВЗ или первой мили, укажи, что нужно запросить.
-2. Ценообразование Ozon: сравни 299 ₽ (22–23%) и цену выше 300 ₽ с комиссией 52%. Не предлагай цену без расчёта затрат.
+2. Ценообразование Ozon: цена в ЛК выше 300 ₽ ломает льготный тариф (комиссия 52%, логистика банки 97 ₽ вместо 25 ₽).
+   Используй ТОЛЬКО цифры блока «ЖЁСТКИЕ ПРАВИЛА OZON» ниже; цену Ozon выше 300 ₽ не предлагай, если в блоке на ней нет прибыли.
+   Наборы для Ozon оценивай только по таблице набора из блока (логистика растёт с объёмом: набор 2 банки = 0,36 л).
 3. Реклама: не писать абстрактное "снизить ДРР". Предлагать конкретную механику: выделять 1-2 локомотива (прозрачный 1001 / молочный 1002) в АРК/поиске с отсечением мусорных ключей ("лак", "шеллак"), а в карточке локомотива через серии и рич-контент допродавать оттенки.
 4. Доставка маркетплейса — объективная данность, на нее нельзя повлиять напрямую, компенсировать ее нужно ростом среднего чека и наборами.
 
 {expert_preamble}
+
+{ozon_guard}
 
 ФАКТИЧЕСКИЕ ДАННЫЕ ЗА 7 ДНЕЙ:
 {fin_7d_text}
@@ -172,7 +190,13 @@ async def generate_monday_ai_board_report(
     ai_analysis, ai_ok = await _call_gemini_advisory(prompt)
     if not ai_ok:
         ai_analysis = await _rules_based_board(ozon_service, wb_service, ai_analysis)
-    ai_analysis = ai_analysis.replace("**", "").replace("__", "")
+    ai_analysis = strip_foreign_scripts(ai_analysis.replace("**", "").replace("__", ""))
+    if ai_ok:
+        ai_analysis = check_ai_ozon_prices(
+            ai_analysis,
+            db_prods if isinstance(db_prods, list) else [],
+            oz_fin30 if isinstance(oz_fin30, dict) else None,
+        )
 
     now_str = datetime.now().strftime("%Y-%m-%d_%H-%M")
     report_file = LOGS_DIR / f"AI_Board_Report_{now_str}.html"

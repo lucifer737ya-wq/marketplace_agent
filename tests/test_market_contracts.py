@@ -461,6 +461,7 @@ class Adapters(unittest.IsolatedAsyncioTestCase):
             return {0: [sale], 19: [ret], 20: [], 999: []}[json_data["rrdId"]]
 
         self.wb._request = AsyncMock(side_effect=request)
+        self.wb.DETAIL_SHORT_PAGE_STOP = False  # проверяем протокол «до пустого ответа»
         report = await self.wb.fetch_real_finance_breakdown()
         self.assertEqual(report["returns_amount"], 300)
         self.assertEqual(report["revenue_seller"], 0)
@@ -667,6 +668,7 @@ class Adapters(unittest.IsolatedAsyncioTestCase):
         self.wb._request = AsyncMock(
             side_effect=[[row, row], [], [], []]
         )
+        self.wb.DETAIL_SHORT_PAGE_STOP = False  # проверяем протокол «до пустого ответа»
         report = await self.wb.fetch_real_finance_breakdown()
         self.assertEqual(report["logistics_direct"], 40)
         detail_calls = [
@@ -677,6 +679,15 @@ class Adapters(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [c.kwargs["json_data"]["rrdId"] for c in detail_calls], [0, 39]
         )
+
+
+    async def test_wb_short_page_does_not_wait_for_empty_page(self):
+        """Неполная страница — последняя: лишний запрос упирался в лимит 1/мин и ждал ~61 с."""
+        row = {"rrdId": 5, "supplierOperName": "Доставка", "deliveryService": "40"}
+        self.wb._request = AsyncMock(side_effect=[[row], [], []])
+        rows = await self.wb._fetch_report_details("2026-11-14", "2026-11-20", "weekly")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(self.wb._request.await_count, 1)
 
 
 class ApprovalChain(unittest.IsolatedAsyncioTestCase):

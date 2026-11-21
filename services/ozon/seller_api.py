@@ -262,6 +262,17 @@ class OzonSellerAPI(MarketplaceClient):
                 or 0.0
             )
             buyer_price = float(price_block.get("marketing_price") or cur_price)
+            # Цена после акций за счёт продавца: с неё Ozon считает вознаграждение и выплату.
+            seller_effective = float(price_block.get("marketing_seller_price") or 0.0)
+            # Индексы цен Ozon: минимальная цена на Ozon/других площадках по схожим товарам.
+            idx = item.get("price_indexes") if isinstance(item.get("price_indexes"), dict) else {}
+
+            def _idx_min(name: str) -> float:
+                node = idx.get(name) if isinstance(idx.get(name), dict) else {}
+                try:
+                    return float(node.get("min_price") or 0.0)
+                except (TypeError, ValueError):
+                    return 0.0
             if cur_price <= 0:
                 continue
 
@@ -352,6 +363,10 @@ class OzonSellerAPI(MarketplaceClient):
                     "ozon_skus": sorted(ids),
                     "current_price": cur_price,
                     "buyer_price": buyer_price,
+                    "marketing_seller_price": seller_effective,
+                    "competitor_min_ozon": _idx_min("ozon_index_data"),
+                    "competitor_min_external": _idx_min("external_index_data"),
+                    "price_index": str(idx.get("color_index") or ""),
                     "commission_rate": round(raw_pct_fbo / 100.0, 4),
                     "commission_rate_fbo": round(raw_pct_fbo / 100.0, 4),
                     "commission_rate_fbs": round(raw_pct_fbs / 100.0, 4),
@@ -692,6 +707,18 @@ class OzonSellerAPI(MarketplaceClient):
             self._write_disk_cache("accrual_types", types)
         return types
 
+    async def _accruals_cached(self, day: date) -> List[Dict[str, Any]]:
+        """Начисления суток с кэшем: свежие сутки живут короче, старые — дольше."""
+        age = (today_local() - day).days
+        ttl = 300 if age <= 0 else (1800 if age <= 3 else 6 * 3600)
+        key = f"accr_day_v1:{day.isoformat()}"
+        cached = self._read_disk_cache(key, ttl)
+        if isinstance(cached, list):
+            return cached
+        rows = await self._accruals_for_day(datetime(day.year, day.month, day.day))
+        self._write_disk_cache(key, rows)
+        return rows
+
     async def _accruals_for_day(self, day: datetime) -> List[Dict[str, Any]]:
         """Все начисления одного дня (/v1/finance/accrual/by-day, курсор last_id)."""
         rows: List[Dict[str, Any]] = []
@@ -734,10 +761,10 @@ class OzonSellerAPI(MarketplaceClient):
         from_date = start_dt.strftime("%Y-%m-%dT00:00:00.000Z")
         to_date = end_dt.strftime("%Y-%m-%dT23:59:59.999Z")
         period_label = f"{start_dt.strftime('%d.%m.%Y')}–{end_dt.strftime('%d.%m.%Y')}"
-        cache_key = f"finance_v2:{from_date}:{to_date}"
+        cache_key = f"finance_v3:{from_date}:{to_date}"
 
         async with self._finance_lock:
-            cached = self._read_disk_cache(cache_key, 900)
+            cached = self._read_disk_cache(cache_key, int(settings.FINANCE_CACHE_TTL_SEC))
             if cached is not None:
                 return cached
 
@@ -821,7 +848,16 @@ class OzonSellerAPI(MarketplaceClient):
             report = dict(
                 report_totals,
                 orders=orders_list,
-                orders_count=len(orders_list),
+                orders_count=sum(
+                    max(_safe_count(o.get("quantity")), 1)
+                    for o in orders_list
+                    if str(o.get("status")) != "returned"
+                ),
+                returns_count=sum(
+                    max(_safe_count(o.get("quantity")), 1)
+                    for o in orders_list
+                    if str(o.get("status")) == "returned"
+                ),
                 billed_skus=sorted(billed_skus),
                 source=f"Ozon {detail} ({period_label})",
             )
@@ -902,10 +938,17 @@ class OzonSellerAPI(MarketplaceClient):
         orders: List[Dict[str, Any]] = []
         billed: set[str] = set()
 
-        for day in _date_range(start, end):
-            rows = await self._accruals_for_day(
-                datetime(day.year, day.month, day.day)
-            )
+        # Раньше сутки грузились строго по очереди (месяц = 31 × несколько страниц ≈ 1–2 мин).
+        # Теперь — параллельно (ACCRUAL_DAY_CONCURRENCY) и с кэшем по суткам.
+        days = list(_date_range(start, end))
+        sem = asyncio.Semaphore(max(int(settings.ACCRUAL_DAY_CONCURRENCY), 1))
+
+        async def load_day(d: date) -> List[Dict[str, Any]]:
+            async with sem:
+                return await self._accruals_cached(d)
+
+        loaded = await asyncio.gather(*(load_day(d) for d in days))
+        for day, rows in zip(days, loaded):
             for row_index, row in enumerate(rows):
                 if not isinstance(row, dict):
                     continue
@@ -961,6 +1004,10 @@ class OzonSellerAPI(MarketplaceClient):
                         or posting_number
                         or f"{day_str}-{row_index}"
                     )
+                    if seller_price == 0:
+                        # Строка услуги без цены продажи — это не заказ: раньше она попадала
+                        # в «Реализовано заказов» и завышала себестоимость в P&L.
+                        continue
                     orders.append(
                         {
                             "order_id": f"oz_{base_id}_{sku or index}",

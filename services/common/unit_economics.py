@@ -2,6 +2,7 @@ import math
 from dataclasses import dataclass, field
 from typing import List, Dict, Any
 from config import settings
+from services.common.ozon_tariffs import ozon_logistics_cost
 
 
 @dataclass
@@ -70,10 +71,18 @@ def evaluate_product_decision(
     promo_id: str,
     active_campaign_id: str,
 ) -> PricingRecommendation:
+    by_formula = marketplace.lower() == "ozon" and bool(settings.OZON_LOGISTICS_BY_FORMULA)
+    limit = float(settings.OZON_LOW_PRICE_LIMIT)
+    low_logistics = (
+        ozon_logistics_cost(settings.OZON_ITEM_VOLUME_L, limit, limit) if by_formula else fbo_logistics_cost
+    )
+    high_logistics = (
+        ozon_logistics_cost(settings.OZON_ITEM_VOLUME_L, limit + 1, limit) if by_formula else fbo_logistics_cost
+    )
     floor_price = calculate_floor_price(
         cost_price=cost_price,
         packaging_cost=packaging_cost,
-        fbo_logistics_cost=fbo_logistics_cost,
+        fbo_logistics_cost=low_logistics,
         first_mile_unit_cost=first_mile_unit_cost,
         target_profit=target_profit,
         commission_rate=commission_rate,
@@ -87,7 +96,7 @@ def evaluate_product_decision(
 
     in_trap = marketplace.lower() == "ozon" and floor_price > 300.0
     if marketplace.lower() == "ozon" and floor_price > 300.0:
-        floor_price = calculate_floor_price(cost_price, packaging_cost, fbo_logistics_cost,
+        floor_price = calculate_floor_price(cost_price, packaging_cost, high_logistics,
             first_mile_unit_cost, target_profit, settings.OZON_HIGH_COMMISSION_RATE,
             settings.ACQUIRING_RATE, settings.TAX_RATE, drr_rate)
         floor_price = max(301.0, floor_price)

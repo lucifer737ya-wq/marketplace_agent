@@ -822,7 +822,9 @@ async def cmd_competitors_audit(message: Message) -> None:
     try:
         from services.competitors.deep_parser import run_full_competitor_deep_audit
 
-        report_text, _ = await run_full_competitor_deep_audit("гель для моделирования ногтей 15г")
+        report_text, _ = await run_full_competitor_deep_audit(
+            "гель для моделирования ногтей 15г", ozon_api=ozon_service, wb_api=wb_service
+        )
         await wait_msg.delete()
         for chunk in _split_html_chunks(report_text):
             await message.answer(chunk, parse_mode="HTML")

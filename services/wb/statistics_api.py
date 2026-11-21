@@ -65,6 +65,8 @@ def _rrd(row: dict) -> int:
 
 
 class WBStatisticsAPI(MarketplaceClient):
+    # Неполная страница детализации = последняя (см. _fetch_report_details); тесты протокола «до 204» отключают.
+    DETAIL_SHORT_PAGE_STOP = True
     STATS_URL = "https://statistics-api.wildberries.ru"
     FINANCE_URL = "https://finance-api.wildberries.ru"
     PRICES_URL = "https://discounts-prices-api.wildberries.ru"
@@ -235,11 +237,37 @@ class WBStatisticsAPI(MarketplaceClient):
         return await self.update_price_and_min_price(nm_id, float(new_price))
 
     async def fetch_stocks_and_prices(self) -> List[Dict[str, Any]]:
+        # Остатки FBO у WB — асинхронная задача отчёта (опрос каждые 5 с, лимит 1/мин): до ~60 с
+        # на каждую кнопку. Устаревший кэш отдаём сразу, а обновляем в фоне.
+        stale_ok = int(settings.INVENTORY_STALE_OK_SEC)
+        if stale_ok > 0:
+            fresh = self._read_disk_cache("wb_stocks_and_prices", int(settings.INVENTORY_CACHE_SEC))
+            stale = None if fresh is not None else self._read_disk_cache("wb_stocks_and_prices", stale_ok)
+            if fresh is None and stale is not None:
+                self._schedule_inventory_refresh()
+                return stale
         async with self._inventory_lock:
             return await self._load_inventory()
 
-    async def _load_inventory(self) -> List[Dict[str, Any]]:
-        cached = self._read_disk_cache("wb_stocks_and_prices", max_age_sec=180)
+    def _schedule_inventory_refresh(self) -> None:
+        task = getattr(self, "_inventory_refresh_task", None)
+        if task is not None and not task.done():
+            return
+
+        async def refresh() -> None:
+            try:
+                async with self._inventory_lock:
+                    # Кэш намеренно протух — _load_inventory с нулевым TTL обновит его.
+                    await self._load_inventory(force=True)
+            except Exception as exc:  # noqa: BLE001 — фоновое обновление не должно шуметь
+                logger.warning("WB: фоновое обновление остатков не удалось: %s", exc)
+
+        self._inventory_refresh_task = asyncio.create_task(refresh())
+
+    async def _load_inventory(self, force: bool = False) -> List[Dict[str, Any]]:
+        cached = None if force else self._read_disk_cache(
+            "wb_stocks_and_prices", max_age_sec=int(settings.INVENTORY_CACHE_SEC)
+        )
         if cached is not None:
             return cached
 
@@ -673,7 +701,11 @@ class WBStatisticsAPI(MarketplaceClient):
             if nxt <= cursor:
                 raise RuntimeError("WB: курсор rrdId не продвигается")
             cursor = nxt
-            # Протокол WB: повторять, пока не вернётся пустой ответ (204).
+            # Протокол WB: повторять, пока не вернётся пустой ответ (204). Но лимит finance-api —
+            # 1 запрос в минуту, и «контрольный» запрос за пустой страницей раньше всегда упирался
+            # в HTTP 429 и ждал ~61 с. Неполная страница (меньше limit) — последняя: не ждём впустую.
+            if self.DETAIL_SHORT_PAGE_STOP and len(page) < payload["limit"]:
+                return rows
         raise RuntimeError("WB: пагинация детализации не завершена")
 
     async def _fetch_legacy_report_details(
@@ -900,7 +932,7 @@ class WBStatisticsAPI(MarketplaceClient):
         date_to = custom_date_to or end.isoformat()
         key = f"finance_v2:{date_from}:{date_to}"
         async with self._orders_lock:
-            cached = self._read_disk_cache(key, 900)
+            cached = self._read_disk_cache(key, int(settings.FINANCE_CACHE_TTL_SEC))
             if cached is not None:
                 return cached
 

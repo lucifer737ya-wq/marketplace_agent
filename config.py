@@ -146,6 +146,19 @@ class Settings(BaseSettings):
     GEMINI_NET_RETRY_DELAY: float = Field(default=1.5, description="Пауза между повторами Gemini после обрыва соединения, сек (растёт линейно)")
     GEMINI_RETRY_ROUNDS: int = Field(default=2, description="Сколько полных кругов маршрутов/моделей пробовать для Gemini")
     WB_MIN_PRICE_RATIO: float = Field(default=0.92, description="Коэффициент минимальной цены для акций WB")
+    # --- Ozon: логистика по объёму (формула продавца) и защита от «ловушки 300 ₽» ---
+    OZON_ITEM_VOLUME_L: float = Field(default=0.18, description="Объём одной банки, литры (для формулы логистики Ozon)")
+    OZON_LOGISTICS_BY_FORMULA: bool = Field(default=True, description="Логистика Ozon = формула по объёму и цене ЛК (вместо среднего ₽/заказ)")
+    OZON_EXTRA_FIXED_PER_ORDER: float = Field(default=0.0, description="Доп. постоянные расходы Ozon на заказ, ₽ (поверх факта из отчёта)")
+    OZON_RETURNS_RESTOCK: bool = Field(default=True, description="Возврат покупателя возвращает товар на склад: себестоимость возврата вычитается")
+    # --- Пробив конкурентов: цена ЛК = витрина / (1 − СПП); чистая прибыль по нашей закупке ---
+    COMPETITOR_WB_SPP_RATE: float = Field(default=0.27, description="Типовой СПП WB (доля), если нет факта из отчёта")
+    COMPETITOR_OZON_DISCOUNT_RATE: float = Field(default=0.0, description="Скидка Ozon за его счёт на витрине (доля), если известна")
+    # --- Скорость отчётов ---
+    ACCRUAL_DAY_CONCURRENCY: int = Field(default=4, description="Сколько суток начислений Ozon грузить параллельно")
+    INVENTORY_CACHE_SEC: int = Field(default=600, description="Свежесть кэша остатков/цен WB, сек")
+    INVENTORY_STALE_OK_SEC: int = Field(default=21600, description="Сколько отдавать устаревший кэш остатков WB мгновенно, обновляя в фоне (0 — выкл.)")
+    FINANCE_CACHE_TTL_SEC: int = Field(default=1800, description="Кэш финансовых отчётов Ozon/WB, сек")
     OZON_REVIEWS_MIN_DATE: str = Field(default="13.11.2026", description="Минимальная дата автоответов Ozon")
 
     @field_validator(

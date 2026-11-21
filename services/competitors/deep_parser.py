@@ -14,6 +14,7 @@ from config import settings
 from services.common.orders_report import _mul_rub, _round_pct, _round_rub, _to_dec
 from services.common.ad_recommendations import sanitize_telegram_html
 from services.common.gemini import generate
+from services.competitors import economics as comp_econ
 
 logger = logging.getLogger(__name__)
 
@@ -534,7 +535,9 @@ async def _call_gemini_competitor_verdict(prompt: str) -> str:
         return f"⚠️ <i>ИИ-разбор временно недоступен ({html.escape(str(exc))}).</i>"
 
 
-async def run_full_competitor_deep_audit(category_query: str) -> Tuple[str, Dict[str, float]]:
+async def run_full_competitor_deep_audit(
+    category_query: str, ozon_api: Any = None, wb_api: Any = None
+) -> Tuple[str, Dict[str, float]]:
     clean_query = str(category_query or "").strip()
     safe_query = html.escape(clean_query or "не задан")
 
@@ -556,6 +559,16 @@ async def run_full_competitor_deep_audit(category_query: str) -> Tuple[str, Dict
     else:
         oz_comps, oz_err = oz_res
 
+    ctx = await comp_econ.load_context(ozon_api, wb_api)
+    wb_comps = comp_econ.annotate(wb_comps, ctx)
+    oz_comps = comp_econ.annotate(oz_comps, ctx)
+    oz_index_lines: List[str] = []
+    if not oz_comps and ozon_api is not None:
+        try:
+            oz_index_lines = comp_econ.ozon_index_block(await ozon_api.fetch_stocks_and_prices(), ctx)
+        except Exception as exc:  # noqa: BLE001 — резерв не должен ронять отчёт
+            logger.warning("[Competitors Ozon] индекс цен Seller API недоступен: %s", exc)
+
     wb_prices = [float(c["buyer_price"]) for c in wb_comps if _safe_float(c.get("buyer_price")) > 0.0]
     oz_prices = [float(c["buyer_price"]) for c in oz_comps if _safe_float(c.get("buyer_price")) > 0.0]
     all_prices = wb_prices + oz_prices
@@ -572,7 +585,7 @@ async def run_full_competitor_deep_audit(category_query: str) -> Tuple[str, Dict
         "median": median_total,
     }
 
-    if not wb_comps and not oz_comps:
+    if not wb_comps and not oz_comps and not oz_index_lines:
         diag_lines = [
             f"📊 <b>Анализ конкурентов: «{safe_query}»</b>\n",
             "⚠️ <b>Не удалось получить реальные карточки с витрин (фейковые данные отключены):</b>",
@@ -597,9 +610,11 @@ async def run_full_competitor_deep_audit(category_query: str) -> Tuple[str, Dict
             feedbacks = _safe_int(comp.get("feedbacks"), 0)
             # DOM-резерв не видит рейтинг: «⭐ 0.0 (0)» выглядел как реальная оценка.
             rating_lbl = "⭐ нет данных" if rating <= 0.0 and feedbacks <= 0 else f"⭐ {rating:.1f} ({feedbacks})"
+            econ_line = comp_econ.format_economy_line(comp, ctx)
             html_rows.append(
                 f"• [{mp_lbl}] Арт. <code>{sku_lbl}</code> | <b>{brand_lbl}</b> — {name_lbl}\n"
                 f"   Витрина: <b>{buyer_price:.0f} ₽</b> | {rating_lbl}"
+                + (f"\n{econ_line}" if econ_line else "")
             )
         return html_rows
 
@@ -613,9 +628,25 @@ async def run_full_competitor_deep_audit(category_query: str) -> Tuple[str, Dict
     if oz_comps:
         lines.append(f"\n🔵 <b>Ozon</b> ({len(oz_comps)} карточек, ср. {avg_oz:.0f} ₽):")
         lines.extend(_format_comp_lines(oz_comps))
+    elif oz_index_lines:
+        lines.append("")
+        lines.extend(oz_index_lines)
+        if oz_err:
+            lines.append(f"<i>Витрина: {html.escape(oz_err)}</i>")
     elif oz_err:
         lines.append(f"\n🔵 Ozon: <code>{html.escape(oz_err)}</code>")
 
+    for label, comps in (("WB", wb_comps), ("Ozon", oz_comps)):
+        summ = comp_econ.summarize(comps)
+        if summ:
+            lines.append(f"\n💰 {label}: {summ}")
+    cogs_txt = (f"{ctx.cogs_unit:.0f} ₽" if ctx.cogs_unit is not None else "не задана — внесите через «📦 Себестоимость»")
+    lines.append(
+        f"ℹ️ Цена ЛК = витрина + СПП (WB ≈ {ctx.wb_spp * 100:.0f}%, Ozon — скидка {ctx.ozon_discount * 100:.0f}%). "
+        f"Чистая прибыль — при нашей закупке (себестоимость банки {cogs_txt}), комиссиях "
+        f"(WB {ctx.wb_commission * 100:.0f}%, Ozon {ctx.ozon_commission_low * 100:.0f}% до 300 ₽ / "
+        f"{settings.OZON_HIGH_COMMISSION_RATE * 100:.0f}% выше), логистике, эквайринге и УСН 6%; без рекламы."
+    )
     if all_prices:
         lines.append(
             f"\n📈 Медиана витрины: <b>{median_total:.0f} ₽</b> · "

@@ -25,6 +25,8 @@ CANCELLED_ORDER_STATUSES: Set[str] = {
     "возврат",
 }
 
+RETURN_ORDER_STATUSES: Set[str] = {"returned", "return", "возврат"}
+
 _SQLITE_IN_CHUNK_SIZE = 500
 _CENT = Decimal("0.01")
 _TENTH = Decimal("0.1")
@@ -215,13 +217,26 @@ def _calculate_marketplace_cogs(
             seen_order_ids.add(order_id)
 
         status = str(order.get("status") or "ordered").strip().lower()
-        if status in CANCELLED_ORDER_STATUSES:
+        is_return = status in RETURN_ORDER_STATUSES
+        if status in CANCELLED_ORDER_STATUSES and not (
+            is_return and mp == "ozon" and settings.OZON_RETURNS_RESTOCK
+        ):
             continue
 
         qty = max(_safe_int(order.get("quantity"), 1), 1)
         raw_sku = str(order.get("sku") or "").strip()
         art = _resolve_order_sku(raw_sku, mp)
         prod = _lookup_product_for_order(mp, raw_sku, by_mp_sku, by_mp_ext)
+        if is_return:
+            # Возврат покупателя: товар вернулся на склад — себестоимость возвращённых
+            # единиц вычитается (иначе P&L завышает затраты и «уходит в минус»).
+            if prod is not None and _safe_nonneg(prod.cost_price) > 0.0:
+                total_cogs -= (
+                    _to_dec(_safe_nonneg(prod.cost_price))
+                    + _to_dec(_safe_nonneg(prod.packaging_cost))
+                    + _to_dec(_safe_nonneg(prod.first_mile_unit_cost))
+                ) * Decimal(qty)
+            continue
 
         if prod is not None and _safe_nonneg(prod.cost_price) > 0.0:
             unit_cogs = (
@@ -235,7 +250,7 @@ def _calculate_marketplace_cogs(
             if art or raw_sku:
                 missing_skus.add(art or raw_sku)
 
-    return _round_rub(total_cogs), missing_units, sorted(missing_skus)
+    return _round_rub(max(total_cogs, Decimal("0"))), missing_units, sorted(missing_skus)
 
 
 def _count_active_orders(orders_list: Any) -> int:
@@ -508,6 +523,16 @@ async def sync_and_generate_orders_report(
         oz_tax = _mul_rub(oz_tax_base, tax_rate)
         oz_net_profit = _round_rub(_to_dec(oz_payout) - _to_dec(oz_cogs) - _to_dec(oz_tax))
 
+        oz_ret_cnt = max(_safe_int(ozon_fin.get("returns_count"), 0), 0)
+        oz_returns_note = f" (+ возвратов: {oz_ret_cnt})" if oz_ret_cnt else ""
+        oz_avg_note = (
+            f"• Средний чек: <b>{_fmt_money(oz_sales / oz_count)} ₽/шт</b> — сверьте с ценой в ЛК: "
+            "если она заметно выше, продажи идут по акциям/скидкам Ozon за ваш счёт или в периоде много возвратов\n"
+            if oz_count > 0 and oz_sales > 0
+            else ""
+        )
+
+
         oz_source_low = str(ozon_fin.get("source") or "").lower()
         oz_profit_known = (
             oz_missing_cogs == 0
@@ -545,7 +570,8 @@ async def sync_and_generate_orders_report(
 
         ozon_block = (
             f"🔵 <b>OZON ({oz_source}):</b>\n"
-            f"• Реализовано заказов (отправлений): <b>{oz_count}</b>\n"
+            f"• Реализовано заказов (отправлений): <b>{oz_count}</b>{oz_returns_note}\n"
+            f"{oz_avg_note}"
             f"• <b>Продажи и возвраты: {_fmt_money(oz_sales)} ₽</b> ({oz_sales_share})\n"
             f"• <b>Начисления МП (всего): {_fmt_expense(oz_ded_tot)}</b> ({_pct(oz_ded_tot, oz_sales)})\n\n"
             f"<b>Детализация расходов Ozon:</b>\n"
