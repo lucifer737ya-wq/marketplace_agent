@@ -19,7 +19,9 @@ from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional
 
 from config import settings
+from services.common.cogs import ozon_tax_base_ratio, unit_cogs_of
 from services.common.ozon_tariffs import ozon_logistics_cost, set_volume_l
+from services.competitors.economics import spp_from_items
 
 
 def _f(value: Any, default: float = 0.0) -> float:
@@ -42,6 +44,10 @@ class Rates:
     # Ozon: логистика считается по формуле объём×цена ЛК; fixed_per_order тогда —
     # только «прочие постоянные» расходы (возвраты, drop-off, упаковка, ПВЗ).
     volume_l: Optional[float] = None
+    # Реклама Ozon в составе ``pct_other``: доля от выручки и ₽ на заказ. Для наборов реклама —
+    # это стоимость ЗАКАЗА, а не % от цены (иначе на 1100 ₽ закладывалось ~140 ₽ рекламы вместо ~45 ₽).
+    ads_pct: float = 0.0
+    ads_per_order: float = 0.0
 
     def fixed_for(self, high_tier: bool) -> float:
         """₽ на заказ на соответствующем тарифе (выше порога логистика Ozon заметно дороже)."""
@@ -119,12 +125,15 @@ def ozon_rates_from_finance(fin: Optional[Dict[str, Any]]) -> Rates:
         other_keys.insert(0, "deliv_direct")
     fixed = sum(abs(_f(fin.get(key))) for key in other_keys) / orders + extra_env
     avg_check = sales / orders
+    ads_abs = abs(_f(fin.get("ads_total")))
     return Rates(
         comm, settings.OZON_HIGH_COMMISSION_RATE, pct, round(fixed, 2),
         f"факт Ozon: {orders} проданных шт., средний чек {avg_check:.0f} ₽, комиссия {comm * 100:.1f}%, "
         f"прочие удержания {pct * 100:.1f}%, постоянные {fixed:.0f} ₽/шт"
         + (f" + логистика по формуле (объём {volume:g} л)" if by_formula else ""),
         volume,
+        ads_pct=ads_abs / sales,
+        ads_per_order=round(ads_abs / orders, 2),
     )
 
 
@@ -164,7 +173,7 @@ def profit_at(price: float, cogs: float, rates: Rates, *, high_tier: Optional[bo
 
 
 def solve_price(cogs: float, rates: Rates, margin: float, *, tiered: bool,
-                tax_base_ratio: float = 1.0) -> Optional[PriceAdvice]:
+                tax_base_ratio: float = 1.0, profit_abs: float = 0.0) -> Optional[PriceAdvice]:
     """Минимальная целая цена ЛК для заданной маржи; ``None`` — цена недостижима."""
     margin = max(margin, 0.0)
     tax = settings.TAX_RATE * tax_base_ratio
@@ -174,7 +183,7 @@ def solve_price(cogs: float, rates: Rates, margin: float, *, tiered: bool,
         denom = 1 - comm - rates.pct_other - tax - margin
         if denom <= 0.01:
             return None
-        return max(1, math.ceil((cogs + rates.fixed_for(high)) / denom))
+        return max(1, math.ceil((cogs + rates.fixed_for(high) + profit_abs) / denom))
 
     low = solve(rates.commission_low, False)
     if not tiered:
@@ -200,11 +209,7 @@ def _advice(price: int, high: bool, cogs: float, rates: Rates, ratio: float,
 
 
 def _cogs(row: Any) -> float:
-    return (
-        _f(getattr(row, "cost_price", 0.0))
-        + _f(getattr(row, "packaging_cost", 0.0))
-        + _f(getattr(row, "first_mile_unit_cost", 0.0))
-    )
+    return unit_cogs_of(row)
 
 
 def _pct_ru(value: float) -> str:
@@ -242,27 +247,42 @@ def _line(label: str, art: str, current: float, cogs: float, rates: Rates, *,
 
 
 def build_bundle_lines(cogs_unit: float, rates: Rates, *, max_units: int = 4) -> List[str]:
-    """Наборы из N банок на Ozon: выгодна ли цена ≤300 ₽ или выше порога (с логистикой по формуле)."""
+    """Наборы из N банок на Ozon: выгодна ли цена ≤300 ₽ или выше порога (с логистикой по формуле).
+
+    Отличия от прежней версии (набор 2 шт. «в ноль» 1125 ₽ при реальных ~41%):
+    * налог 6% — со стоимости для покупателя (``ozon_tax_base_ratio``);
+    * реклама — ₽ за заказ (CPO), а не % от цены набора;
+    * цели — по ROI к себестоимости: 30% и 100% (коридор рекомендаций).
+    """
     if cogs_unit <= 0 or rates.volume_l is None:
         return []
     limit = float(settings.OZON_LOW_PRICE_LIMIT)
     unit_vol = float(settings.OZON_ITEM_VOLUME_L)
+    ratio = ozon_tax_base_ratio()
+    roi_min, roi_max = float(settings.PRICE_MIN_ROI), float(settings.PRICE_MAX_ROI)
     out = ["", "📦 <b>Наборы Ozon</b> (себестоимость банки "
-           f"{cogs_unit:.0f} ₽, объём {unit_vol:g} л; логистика — по формуле объёма и цены ЛК):"]
+           f"{cogs_unit:.0f} ₽ = закупка + упаковка {settings.PACKAGING_COST_PER_UNIT:.0f} + зарплата "
+           f"{settings.LABOR_COST_PER_UNIT:.0f}; объём {unit_vol:g} л; налог с цены покупателя ≈{ratio * 100:.0f}% цены ЛК; "
+           "реклама — как стоимость заказа):"]
     for n in range(2, max_units + 1):
         vol = set_volume_l(n, unit_vol)
-        sub = Rates(rates.commission_low, rates.commission_high, rates.pct_other,
-                    rates.fixed_per_order, rates.source, vol)
+        sub = Rates(rates.commission_low, rates.commission_high, max(rates.pct_other - rates.ads_pct, 0.0),
+                    rates.fixed_per_order + rates.ads_per_order, rates.source, vol)
         cogs = cogs_unit * n
-        low_p = profit_at(limit, cogs, sub, high_tier=False)
-        be = solve_price(cogs, sub, 0.0, tiered=True)
-        tgt = solve_price(cogs, sub, float(settings.PRICE_TARGET_MARGIN), tiered=True)
+        low_p = profit_at(limit, cogs, sub, high_tier=False, tax_base_ratio=ratio)
+        be = solve_price(cogs, sub, 0.0, tiered=True, tax_base_ratio=ratio)
+        lo_t = solve_price(cogs, sub, 0.0, tiered=True, tax_base_ratio=ratio, profit_abs=roi_min * cogs)
+        hi_t = solve_price(cogs, sub, 0.0, tiered=True, tax_base_ratio=ratio, profit_abs=roi_max * cogs)
         verdict = "✅" if low_p > 0 else "❌"
-        be_t = "—" if be is None else f"{be.price} ₽" + (" (тариф 52%)" if be.tier == "high" else "")
-        tgt_t = "недостижима" if tgt is None else f"{tgt.price} ₽" + (" (тариф 52%)" if tgt.tier == "high" else "")
+
+        def fmt(adv: Optional[PriceAdvice]) -> str:
+            if adv is None:
+                return "недостижима"
+            return f"{adv.price} ₽" + (" (тариф 52%)" if adv.tier == "high" else "")
+
         out.append(
             f"• {n} шт ({vol:g} л): на {limit:.0f} ₽ {verdict} {low_p:+.0f} ₽/набор; "
-            f"в ноль: <b>{be_t}</b>; для {settings.PRICE_TARGET_MARGIN * 100:.0f}%: <b>{tgt_t}</b>"
+            f"в ноль: <b>{fmt(be)}</b>; ROI {roi_min * 100:.0f}%: <b>{fmt(lo_t)}</b>; ROI {roi_max * 100:.0f}%: <b>{fmt(hi_t)}</b>"
         )
     return out
 
@@ -286,13 +306,14 @@ def build_price_lines(
         if cogs <= 0:
             missing.append(f"ozon:{sku}")
             continue
-        out.append(_line("OZON", sku, _f(item.get("current_price")), cogs, oz_rates, tiered=True, ratio=1.0,
+        out.append(_line("OZON", sku, _f(item.get("current_price")), cogs, oz_rates, tiered=True, ratio=ozon_tax_base_ratio(),
                          effective=_f(item.get("marketing_seller_price")) or None))
         oz_cogs_seen.append(cogs)
     if oz_cogs_seen:
         out.extend(build_bundle_lines(sum(oz_cogs_seen) / len(oz_cogs_seen), oz_rates))
     out.append("")
-    out.append("🟣 <b>WILDBERRIES</b> — комиссия по предмету из тарифов WB")
+    out.append("🟣 <b>WILDBERRIES</b> — комиссия по предмету из тарифов WB; налог 6% — с цены покупателя (после СПП)")
+    wb_spp = spp_from_items(list(wb_items), float(settings.COMPETITOR_WB_SPP_RATE))
     for item in sorted((i for i in wb_items if isinstance(i, dict)), key=lambda i: str(i.get("sku"))):
         sku = str(item.get("sku") or "").strip()
         cogs = costs.get(("wb", sku), 0.0)
@@ -301,7 +322,7 @@ def build_price_lines(
             continue
         cur = _f(item.get("current_price"))
         buyer = _f(item.get("buyer_price"), cur)
-        ratio = min(max(buyer / cur, 0.3), 1.5) if cur > 0 else 1.0
+        ratio = min(max(buyer / cur, 0.3), 1.5) if cur > 0 and buyer < cur * 0.995 else 1.0 - wb_spp
         out.append(_line("WB", sku, cur, cogs, wb_rates_from_item(item, wb_fin), tiered=False, ratio=ratio))
     if missing:
         out.append("")
@@ -388,10 +409,10 @@ def build_ozon_guard(products: Iterable[Any], oz_fin: Optional[Dict[str, Any]]) 
         lines.append(f"• Средняя себестоимость банки (закупка+упаковка+первая миля): {cogs:.0f} ₽. "
                      f"Постоянные расходы Ozon ≈ {rates.fixed_per_order:.0f} ₽/шт, прочие удержания {rates.pct_other * 100:.1f}% цены.")
         for price in (cap, int(limit) + 1, 349, 360, 399):
-            p = profit_at(price, cogs, rates, limit=limit)
+            p = profit_at(price, cogs, rates, limit=limit, tax_base_ratio=ozon_tax_base_ratio())
             lines.append(f"  – цена ЛК {price} ₽: чистая прибыль {p:+.0f} ₽/шт ({p / price * 100:+.1f}%)")
-        be = solve_price(cogs, rates, 0.0, tiered=True)
-        tgt = solve_price(cogs, rates, float(settings.PRICE_TARGET_MARGIN), tiered=True)
+        be = solve_price(cogs, rates, 0.0, tiered=True, tax_base_ratio=ozon_tax_base_ratio())
+        tgt = solve_price(cogs, rates, float(settings.PRICE_TARGET_MARGIN), tiered=True, tax_base_ratio=ozon_tax_base_ratio())
         if be:
             lines.append(f"  – цена «в ноль»: {be.price} ₽" + (" (выше порога, тариф 52%)" if be.tier == "high" else ""))
         lines.append("  – цена для целевой маржи " + (
@@ -423,7 +444,7 @@ def check_ai_ozon_prices(text: str, products: Iterable[Any], oz_fin: Optional[Di
             price = int(m.group(1))
             if limit < price <= 3000 and price not in flagged:
                 if cogs > 0:
-                    pr = profit_at(price, cogs, rates, limit=limit)
+                    pr = profit_at(price, cogs, rates, limit=limit, tax_base_ratio=ozon_tax_base_ratio())
                     flagged[price] = (f"{price} ₽: тариф {settings.OZON_HIGH_COMMISSION_RATE * 100:.0f}%, "
                                       f"логистика {ozon_logistics_cost(settings.OZON_ITEM_VOLUME_L, price, limit):.0f} ₽ → "
                                       f"чистая прибыль {pr:+.0f} ₽/шт")

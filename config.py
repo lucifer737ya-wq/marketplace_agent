@@ -153,7 +153,23 @@ class Settings(BaseSettings):
     OZON_RETURNS_RESTOCK: bool = Field(default=True, description="Возврат покупателя возвращает товар на склад: себестоимость возврата вычитается")
     # --- Пробив конкурентов: цена ЛК = витрина / (1 − СПП); чистая прибыль по нашей закупке ---
     COMPETITOR_WB_SPP_RATE: float = Field(default=0.27, description="Типовой СПП WB (доля), если нет факта из отчёта")
-    COMPETITOR_OZON_DISCOUNT_RATE: float = Field(default=0.0, description="Скидка Ozon за его счёт на витрине (доля), если известна")
+    COMPETITOR_OZON_DISCOUNT_RATE: float = Field(
+        default=0.26,
+        description="Скидка Ozon за его счёт на витрине (цена по Ozon Карте): ЛК 296 ₽ -> витрина ~220 ₽ = 0.26",
+    )
+    OZON_TAX_ON_BUYER_PRICE: bool = Field(
+        default=True, description="УСН 6% на Ozon считать со стоимости, по которой покупает покупатель (витрина), а не с цены ЛК"
+    )
+    # --- Себестоимость единицы: закупка (по SKU, 58-66 ₽) + упаковка + зарплата ---
+    PACKAGING_COST_PER_UNIT: float = Field(default=9.0, description="Упаковка на 1 банку, ₽ (0 — брать из БД по SKU)")
+    LABOR_COST_PER_UNIT: float = Field(default=5.0, description="Зарплата сборщика на 1 банку, ₽")
+    PURCHASE_COST_MIN: float = Field(default=58.0, description="Нижняя граница закупки банки, ₽ (проверка данных)")
+    PURCHASE_COST_MAX: float = Field(default=66.0, description="Верхняя граница закупки банки, ₽ (проверка данных)")
+    PURCHASE_COST_DEFAULT: float = Field(default=62.0, description="Закупка, если по SKU она не задана, ₽ (середина диапазона)")
+    # --- Рекомендации цен: чистая прибыль к себестоимости (ROI) от 30% до 100% ---
+    PRICE_MIN_ROI: float = Field(default=0.30, description="Минимальная чистая прибыль к себестоимости в рекомендации цены")
+    PRICE_MAX_ROI: float = Field(default=1.00, description="Максимальная чистая прибыль к себестоимости в рекомендации цены")
+    COMPETITOR_PRICE_UNDERCUT: float = Field(default=0.02, description="На сколько ниже медианы конкурентов целиться по цене (доля)")
     # --- Скорость отчётов ---
     ACCRUAL_DAY_CONCURRENCY: int = Field(default=4, description="Сколько суток начислений Ozon грузить параллельно")
     INVENTORY_CACHE_SEC: int = Field(default=600, description="Свежесть кэша остатков/цен WB, сек")

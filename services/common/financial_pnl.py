@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from sqlalchemy import select
 
 from config import settings
+from services.common.cogs import unit_cogs_of
 from database.models import Product, get_db_session
 from products_catalog import OZON_SKU_TO_ART, PRODUCTS_CATALOG, WB_SKU_TO_ART
 from services.common.orders_report import (
@@ -221,9 +222,7 @@ def _build_stats_from_sku_sales(
         p_db = _lookup_product_for_order(mp, raw_sku, by_mp_sku, by_mp_ext)
         cogs_known = p_db is not None and _safe_nonneg(p_db.cost_price) > 0.0
         unit_cogs = (
-            _safe_nonneg(p_db.cost_price)
-            + _safe_nonneg(p_db.packaging_cost)
-            + _safe_nonneg(p_db.first_mile_unit_cost)
+            unit_cogs_of(p_db)
             if cogs_known and p_db is not None
             else 0.0
         )
@@ -555,9 +554,7 @@ async def generate_weekly_top_and_unprofitable_report(
         p_db = _lookup_product_for_order(mp, raw_sku, by_mp_sku, by_mp_ext)
         unit_cogs_known = p_db is not None and _safe_nonneg(p_db.cost_price) > 0.0
         unit_cogs = (
-            _safe_nonneg(p_db.cost_price)
-            + _safe_nonneg(p_db.packaging_cost)
-            + _safe_nonneg(p_db.first_mile_unit_cost)
+            unit_cogs_of(p_db)
             if unit_cogs_known and p_db is not None
             else 0.0
         )

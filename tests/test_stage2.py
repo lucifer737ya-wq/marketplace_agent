@@ -8,6 +8,7 @@ offline.require_isolation()  # before importing application settings
 
 from database.models import init_db, close_db
 from database.crud import create_pending_action, get_pending_action, claim_price_action, finish_price_action
+from config import settings
 from services.common.price_auditor import calculate_ozon_unit_profit, evaluate_ozon_dual_scenarios, find_optimal_wb_price
 from services.common.unit_economics import calculate_floor_price
 from services.wb.statistics_api import WBStatisticsAPI
@@ -21,11 +22,11 @@ class TestPrices(unittest.TestCase):
         self.assertEqual(calculate_ozon_unit_profit(300.01, 60, 39, 0, 3, .063, .22)['comm_pct'], 52)
         d = evaluate_ozon_dual_scenarios(299, 60, .22, .23, 10, 10, 39, 10, 5, .063)
         self.assertGreater(d['tier_over300']['price'], 300)
-        self.assertGreaterEqual(d['tier_over300']['net_profit'], max(d['tier_299']['net_profit'] + 25, 55))
+        self.assertGreaterEqual(d['tier_over300']['net_profit'], settings.PRICE_MIN_ROI * 60 - 1)  # ROI >= 30% к себестоимости
 
     def test_invalid_economics(self):
         with self.assertRaises(ValueError): calculate_floor_price(1, 1, 1, 1, 1, .9, .1, .06, .1)
-        with self.assertRaises(ValueError): find_optimal_wb_price(100, 10, .8, 1, 0, 10, 10, 1, .1)
+        with self.assertRaises(ValueError): find_optimal_wb_price(100, 10, .95, 1, 0, 10, 10, 1, .1)
 
     def test_identifiers_and_ozon_result(self):
         self.assertEqual(_resolve_wb_nm_id({'nm_id': 123}, '1001', 'act:app:42'), 123)

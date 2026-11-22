@@ -642,7 +642,7 @@ async def run_full_competitor_deep_audit(
             lines.append(f"\n💰 {label}: {summ}")
     cogs_txt = (f"{ctx.cogs_unit:.0f} ₽" if ctx.cogs_unit is not None else "не задана — внесите через «📦 Себестоимость»")
     lines.append(
-        f"ℹ️ Цена ЛК = витрина + СПП (WB ≈ {ctx.wb_spp * 100:.0f}%, Ozon — скидка {ctx.ozon_discount * 100:.0f}%). "
+        f"ℹ️ Цена ЛК = витрина / (1 − скидка площадки): WB СПП ≈ {ctx.wb_spp * 100:.0f}%, Ozon (цена по Ozon Карте) ≈ {ctx.ozon_discount * 100:.0f}%. Налог 6% — с цены витрины. "
         f"Чистая прибыль — при нашей закупке (себестоимость банки {cogs_txt}), комиссиях "
         f"(WB {ctx.wb_commission * 100:.0f}%, Ozon {ctx.ozon_commission_low * 100:.0f}% до 300 ₽ / "
         f"{settings.OZON_HIGH_COMMISSION_RATE * 100:.0f}% выше), логистике, эквайринге и УСН 6%; без рекламы."
@@ -652,5 +652,34 @@ async def run_full_competitor_deep_audit(
             f"\n📈 Медиана витрины: <b>{median_total:.0f} ₽</b> · "
             f"среднее: <b>{avg_total:.0f} ₽</b>"
         )
+
+    if wb_err and not wb_comps:
+        lines.append(
+            "\n🛠 <b>WB не отдал карточки.</b> Один раз выполните в cmd <code>login_wb.bat</code>: откроется окно Chrome "
+            "с тем же профилем, пройдите проверку «я не робот» и закройте окно. Токен антибота сохранится в профиле, "
+            "дальше «Пробив конкурентов» будет получать выдачу WB. Запускайте без VPN, "
+            "в .env: LISTINGS_BROWSER_HEADLESS=false, LISTINGS_BROWSER_CHANNEL=chrome."
+        )
+
+    # Цены конкурентов нужны аудиту цен: рекомендация не должна быть дороже рынка.
+    try:
+        from services.common.pricing_policy import save_competitor_reference
+
+        save_competitor_reference(wb_prices, oz_prices)
+    except Exception as exc:  # noqa: BLE001 — кэш не должен ронять отчёт
+        logger.warning("[Competitors] кэш цен не записан: %s", exc)
+
+    # ИИ-разбор: как покупатель выбирает и чего нет у нас (цели с числами, а не «добавь фото»).
+    try:
+        from services.competitors.ai_card_analysis import run_ai_card_analysis
+
+        ai_block = await run_ai_card_analysis(
+            clean_query, wb_comps, oz_comps, ozon_api=ozon_api, wb_api=wb_api, wb_spp=ctx.wb_spp
+        )
+        lines.append("\n" + ai_block)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        lines.append(f"\n🧠 ИИ-разбор карточек недоступен: <code>{html.escape(str(exc)[:200])}</code>")
 
     return "\n".join(lines), prices_dict

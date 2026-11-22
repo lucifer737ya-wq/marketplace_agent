@@ -576,6 +576,10 @@ class TestStage3CompetitorsDeepParser(unittest.IsolatedAsyncioTestCase):
                 "services.competitors.deep_parser._call_gemini_competitor_verdict",
                 new=AsyncMock(return_value="<b>Вывод:</b> держать 299 ₽ на Ozon."),
             ),
+            patch(
+                "services.competitors.ai_card_analysis.run_ai_card_analysis",
+                new=AsyncMock(return_value="🧠 <b>ИИ-разбор</b>"),
+            ),
         ):
             rep_html, stats = await run_full_competitor_deep_audit("гель <15г>")
 

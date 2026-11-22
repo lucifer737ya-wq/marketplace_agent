@@ -41,6 +41,10 @@ os.environ.update(
     GEMINI_RETRY_ROUNDS="1",
     GEMINI_NET_RETRY_DELAY="0",
     GEMINI_DIRECT_FALLBACK="false",
+    # Старые тесты считают себестоимость как закупка+упаковка из БД; новые правила проверяет tests/test_audit_20261121.py.
+    PACKAGING_COST_PER_UNIT="0",
+    LABOR_COST_PER_UNIT="0",
+    COMPETITOR_OZON_DISCOUNT_RATE="0",
 )
 
 

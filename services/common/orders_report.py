@@ -9,6 +9,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
 from config import settings
+from services.common.cogs import unit_cogs_of
 from database.crud import _db_write_lock
 from database.models import OrderRecord, Product, get_db_session
 from products_catalog import OZON_SKU_TO_ART, WB_SKU_TO_ART
@@ -231,19 +232,11 @@ def _calculate_marketplace_cogs(
             # Возврат покупателя: товар вернулся на склад — себестоимость возвращённых
             # единиц вычитается (иначе P&L завышает затраты и «уходит в минус»).
             if prod is not None and _safe_nonneg(prod.cost_price) > 0.0:
-                total_cogs -= (
-                    _to_dec(_safe_nonneg(prod.cost_price))
-                    + _to_dec(_safe_nonneg(prod.packaging_cost))
-                    + _to_dec(_safe_nonneg(prod.first_mile_unit_cost))
-                ) * Decimal(qty)
+                total_cogs -= _to_dec(unit_cogs_of(prod)) * Decimal(qty)
             continue
 
         if prod is not None and _safe_nonneg(prod.cost_price) > 0.0:
-            unit_cogs = (
-                _to_dec(_safe_nonneg(prod.cost_price))
-                + _to_dec(_safe_nonneg(prod.packaging_cost))
-                + _to_dec(_safe_nonneg(prod.first_mile_unit_cost))
-            )
+            unit_cogs = _to_dec(unit_cogs_of(prod))
             total_cogs += unit_cogs * Decimal(qty)
         else:
             missing_units += qty

@@ -9,6 +9,7 @@ from services.common.gemini import generate
 from sqlalchemy import select
 
 from config import settings
+from services.common.cogs import unit_cogs_of
 from database.models import Product, get_db_session
 from products_catalog import OZON_SKU_TO_ART, PRODUCTS_CATALOG, WB_SKU_TO_ART
 from services.common.orders_report import (
@@ -330,12 +331,7 @@ def analyze_ozon_campaigns(
         if sku_key and ext_key:
             prod_id_to_art[ext_key] = sku_key
         if sku_key and _safe_nonneg(prod.cost_price) > 0.0:
-            oz_cogs_by_sku[sku_key] = round(
-                _safe_nonneg(prod.cost_price)
-                + _safe_nonneg(prod.packaging_cost)
-                + _safe_nonneg(prod.first_mile_unit_cost),
-                2,
-            )
+            oz_cogs_by_sku[sku_key] = round(unit_cogs_of(prod), 2)
 
     stock_by_art: Dict[str, Dict[str, Any]] = {}
     market_sku_to_art = dict(OZON_SKU_TO_ART)

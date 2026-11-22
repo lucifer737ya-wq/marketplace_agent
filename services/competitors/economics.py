@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional
 
 from config import settings
+from services.common.cogs import unit_cogs_of
 from services.common.ozon_tariffs import ozon_logistics_cost
 
 # Типичные «прочие постоянные» расходы Ozon на заказ (возвраты, drop-off, упаковка, ПВЗ), ₽.
@@ -54,7 +55,9 @@ def spp_from_items(items: Iterable[Dict[str, Any]], fallback: float) -> float:
         if not isinstance(it, dict):
             continue
         cur, buyer = _f(it.get("current_price")), _f(it.get("buyer_price"))
-        if cur > 0 and 0 < buyer <= cur:
+        # buyer == cur — это «нет заказов за 7 дней, цена покупателя неизвестна» (API подставляет цену продавца),
+        # а не СПП 0%. Раньше такие SKU тянули медиану к 0% и в отчёте было «СПП ≈ 0%».
+        if cur > 0 and 0 < buyer < cur * 0.995:
             ratios.append(buyer / cur)
     if not ratios:
         return fallback
@@ -66,8 +69,7 @@ def build_context(products: Iterable[Any], oz_items: Iterable[Dict[str, Any]],
                   wb_items: Iterable[Dict[str, Any]]) -> OurEconomy:
     costs = []
     for p in products or []:
-        total = (_f(getattr(p, "cost_price", 0.0)) + _f(getattr(p, "packaging_cost", 0.0))
-                 + _f(getattr(p, "first_mile_unit_cost", 0.0)))
+        total = unit_cogs_of(p)
         if _f(getattr(p, "cost_price", 0.0)) > 0:
             costs.append(total)
     cogs = round(statistics.mean(costs), 2) if costs else None
@@ -107,7 +109,9 @@ def net_profit(mp: str, lk: float, showcase: float, ctx: OurEconomy) -> Optional
     comm = settings.OZON_HIGH_COMMISSION_RATE if lk > limit else ctx.ozon_commission_low
     logistics = ozon_logistics_cost(settings.OZON_ITEM_VOLUME_L, lk, limit)
     fixed = OZON_OTHER_FIXED_TYPICAL + float(settings.OZON_EXTRA_FIXED_PER_ORDER)
-    return round(lk * (1 - comm - acq - tax_rate) - ctx.cogs_unit - logistics - fixed, 2)
+    # УСН — со стоимости, по которой берёт покупатель (витрина), а не с цены ЛК.
+    tax_base = showcase if settings.OZON_TAX_ON_BUYER_PRICE and showcase > 0 else lk
+    return round(lk * (1 - comm - acq) - tax_base * tax_rate - ctx.cogs_unit - logistics - fixed, 2)
 
 
 def annotate(comps: Iterable[Dict[str, Any]], ctx: OurEconomy) -> List[Dict[str, Any]]:

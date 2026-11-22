@@ -17,6 +17,7 @@ from services.common.orders_report import sync_and_generate_orders_report
 from services.common.price_calculator import build_ozon_guard, build_price_report, check_ai_ozon_prices
 from services.ozon.seller_api import OzonSellerAPI
 from services.wb.statistics_api import WBStatisticsAPI
+from services.common.cogs import unit_cogs_of
 
 
 async def check_gemini_api_health() -> Dict[str, Any]:
@@ -125,7 +126,7 @@ async def generate_monday_ai_board_report(
             sku = str(it.get("sku") or "").strip()
             p_db = cogs_map.get(f"{mp_label.lower()}_{sku}")
             if p_db and float(p_db.cost_price or 0.0) > 0.0:
-                cogs_val = float(p_db.cost_price) + float(p_db.packaging_cost or 0.0) + float(p_db.first_mile_unit_cost or 0.0)
+                cogs_val = unit_cogs_of(p_db)
                 cogs_str = f"{cogs_val:.0f}₽"
             else:
                 cogs_str = "не задана"
