@@ -1403,6 +1403,7 @@ async def _open_review_card(page, row, ident, row_text, review_idx: int = 3):
         # Строгий селектор не дал одной карточки — берём видимый портал/диалог (как в «ИСХОД»).
         marked = await page.evaluate(_MARK_LOOSE_JS, token)
     if not marked:
+        await _save_fail_diag(page, "card")
         raise _SkipReview("Нельзя однозначно выбрать карточку отзыва")
 
     # Этот локатор не перестанет находить карточку при исчезновении кнопки «Ответить».
@@ -1743,32 +1744,69 @@ _FILTERS_BTN = re.compile(r"^Фильтры(?:\s*\d+)?$", re.I)
 FILTER_POINT = (355, 425)  # резервная точка кнопки «Фильтры» (из «ИСХОД», система 1440x900)
 _CONTENT_OPTS: Dict[str, bool] = {"С текстом": True, "С медиа": True, "Только с оценкой": False}
 
-_CHECKBOX_STATE_JS = r"""(names) => {
-    const out = {};
-    const nodes = [...document.querySelectorAll('label, [role=checkbox], [role=option], li, div, span')];
+# ПАТЧ 2026-11-26b. Причина «галочки: С текстом=True, С медиа=False» и случайного открытия отзыва:
+# прежний поиск брал ПЕРВЫЙ элемент с текстом «С медиа» во всём документе. В таблице отзывов есть бейджи
+# «С медиа» (их же вычищает _clean_review_text), поэтому состояние читалось у строки таблицы, а
+# row.click() по её родителю ОТКРЫВАЛ ОТЗЫВ вместо переключения галочки. Теперь: поиск только внутри
+# панели фильтров (предок кнопки «Применить»), элементы внутри таблицы исключены, клик — настоящий.
+_FILTER_FN = r"""
+const inTable = e => !!e.closest('table, tbody, thead, tr, [role="row"], [role="grid"], [role="table"]');
+const vis = e => { const s = getComputedStyle(e), r = e.getBoundingClientRect();
+    return s.display !== 'none' && s.visibility !== 'hidden' && r.width > 0 && r.height > 0; };
+const leafs = (root, name) => [...root.querySelectorAll('label, span, div, p, li, [role="checkbox"], [role="option"]')]
+    .filter(e => (e.innerText || '').trim() === name && !inTable(e) && vis(e));
+const panel = () => {
+    const btns = [...document.querySelectorAll('button, [role="button"]')]
+        .filter(b => /^применить$/i.test((b.innerText || '').trim()) && vis(b) && !inTable(b));
+    for (const b of btns.reverse()) {
+        for (let n = b.parentElement; n && n !== document.body; n = n.parentElement) {
+            if (leafs(n, 'С текстом').length && leafs(n, 'С медиа').length) return n;
+        }
+    }
+    return null;
+};
+const BOX = 'input[type="checkbox"], [role="checkbox"]';
+const rowOf = el => {
+    for (let n = el, i = 0; n && i < 4; n = n.parentElement, i++) {
+        if (n.matches(BOX) || n.hasAttribute('aria-checked')) return n;
+        const k = n.querySelectorAll(BOX).length;
+        if (k === 1) return n;
+        if (k > 1) return null;   // поднялись выше одной строки — соседняя галочка не наша
+    }
+    return null;
+};
+const stateOf = row => {
+    const inp = row.matches('input[type="checkbox"]') ? row : row.querySelector('input[type="checkbox"]');
+    if (inp) return !!inp.checked;
+    const a = row.hasAttribute('aria-checked') ? row : row.querySelector('[aria-checked]');
+    return a ? a.getAttribute('aria-checked') === 'true' : null;
+};
+"""
+
+_CHECKBOX_STATE_JS = "(names) => {" + _FILTER_FN + r"""
+    const out = {}, sc = panel();
     for (const name of names) {
         out[name] = null;
-        for (const el of nodes) {
-            if ((el.innerText || '').trim() !== name) continue;
-            const row = el.closest('label') || el.closest('[role=checkbox]') || el.parentElement;
+        if (!sc) continue;
+        for (const el of leafs(sc, name)) {
+            const row = rowOf(el);
             if (!row) continue;
-            const inp = row.matches('input[type=checkbox]') ? row : row.querySelector('input[type=checkbox]');
-            if (inp) { out[name] = !!inp.checked; break; }
-            const aria = row.getAttribute('aria-checked') ?? el.getAttribute('aria-checked');
-            if (aria !== null) { out[name] = aria === 'true'; break; }
+            const v = stateOf(row);
+            if (v !== null) { out[name] = v; break; }
         }
     }
     return out;
 }"""
 
-_CHECKBOX_CLICK_JS = r"""(name) => {
-    for (const el of document.querySelectorAll('label, [role=checkbox], [role=option], li, div, span')) {
-        if ((el.innerText || '').trim() !== name) continue;
-        const row = el.closest('label') || el.closest('[role=checkbox]') || el.parentElement;
-        if (!row) continue;
-        const r = row.getBoundingClientRect();
-        if (!r.width || !r.height) continue;
-        row.click();
+# Помечает ТЕКСТ/метку нужной галочки (внутри панели фильтров) для настоящего клика мышью.
+_CHECKBOX_MARK_JS = "([name, token]) => {" + _FILTER_FN + r"""
+    const sc = panel();
+    if (!sc) return false;
+    for (const el of leafs(sc, name)) {
+        const row = rowOf(el);
+        if (!row || stateOf(row) === null) continue;
+        const target = row.closest('label') || (row.matches('[role="checkbox"]') ? row : el);
+        target.setAttribute('data-yasoko-opt', token);
         return true;
     }
     return false;
@@ -1789,8 +1827,14 @@ async def _checkbox_states(page) -> Dict[str, Optional[bool]]:
 
 
 async def _filters_panel_open(page) -> bool:
+    """Панель открыта, если виден «Применить» вне таблицы (заголовок «Контент» может быть и в таблице)."""
     try:
-        return await page.get_by_text("Контент", exact=True).last.is_visible()
+        return bool(await page.evaluate(
+            "() => {" + _FILTER_FN + r"""
+                return [...document.querySelectorAll('button, [role="button"]')].some(
+                    b => /^применить$/i.test((b.innerText || '').trim()) && vis(b) && !inTable(b));
+            }"""
+        ))
     except Exception:
         return False
 
@@ -1820,10 +1864,52 @@ async def _open_filters_panel(page) -> bool:
     return True
 
 
+async def _set_filter_option(page, name: str, want: bool) -> bool:
+    """Ставит галочку ТОЛЬКО внутри панели фильтров настоящим кликом; вслепую не кликает."""
+    for _ in range(3):
+        cur = (await _checkbox_states(page)).get(name)
+        if cur is None:
+            return False
+        if cur == want:
+            return True
+        token = str(time.monotonic_ns())
+        if not await page.evaluate(_CHECKBOX_MARK_JS, [name, token]):
+            return False
+        target = page.locator(f'[data-yasoko-opt="{token}"]')
+        try:
+            await target.scroll_into_view_if_needed(timeout=2000)
+            await target.click(timeout=2500)
+        except PWError:
+            try:
+                await page.evaluate(
+                    "t => { const e = document.querySelector('[data-yasoko-opt=\"' + t + '\"]'); if (e) e.click(); }",
+                    token,
+                )
+            except PWError:
+                pass
+        await page.wait_for_timeout(350)
+        if await _review_card_open(page):
+            # Промах: вместо галочки открылась карточка отзыва — закрываем и пробуем ещё раз.
+            _log.warning("Клик по «%s» открыл карточку отзыва — закрываю", name)
+            await _force_close_drawer(page)
+            if not await _filters_panel_open(page) and not await _open_filters_panel(page):
+                return False
+    return (await _checkbox_states(page)).get(name) == want
+
+
+async def _close_filters_panel(page) -> None:
+    """Панель обязана закрыться, иначе она перекроет таблицу (и _js_is_drawer_open даст ложное «открыто»)."""
+    for _ in range(3):
+        if not await _filters_panel_open(page):
+            return
+        await page.keyboard.press("Escape")
+        await page.wait_for_timeout(350)
+
+
 async def _apply_reviews_content_filter(page) -> bool:
     """Фильтры -> Контент -> галочки «С текстом» + «С медиа» (без «Только с оценкой») -> Применить.
 
-    Возвращает True, если обе нужные галочки стояли на момент нажатия «Применить».
+    Возвращает True, если нужные галочки стояли на момент нажатия «Применить».
     Любая ошибка не фатальна: строки «только оценка» всё равно отсеет review_row_decision.
     """
     _log.info("Фильтр Ozon: «Контент» -> «С текстом» + «С медиа»")
@@ -1831,26 +1917,29 @@ async def _apply_reviews_content_filter(page) -> bool:
         if not await _open_filters_panel(page):
             _log.warning("Панель «Фильтры» не открылась — работаю без фильтра (строки отсеет review_row_decision)")
             return False
-        probe = page.get_by_text("С текстом", exact=True)
-        if not (await probe.count() and await probe.last.is_visible()):
+        if (await _checkbox_states(page)).get("С текстом") is None:
             await _click_clear(page, page.get_by_text("Контент", exact=True).last, label="Контент")
-            await page.wait_for_timeout(500)
-        for name, want in _CONTENT_OPTS.items():
-            for _ in range(2):
-                cur = (await _checkbox_states(page)).get(name)
-                if cur is None or cur == want:
-                    break
-                await page.evaluate(_CHECKBOX_CLICK_JS, name)
-                await page.wait_for_timeout(250)
-        states = await _checkbox_states(page)
-        ok = states.get("С текстом") is True and states.get("С медиа") is True
+            await page.wait_for_timeout(600)
+        states: Dict[str, Optional[bool]] = {}
+        ok = False
+        for _round in range(3):
+            # «Только с оценкой» снимаем первой: пока она стоит, часть строк без текста.
+            for name in ("Только с оценкой", "С текстом", "С медиа"):
+                await _set_filter_option(page, name, _CONTENT_OPTS[name])
+            states = await _checkbox_states(page)
+            ok = states.get("С текстом") is True and states.get("С медиа") is True \
+                and states.get("Только с оценкой") is not True
+            if ok:
+                break
         apply_btn = page.get_by_role("button", name=re.compile(r"^Применить$", re.I)).last
         if await apply_btn.count() and await apply_btn.is_visible():
             await _click_clear(page, apply_btn, label="Применить")
         await page.wait_for_timeout(2000)
-        if await _filters_panel_open(page):  # панель не закрылась сама
-            await page.keyboard.press("Escape")
-            await page.wait_for_timeout(400)
+        await _close_filters_panel(page)
+        if await _review_card_open(page):  # на всякий случай: случайно открытый отзыв не должен остаться
+            _log.warning("После фильтра открыта карточка отзыва — закрываю")
+            await _force_close_drawer(page)
+        await page.wait_for_timeout(500)  # таблица перерисовывается после «Применить»
         _log.info("Фильтр Ozon %s (галочки: %s)", "применён" if ok else "НЕ подтверждён", states)
         return ok
     except Exception as exc:  # noqa: BLE001 — фильтр не обязателен
@@ -1987,10 +2076,91 @@ def _extract_product_color(*texts: str) -> str:
     return ""
 
 
+# ---- ПАТЧ 2026-11-26b: поиск окна отзыва без привязки к role=dialog / размеру портала ------------
+# Причина сбоя «Нельзя однозначно выбрать карточку отзыва»: окно открывалось (заголовок «Отзыв на товар»
+# и кнопка «Ответить на отзыв» видны), но у #ui-kit-side-page-portal-container нулевая собственная высота,
+# а role="dialog" у шторки Ozon нет -> ни строгий селектор, ни _MARK_LOOSE_JS карточку не находили,
+# каждый отзыв пропускался ДО чтения, а окно закрывалось крестиком. Теперь якорь = заголовок/кнопка.
+_DRAWER_FN = r"""
+const shown = e => { const s = getComputedStyle(e);
+    return s.display !== 'none' && s.visibility !== 'hidden' && Number(s.opacity) > 0.02; };
+const sized = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+const inTable = e => !!e.closest('table, tbody, thead, tr, [role="row"], [role="grid"], [role="table"]');
+const HOST = '#ui-kit-side-page-portal-container, [role="dialog"], [aria-modal="true"], dialog[open], ' +
+    '[data-testid="review-drawer"]';
+const findAnchor = () => {
+    for (const el of document.querySelectorAll('h1, h2, h3, h4, div, span, p, button, [role="button"]')) {
+        const t = (el.innerText || '').trim();
+        const hit = t === 'Отзыв на товар' ||
+            (el.matches('button, [role="button"]') && t.toLowerCase().includes('ответить на отзыв'));
+        if (hit && shown(el) && sized(el) && !inTable(el) && !el.querySelector('tbody, [role="row"]')) return el;
+    }
+    return null;
+};
+const findDrawer = () => {
+    const anchor = findAnchor();
+    if (anchor) {
+        let host = null;
+        for (let n = anchor; n; n = n.parentElement) if (n.matches && n.matches(HOST)) host = n;  // внешний
+        if (host) return host;
+        let n = anchor;
+        while (n.parentElement && n.parentElement !== document.body &&
+               n.parentElement !== document.documentElement &&
+               !n.parentElement.querySelector('tbody, [role="row"]')) n = n.parentElement;
+        return n;
+    }
+    const portal = document.querySelector('#ui-kit-side-page-portal-container');
+    if (portal && shown(portal) && (portal.innerText || '').trim().length > 10) return portal;
+    const area = e => { const r = e.getBoundingClientRect(); return r.width * r.height; };
+    const dl = [...document.querySelectorAll('[role="dialog"], [aria-modal="true"]')]
+        .filter(d => shown(d) && d.getBoundingClientRect().width >= 100 && d.getBoundingClientRect().height >= 100)
+        .sort((a, b) => area(b) - area(a));
+    return dl[0] || null;
+};
+"""
+
+_REVIEW_CARD_OPEN_JS = "() => {" + _DRAWER_FN + " return !!findAnchor(); }"
+_DRAWER_DEBUG_JS = "() => {" + _DRAWER_FN + r"""
+    const d = findDrawer(), a = findAnchor();
+    const desc = e => e ? (e.tagName.toLowerCase() + (e.id ? '#' + e.id : '') +
+        '[role=' + (e.getAttribute('role') || '') + ']' + (' ' + (e.className && e.className.baseVal !== undefined
+            ? e.className.baseVal : e.className || '')).slice(0, 60)) : null;
+    const chain = []; for (let n = a; n && chain.length < 8; n = n.parentElement) chain.push(desc(n));
+    const portal = document.querySelector('#ui-kit-side-page-portal-container');
+    const pr = portal ? portal.getBoundingClientRect() : null;
+    return {anchor: desc(a), drawer: desc(d), chain,
+            portal: pr ? [Math.round(pr.width), Math.round(pr.height)] : null,
+            dialogs: document.querySelectorAll('[role="dialog"]').length};
+}"""
+
+
+async def _review_card_open(page) -> bool:
+    """Открыта именно карточка отзыва (заголовок/кнопка «Ответить на отзыв»), а не панель фильтров."""
+    try:
+        return bool(await page.evaluate(_REVIEW_CARD_OPEN_JS))
+    except PWError:
+        return False
+
+
+async def _save_fail_diag(page, tag: str) -> None:
+    """Скриншот + описание DOM при сбое (раньше при сбое не оставалось никаких следов)."""
+    try:
+        info = await page.evaluate(_DRAWER_DEBUG_JS)
+    except PWError:
+        info = None
+    _log.warning("Диагностика окна отзыва (%s): %s", tag, info)
+    try:
+        LOGS_DIR.mkdir(parents=True, exist_ok=True)
+        path = LOGS_DIR / f"review_fail_{tag}_{datetime.now():%Y%m%d_%H%M%S}.png"
+        await page.screenshot(path=str(path))
+        _log.warning("Скриншот сохранён: %s", path)
+    except Exception as exc:  # noqa: BLE001 — диагностика не должна ронять обход
+        _log.debug("Скриншот не сохранён: %s", short_error(exc))
+
+
 # ---- гарантированное закрытие окна отзыва -----------------------------------------------
-_CLOSE_X_JS = r"""() => {
-    const scope = document.querySelector('#ui-kit-side-page-portal-container') ||
-        [...document.querySelectorAll('div[role="dialog"]')].find(d => d.getBoundingClientRect().width > 100);
+_CLOSE_X_JS = "() => {" + _DRAWER_FN + r"""
+    const scope = findDrawer();
     if (!scope) return false;
     const sr = scope.getBoundingClientRect();
     const btns = [...scope.querySelectorAll('button, [role="button"]')].filter(b => {
@@ -2077,15 +2247,10 @@ async def _wait_card(page, cards, timeout_ms: int) -> None:
     raise PWTimeout("Окно отзыва не появилось")
 
 
-_MARK_LOOSE_JS = r"""(key) => {
-    const vis = e => { const r = e.getBoundingClientRect(); const s = getComputedStyle(e);
-        return r.width >= 100 && r.height >= 100 && s.display !== 'none' && s.visibility !== 'hidden'; };
-    const cands = [document.querySelector('#ui-kit-side-page-portal-container'),
-        ...document.querySelectorAll('div[role="dialog"]')].filter(e => e && vis(e));
-    if (!cands.length) return false;
-    cands.sort((a, b) => (b.getBoundingClientRect().width * b.getBoundingClientRect().height) -
-                         (a.getBoundingClientRect().width * a.getBoundingClientRect().height));
-    cands[0].setAttribute('data-yasoko-card', key);
+_MARK_LOOSE_JS = "(key) => {" + _DRAWER_FN + r"""
+    const d = findDrawer();
+    if (!d) return false;
+    d.setAttribute('data-yasoko-card', key);
     return true;
 }"""
 
@@ -2101,14 +2266,16 @@ async def _click_reply_dom(page, drawer) -> bool:
                 return True
             except PWError:
                 continue
-    try:  # как в «ИСХОД»: JS-клик по точному тексту
+    try:  # как в «ИСХОД»: JS-клик по точному тексту (в окне отзыва, затем по всей странице)
         return bool(await page.evaluate(
-            r"""() => {
-                const root = document.querySelector('#ui-kit-side-page-portal-container') ||
-                    document.querySelector('div[role="dialog"]') || document;
-                for (const b of root.querySelectorAll('button, [role="button"]')) {
-                    const t = (b.innerText || '').trim().toLowerCase();
-                    if (t === 'ответить на отзыв' || t === 'ответить') { b.click(); return true; }
+            "() => {" + _DRAWER_FN + r"""
+                for (const root of [findDrawer(), document]) {
+                    if (!root) continue;
+                    for (const b of root.querySelectorAll('button, [role="button"]')) {
+                        if (inTable(b)) continue;
+                        const t = (b.innerText || '').trim().toLowerCase();
+                        if (t === 'ответить на отзыв' || t === 'ответить') { b.click(); return true; }
+                    }
                 }
                 return false;
             }"""
