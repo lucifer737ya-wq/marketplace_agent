@@ -484,14 +484,16 @@ async def scheduled_reviews_and_questions_job() -> None:
                     if result["status"] == "partial" and not result.get("replied") and "бюджету времени" in message:
                         print(f"[Worker] {job.__name__}: {message}", flush=True)
                     else:
-                        await notify_admin_once(html.escape(message))
+                        # Многострочный «Call log» Playwright в Telegram не нужен: первая строка + лимит.
+                        brief = message.strip().splitlines()[0] if message.strip() else message
+                        await notify_admin_once(html.escape(brief[:500]))
             except (TimeoutError, asyncio.TimeoutError):
                 await notify_admin_once(
                     f"⚠️ Ozon {job.__name__}: остановлен, превышен бюджет {int(job_budget // 60)} мин. "
                     "Не все записи могли быть проверены; состояние публикации проверьте в ЛК."
                 )
             except Exception as exc:
-                await notify_admin_once(f"Ozon {job.__name__}: {html.escape(str(exc))}")
+                await notify_admin_once(f"Ozon {job.__name__}: {html.escape(str(exc).strip().splitlines()[0][:500] if str(exc).strip() else type(exc).__name__)}")
 
 
 async def scheduled_daily_price_audit_job() -> None:

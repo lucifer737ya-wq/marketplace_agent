@@ -475,9 +475,10 @@ async def _launch(p):
         kwargs = dict(
             user_data_dir=str(profile_dir),
             headless=headless,
-            args=BROWSER_ARGS,
+            args=BROWSER_ARGS + ([] if headless else ["--start-maximized"]),
+            ignore_default_args=["--enable-automation"],  # без полосы «управляется ПО»
             env=_direct_env(),
-            viewport=VIEWPORT,
+            viewport=VIEWPORT if headless else None,
             user_agent=USER_AGENT,
             locale="ru-RU",
             timezone_id="Europe/Moscow",

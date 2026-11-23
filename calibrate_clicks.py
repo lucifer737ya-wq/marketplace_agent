@@ -35,9 +35,10 @@ async def main():
         context = await p.chromium.launch_persistent_context(
             user_data_dir=str(BROWSER_DATA_DIR),
             headless=False,
-            args=DIRECT_BROWSER_ARGS,
+            args=DIRECT_BROWSER_ARGS + ["--start-maximized"],
+            ignore_default_args=["--enable-automation"],  # без полосы «управляется ПО»
             env=_get_direct_env(),
-            viewport={"width": 1440, "height": 900},  # Ровно то же разрешение, что и в агенте!
+            no_viewport=True,
         )
         page = await context.new_page()
 

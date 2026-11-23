@@ -80,7 +80,23 @@ DIRECT_BROWSER_ARGS = [
     "--no-sandbox",
     "--disable-infobars",
     "--disable-dev-shm-usage",
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--hide-crash-restore-bubble",
+    "--disable-session-crashed-bubble",
 ]
+
+# Playwright по умолчанию добавляет --enable-automation: из-за него Chrome рисует вверху жёлтую
+# полосу «Браузером управляет автоматизированное ПО». Полоса сдвигает страницу вниз, а окно с
+# фиксированным viewport 1440x900 перестаёт помещаться в экран — поле ответа и «самолётик»
+# уезжают за нижний край. Флаг --disable-infobars в Chrome 76+ уже не работает, поэтому
+# отключаем именно --enable-automation.
+IGNORE_DEFAULT_ARGS = ["--enable-automation"]
+
+# Контейнер окон дизайн-системы Ozon (ODS): сюда монтируются модалки/шторки/подложки.
+ODS_CONTAINER = "#ods-window-target-container"
+# Таймаут по умолчанию 30 с × десятки повторов «перехвата клика» выглядел как зависание.
+DEFAULT_ACTION_TIMEOUT_MS = 12000
 
 MIN_TARGET_DATE = datetime(2026, 11, 13)
 
@@ -88,6 +104,43 @@ MIN_TARGET_DATE = datetime(2026, 11, 13)
 REVIEW_POINTS_FILE = LOGS_DIR / "review_click_points.json"
 _log = logging.getLogger("ozon.reviews")
 _DASH_ONLY = re.compile(r"^[\s\-–—−·•.]*$")
+
+
+def browser_launch_kwargs(headless: bool, *, with_channel: bool = False) -> Dict[str, Any]:
+    """Единые параметры запуска Chromium для отзывов/вопросов/калибровки.
+
+    * без --enable-automation → нет жёлтой полосы «управляется ПО» и сдвига страницы;
+    * видимое окно: viewport=None + --start-maximized — страница занимает всё окно и
+      гарантированно помещается в экран (поле ответа и «самолётик» не уезжают вниз);
+    * headless: фиксированный viewport 1440x900 (калиброванные координаты).
+    """
+    args = list(DIRECT_BROWSER_ARGS)
+    kwargs: Dict[str, Any] = {
+        "user_data_dir": str(BROWSER_DATA_DIR),
+        "headless": headless,
+        "args": args,
+        "ignore_default_args": list(IGNORE_DEFAULT_ARGS),
+        "env": _get_direct_env(),
+    }
+    if headless:
+        kwargs["viewport"] = dict(VIEWPORT)
+    else:
+        args += ["--start-maximized", "--window-position=0,0"]
+        kwargs["viewport"] = None
+        kwargs["no_viewport"] = True
+    return kwargs
+
+
+def short_error(exc: BaseException, limit: int = 300) -> str:
+    """Одна строка вместо многостраничного «Call log» Playwright (раньше он целиком уходил в Telegram)."""
+    text = str(exc).strip() or type(exc).__name__
+    first = text.splitlines()[0].strip() if text else type(exc).__name__
+    low = text.lower()
+    if "intercepts pointer events" in low:
+        first = f"{first} (клик перекрыт всплывающим окном Ozon; обход будет повторён в следующем цикле)"
+    if len(first) > limit:
+        first = first[: limit - 1] + "…"
+    return f"{type(exc).__name__}: {first}"
 
 
 def _is_dash(text: str) -> bool:
@@ -164,6 +217,28 @@ def _load_points() -> Dict[str, Any]:
         return {}
 
 
+async def _inner_size(page) -> Tuple[int, int]:
+    """Реальный размер видимой области страницы (viewport может быть None в видимом окне)."""
+    vp = page.viewport_size
+    if vp:
+        return int(vp["width"]), int(vp["height"])
+    try:
+        w, h = await page.evaluate("() => [window.innerWidth, window.innerHeight]")
+        return int(w), int(h)
+    except Exception:  # noqa: BLE001
+        return VIEWPORT["width"], VIEWPORT["height"]
+
+
+async def _scale_pt(page, x: int, y: int, base_w: Optional[int] = None, base_h: Optional[int] = None) -> Tuple[int, int]:
+    """Пересчёт калиброванной точки (1440x900) в размер реального окна."""
+    base_w = base_w or VIEWPORT["width"]
+    base_h = base_h or VIEWPORT["height"]
+    w, h = await _inner_size(page)
+    if (w, h) == (base_w, base_h) or base_w <= 0 or base_h <= 0:
+        return x, y
+    return round(x * w / base_w), round(y * h / base_h)
+
+
 async def _coord_click(page, name: str) -> bool:
     """Клик по калиброванной точке (резерв, если элемент не найден по DOM)."""
     if str(getattr(settings, "OZON_REVIEWS_CLICK_MODE", "auto")).strip().lower() == "dom":
@@ -175,8 +250,14 @@ async def _coord_click(page, name: str) -> bool:
         x, y = int(pt[0]), int(pt[1])
     except (TypeError, ValueError):
         return False
-    vp = page.viewport_size or VIEWPORT
-    if not (0 <= x < vp["width"] and 0 <= y < vp["height"]):
+    saved = _load_points().get("_viewport")
+    try:
+        base_w, base_h = int(saved[0]), int(saved[1])
+    except (TypeError, ValueError, IndexError, KeyError):
+        base_w, base_h = VIEWPORT["width"], VIEWPORT["height"]
+    x, y = await _scale_pt(page, x, y, base_w, base_h)
+    vp = await _inner_size(page)
+    if not (0 <= x < vp[0] and 0 <= y < vp[1]):
         return False
     _log.info("Этап «%s»: DOM-элемент не найден, клик по координатам (%s, %s)", name, x, y)
     await page.mouse.move(x, y, steps=8)
@@ -549,8 +630,9 @@ async def _js_is_drawer_open(page) -> bool:
 async def _close_question_drawer(page) -> bool:
     if not await _js_is_drawer_open(page):
         return True
+    close_x, close_y = await _scale_pt(page, Q_CLOSE_PT[0], Q_CLOSE_PT[1])
     try:
-        await page.mouse.click(Q_CLOSE_PT[0], Q_CLOSE_PT[1])
+        await page.mouse.click(close_x, close_y)
         await asyncio.sleep(0.4)
     except Exception as exc:
         logging.getLogger(__name__).debug("Playwright: %s", type(exc).__name__)
@@ -558,7 +640,7 @@ async def _close_question_drawer(page) -> bool:
         return True
     for dx, dy in [(-6, 0), (6, 0), (0, -6), (0, 6)]:
         try:
-            await page.mouse.click(Q_CLOSE_PT[0] + dx, Q_CLOSE_PT[1] + dy)
+            await page.mouse.click(close_x + dx, close_y + dy)
             await asyncio.sleep(0.15)
             if not await _js_is_drawer_open(page):
                 return True
@@ -597,7 +679,12 @@ def _extract_sku(*texts: str) -> Optional[str]:
         if m:
             return m[1]
     for t in texts:
-        m = re.search(r"\b(1[0-5]\d{2})\b", t or "")
+        # Запасной вариант: четырёхзначное число не должно быть суммой/весом/количеством из текста отзыва.
+        m = re.search(
+            r"(?<![\d.,])(1[0-5]\d{2})(?![\d.,]|\s*(?:₽|руб|р\.?(?!\w)|г\b|гр\b|мл|шт|кг|%|штук|раз))",
+            t or "",
+            re.I,
+        )
         if m:
             return m[1]
     return None
@@ -648,6 +735,96 @@ def _extract_question_text(drawer_text: str, fallback: str) -> str:
     return fallback
 
 
+_NEUTRALIZE_BACKDROPS_JS = r"""(sel) => {
+    const root = document.querySelector(sel);
+    if (!root) return 0;
+    let n = 0;
+    for (const el of root.querySelectorAll('*')) {
+        if (getComputedStyle(el).pointerEvents === 'none') continue;
+        const r = el.getBoundingClientRect();
+        const empty = el.children.length === 0 && !(el.innerText || '').trim();
+        // Пустая подложка на пол-экрана без содержимого — «застрявший» backdrop закрытой модалки.
+        if (empty && r.width >= innerWidth * 0.5 && r.height >= innerHeight * 0.5) {
+            el.style.pointerEvents = 'none';
+            n += 1;
+        }
+    }
+    return n;
+}"""
+
+
+async def _dismiss_blockers(page, *, neutralize: bool = False) -> int:
+    """Закрывает всплывающие окна Ozon, перехватывающие клики (контейнер ODS).
+
+    Порядок: «Закрыть/Понятно» в окне → Escape → (по требованию) отключение пустой подложки.
+    Возвращает число сделанных действий.
+    """
+    actions = 0
+    try:
+        box = page.locator(ODS_CONTAINER)
+        if await box.count():
+            close = box.locator(
+                ':is(button[aria-label*="акрыть" i], button[title*="акрыть" i], '
+                '[data-testid*="close" i]):visible'
+            ).first
+            if await close.count():
+                try:
+                    await close.click(timeout=1500)
+                    actions += 1
+                except PWError:
+                    pass
+            else:
+                ok = box.get_by_role(
+                    "button", name=re.compile(r"^(?:Понятно|Закрыть|Хорошо|Позже|Не сейчас|Пропустить)$", re.I)
+                ).first
+                if await ok.count():
+                    try:
+                        await ok.click(timeout=1500)
+                        actions += 1
+                    except PWError:
+                        pass
+        await page.keyboard.press("Escape")
+        actions += 1
+        await page.wait_for_timeout(250)
+        if neutralize:
+            actions += int(await page.evaluate(_NEUTRALIZE_BACKDROPS_JS, ODS_CONTAINER) or 0)
+    except Exception as exc:  # noqa: BLE001 — «уборка» окон не должна ронять обход
+        _log.debug("Не удалось снять блокирующее окно: %s", type(exc).__name__)
+    return actions
+
+
+async def _click_clear(page, locator, *, timeout: int = 6000, label: str = "элемент") -> None:
+    """Клик с самолечением: если клик перекрыт подложкой/окном — закрываем его и повторяем.
+
+    1) обычный клик; 2) закрыть окно (Закрыть/Escape) и повторить;
+    3) отключить пустую подложку и повторить; 4) force-клик. Иначе — исходная ошибка (короткая).
+    """
+    try:
+        await locator.click(timeout=timeout)
+        return
+    except PWTimeout as first:
+        error: Exception = first
+    _log.warning("Клик «%s» не прошёл (%s) — снимаю перекрытие", label, short_error(error))
+    await _dismiss_blockers(page)
+    try:
+        await locator.click(timeout=3000)
+        return
+    except PWTimeout as exc:
+        error = exc
+    await _dismiss_blockers(page, neutralize=True)
+    try:
+        await locator.click(timeout=3000)
+        return
+    except PWTimeout as exc:
+        error = exc
+    try:
+        await locator.click(timeout=2000, force=True)
+        return
+    except PWError:
+        pass
+    raise error
+
+
 async def _click_subtab(page, names: List[str]) -> bool:
     for name in names:
         rx = re.compile(rf"^\s*{re.escape(name)}\b", re.I)
@@ -660,7 +837,7 @@ async def _click_subtab(page, names: List[str]) -> bool:
                     continue
                 box = await el.bounding_box()
                 if box and box["y"] > 140 and box["height"] < 90:
-                    await el.click()
+                    await _click_clear(page, el, label=name)
                     await asyncio.sleep(2.5)
                     return True
         except Exception:
@@ -678,13 +855,7 @@ async def run_interactive_login() -> None:
     async with async_playwright() as p:
         context = None
         try:
-            context = await p.chromium.launch_persistent_context(
-                user_data_dir=str(BROWSER_DATA_DIR),
-                headless=False,
-                args=DIRECT_BROWSER_ARGS + ["--start-maximized"],
-                env=_get_direct_env(),
-                viewport=None,
-            )
+            context = await p.chromium.launch_persistent_context(**browser_launch_kwargs(False))
             page = context.pages[0] if context.pages else await context.new_page()
             await page.goto(REVIEWS_URL, wait_until="domcontentloaded", timeout=60000)
             while len(context.pages) > 0:
@@ -948,9 +1119,21 @@ async def _review_editor(page, drawer, review_id):
     return field
 
 
+async def _reveal(locator) -> None:
+    """Прокрутить элемент в видимую область (шторка могла уехать вниз за край окна)."""
+    try:
+        await locator.scroll_into_view_if_needed(timeout=2500)
+        await locator.evaluate(
+            "e => e.scrollIntoView({block: 'center', inline: 'nearest'})"
+        )
+    except PWError:
+        pass
+
+
 async def _focus_editor(page, field) -> bool:
     """Этап 2 завершён только когда курсор реально в поле ввода ответа."""
     probe = "e => e === document.activeElement || e.contains(document.activeElement)"
+    await _reveal(field)
     for attempt in range(3):
         if await field.evaluate(probe):
             return True
@@ -971,6 +1154,7 @@ async def _editor_text(field) -> str:
 async def _fill_review(page, field, reply: str) -> str:
     from services.common.buyer_questions import call_fast_gemini
 
+    await _reveal(field)
     await field.click(timeout=4000)
 
     for attempt in range(2):
@@ -1074,6 +1258,7 @@ async def _submit_review_reply(page, drawer, field, reply: str) -> bool:
             # и не кликаем по координатам после неопределённого результата.
             _log.info("Этап 4/5: отправка ответа — %s", how)
             if control is not None:
+                await _reveal(control)
                 await control.click(timeout=4000)
             else:
                 key = str(getattr(settings, "OZON_REVIEWS_SEND_KEY", "Enter") or "Enter")
@@ -1130,7 +1315,7 @@ async def _reset_review_filters(page) -> None:
         "button", name=re.compile(r"^Сбросить (?:все )?фильтры$", re.I)
     ).first
     if await reset.is_visible():
-        await reset.click()
+        await _click_clear(page, reset, label="сброс")
         return
 
     filters = page.get_by_role(
@@ -1139,17 +1324,17 @@ async def _reset_review_filters(page) -> None:
     if not await filters.is_visible():
         return
 
-    await filters.click()
+    await _click_clear(page, filters, label="Фильтры")
     reset = page.get_by_role(
         "button",
         name=re.compile(r"^(Сбросить|Очистить)(?: все| всё| фильтры| все фильтры)?$", re.I),
     ).last
     if await reset.is_visible() and await reset.is_enabled():
-        await reset.click()
+        await _click_clear(page, reset, label="сброс")
     else:
         content = page.get_by_text("Контент", exact=True).last
         if await content.is_visible():
-            await content.click()
+            await _click_clear(page, content, label="Контент")
         for name in ("Только с оценкой", "С текстом", "С медиа"):
             option = page.get_by_role("checkbox", name=name, exact=True)
             if await option.count() == 1 and await option.is_checked():
@@ -1157,7 +1342,7 @@ async def _reset_review_filters(page) -> None:
 
     apply = page.get_by_role("button", name="Применить", exact=True).last
     if await apply.is_visible() and await apply.is_enabled():
-        await apply.click()
+        await _click_clear(page, apply, label="Применить")
     else:
         await page.keyboard.press("Escape")
 
@@ -1169,14 +1354,14 @@ async def _review_tab(page, names: list[str]) -> bool:
         for role in roles:
             tab = page.get_by_role(role, name=rx)
             if await tab.count() == 1 and await tab.is_visible():
-                await tab.click()
+                await _click_clear(page, tab, label=name)
                 await page.wait_for_timeout(400)
                 return True
         if name == "Все":
             continue
         fallback = page.get_by_text(rx)
         if await fallback.count() == 1 and await fallback.is_visible():
-            await fallback.click()
+            await _click_clear(page, fallback, label=name)
             await page.wait_for_timeout(400)
             return True
     return False
@@ -1314,8 +1499,18 @@ async def _scan_reviews(
     start = tracker["replied_count"]
     budget = min(max_per_run, MAX_DAILY_REPLIES - start)
 
-    await _reset_review_filters(page)
-    if await _review_tab(page, ["Все отзывы", "Все"]):
+    try:
+        await _reset_review_filters(page)
+    except PWError as exc:
+        # Сброс фильтров — удобство, а не условие работы: не роняем весь обход.
+        _log.warning("Сброс фильтров отзывов не удался: %s", short_error(exc))
+        await _dismiss_blockers(page, neutralize=True)
+    try:
+        all_tab = await _review_tab(page, ["Все отзывы", "Все"])
+    except PWError as exc:
+        _log.warning("Вкладка «Все» недоступна: %s", short_error(exc))
+        all_tab = False
+    if all_tab:
         tabs = [("Все", [])]
     else:
         tabs = [
@@ -1327,9 +1522,15 @@ async def _scan_reviews(
     for title, names in tabs:
         if len(records) >= budget or _expired(deadline):
             break
-        if names and not await _review_tab(page, names):
-            failures.append(f"Не найдена вкладка «{title}»")
-            continue
+        if names:
+            try:
+                found_tab = await _review_tab(page, names)
+            except PWError as exc:
+                failures.append(f"Вкладка «{title}» не нажалась: {short_error(exc)}")
+                continue
+            if not found_tab:
+                failures.append(f"Не найдена вкладка «{title}»")
+                continue
 
         visited, last_page, idle = set(), None, 0
         pages_checked = 0
@@ -1442,7 +1643,7 @@ async def _scan_reviews(
                     if signature == last_page:
                         raise RuntimeError("Пагинация отзывов не продвигается")
                     last_page = signature
-                    await nxt.click()
+                    await _click_clear(page, nxt, label="Следующая страница")
                     await page.wait_for_timeout(500)
                     if signature != tuple(await rows.all_inner_texts()):
                         visited.clear()
@@ -1477,19 +1678,15 @@ async def auto_reply_unanswered_reviews(
 
     try:
         async with async_playwright() as pw:
-            context = await pw.chromium.launch_persistent_context(
-                user_data_dir=str(BROWSER_DATA_DIR),
-                headless=headless,
-                args=DIRECT_BROWSER_ARGS,
-                env=_get_direct_env(),
-                viewport=VIEWPORT,
-            )
+            context = await pw.chromium.launch_persistent_context(**browser_launch_kwargs(headless))
             try:
+                context.set_default_timeout(DEFAULT_ACTION_TIMEOUT_MS)
                 page = context.pages[0] if context.pages else await context.new_page()
                 await page.goto(REVIEWS_URL, wait_until="domcontentloaded", timeout=60000)
                 if "login" in page.url.lower():
                     return {"status": "need_auth", "replied": 0, "message": "Необходима авторизация Ozon"}
                 await page.wait_for_timeout(1500)
+                await _dismiss_blockers(page)
                 return await _scan_reviews(
                     page, tracker, dry_run, max_per_run, _deadline(max_runtime_sec)
                 )
@@ -1499,7 +1696,7 @@ async def auto_reply_unanswered_reviews(
         return {
             "status": "error",
             "replied": tracker["replied_count"] - start,
-            "message": str(exc),
+            "message": short_error(exc),
         }
 
 
@@ -1536,13 +1733,8 @@ async def auto_reply_unanswered_questions(
         async with async_playwright() as p:
             context = None
             try:
-                context = await p.chromium.launch_persistent_context(
-                    user_data_dir=str(BROWSER_DATA_DIR),
-                    headless=headless,
-                    args=DIRECT_BROWSER_ARGS,
-                    env=_get_direct_env(),
-                    viewport=VIEWPORT,
-                )
+                context = await p.chromium.launch_persistent_context(**browser_launch_kwargs(headless))
+                context.set_default_timeout(DEFAULT_ACTION_TIMEOUT_MS)
                 page = context.pages[0] if context.pages else await context.new_page()
 
                 print("[Ozon Questions] Открытие раздела вопросов...")
@@ -1624,11 +1816,12 @@ async def auto_reply_unanswered_questions(
 
                             click_y = int(row_box["y"] + row_box["height"] / 2)
                             print(f"\n👉 [Вопрос] X={Q_CLICK_X}, Y={click_y}: «{q_cell_text[:50]}...»")
-                            await page.mouse.click(Q_CLICK_X, click_y)
+                            click_x, _unused = await _scale_pt(page, Q_CLICK_X, 0)
+                            await page.mouse.click(click_x, click_y)
                             await asyncio.sleep(2.0)
 
                             if not await _js_is_drawer_open(page):
-                                await page.mouse.click(Q_CLICK_X, click_y)
+                                await page.mouse.click(click_x, click_y)
                                 await asyncio.sleep(2.0)
 
                             drawer = page.locator(f"{PORTAL_SEL}:visible, {DIALOG_SEL}:visible").first
@@ -1677,7 +1870,8 @@ async def auto_reply_unanswered_questions(
                                 logging.getLogger(__name__).debug("Playwright: %s", type(exc).__name__)
 
                             print(f"👉 [Клик в поле ввода вопроса ({Q_INPUT_PT[0]}, {Q_INPUT_PT[1]})]")
-                            await page.mouse.click(Q_INPUT_PT[0], Q_INPUT_PT[1])
+                            input_x, input_y = await _scale_pt(page, Q_INPUT_PT[0], Q_INPUT_PT[1])
+                            await page.mouse.click(input_x, input_y)
                             await asyncio.sleep(0.5)
 
                             field = page.locator(
@@ -1685,6 +1879,7 @@ async def auto_reply_unanswered_questions(
                                 f"{DIALOG_SEL} textarea, {DIALOG_SEL} [contenteditable='true']"
                             ).last
                             if await field.count() > 0 and await field.is_visible():
+                                await _reveal(field)
                                 try:
                                     await field.fill(cleaned_reply)
                                 except Exception:
@@ -1738,4 +1933,4 @@ async def auto_reply_unanswered_questions(
             }
     except Exception as exc:
         print(f"❌ [Ozon Questions Error]: {exc}")
-        return {"status": "error", "replied": replied_count, "message": str(exc)}
+        return {"status": "error", "replied": replied_count, "message": short_error(exc)}

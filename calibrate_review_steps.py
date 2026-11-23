@@ -21,7 +21,7 @@ from playwright.async_api import async_playwright
 
 from config import prepare_runtime_dirs
 from services.ozon.browser_reviews import (
-    BROWSER_DATA_DIR, DIRECT_BROWSER_ARGS, REVIEW_POINTS_FILE, REVIEWS_URL, VIEWPORT, _get_direct_env,
+    REVIEW_POINTS_FILE, REVIEWS_URL, browser_launch_kwargs,
 )
 
 STEPS = [
@@ -41,7 +41,7 @@ HUD_JS = """
   hud.innerText = 'X: 0 | Y: 0';
   document.documentElement.appendChild(hud);
   addEventListener('mousemove', e => { hud.innerText = `X: ${e.clientX} | Y: ${e.clientY}`; });
-  addEventListener('click', e => window.reportClick(e.clientX, e.clientY), true);
+  addEventListener('click', e => window.reportClick(e.clientX, e.clientY, innerWidth, innerHeight), true);
 }
 """
 
@@ -62,26 +62,24 @@ async def main() -> None:
             return
         print(f"\nШаг {i + 1}/{len(STEPS)} [{STEPS[i][0]}]: {STEPS[i][1]}")
 
-    def on_click(x, y) -> None:
+    def on_click(x, y, vw=1440, vh=900) -> None:
         i = state["i"]
         if i >= len(STEPS):
             return
         name = STEPS[i][0]
         points[name] = [int(x), int(y)]
+        points["_viewport"] = [int(vw), int(vh)]  # агент пересчитает точки под размер своего окна
         print(f"   📍 {name}: X={int(x)} Y={int(y)}")
         state["i"] += 1
         prompt()
 
     async with async_playwright() as p:
-        context = await p.chromium.launch_persistent_context(
-            user_data_dir=str(BROWSER_DATA_DIR), headless=False, args=DIRECT_BROWSER_ARGS,
-            env=_get_direct_env(), viewport=VIEWPORT,
-        )
+        context = await p.chromium.launch_persistent_context(**browser_launch_kwargs(False))
         await context.expose_function("reportClick", on_click)
         await context.add_init_script(f"document.addEventListener('DOMContentLoaded', {HUD_JS});")
         page = context.pages[0] if context.pages else await context.new_page()
         await page.goto(REVIEWS_URL, wait_until="domcontentloaded", timeout=60000)
-        print("Окно 1440x900 — не меняйте его размер. Закройте окно браузера, чтобы выйти.")
+        print("Окно развёрнуто на весь экран — не меняйте его размер. Закройте окно браузера, чтобы выйти.")
         prompt()
         while not done.is_set() and context.pages:
             await asyncio.sleep(0.5)

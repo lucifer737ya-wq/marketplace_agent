@@ -21,8 +21,9 @@ from playwright.async_api import async_playwright
 
 from config import LOGS_DIR, prepare_runtime_dirs
 from services.ozon.browser_reviews import (
-    BROWSER_DATA_DIR, DIRECT_BROWSER_ARGS, REVIEW_POINTS_FILE, REVIEWS_URL, VIEWPORT,
-    _get_direct_env, _header_texts, _row_cells_dump,
+    REVIEW_POINTS_FILE, REVIEWS_URL, VIEWPORT,
+    browser_launch_kwargs,
+    _header_texts, _row_cells_dump,
 )
 
 DIAG_FILE = LOGS_DIR / "review_diag.json"
@@ -131,15 +132,12 @@ async def main() -> None:
         prompt()
 
     async with async_playwright() as p:
-        context = await p.chromium.launch_persistent_context(
-            user_data_dir=str(BROWSER_DATA_DIR), headless=False, args=DIRECT_BROWSER_ARGS,
-            env=_get_direct_env(), viewport=VIEWPORT,
-        )
+        context = await p.chromium.launch_persistent_context(**browser_launch_kwargs(False))
         await context.expose_function("reportClick", on_click)
         await context.add_init_script(f"document.addEventListener('DOMContentLoaded', {HUD_JS});")
         page = context.pages[0] if context.pages else await context.new_page()
         await page.goto(REVIEWS_URL, wait_until="domcontentloaded", timeout=60000)
-        print("Окно 1440x900 — не меняйте его размер.")
+        print("Окно развёрнуто на весь экран — не меняйте его размер.")
         print("Дождитесь, пока в окне загрузится ТАБЛИЦА отзывов (вкладка «Все отзывы»/«Новые»).")
         await asyncio.to_thread(input, "Когда таблица видна — нажмите Enter здесь, в консоли... ")
 
