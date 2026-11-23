@@ -38,7 +38,10 @@ class GeminiUnavailable(RuntimeError):
 # Актуальные текстовые модели Google (сверено с документацией на 20.11.2026):
 # * gemini-3.8-flash (02.09.2026) — текущая Flash-модель;
 # * gemini-3.6-flash — без объявленной даты отключения в Gemini API;
-# * gemini-3.5-flash / 3.5-flash-lite — действуют (3.5-flash маршрутизируется на 3.6);
+# * gemini-3.5-flash-lite действует; gemini-3.5-flash автоматически идёт на 3.6, gemini-3.7-flash — на 3.8
+#   (подтверждено ai.google.dev/gemini-api/docs/deprecations на 20.11.2026);
+# * семейство Gemini 4 (argon/carbon/hydrogen/neon, 10.10–18.11.2026) в цепочку не добавлено — проверьте
+#   в AI Studio, какая из моделей Flash-класса доступна вашему ключу;
 # * gemini-3.1-flash-lite — действует до 07.05.2027 (эконом-модель).
 # gemini-2.5-* объявлены устаревшими 02.11.2026 («только существующим
 # пользователям», с 01.12.2026 перенаправляются Google) — в цепочке их больше нет:
@@ -68,6 +71,13 @@ _NON_TEXT_TAGS = (
     "video",
     "live",
     "native-audio",
+    "nano-banana",  # gemini-nano-banana-2.1 — генерация изображений
+    "omni",         # gemini-omni-*-flash — генерация видео
+    "genie",
+    "lyria",
+    "transcribe",
+    "translate",
+    "decision",
 )
 
 

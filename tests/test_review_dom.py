@@ -53,6 +53,10 @@ class ReviewDOM(unittest.IsolatedAsyncioTestCase):
                 reviews, "_scroll_main_table_down", AsyncMock(return_value=False)
             )
         )
+        # Эти тесты проверяют DOM-ветку на минимальной странице без калиброванной вёрстки Ozon.
+        self.enterContext(
+            patch.object(reviews.settings, "OZON_REVIEWS_CLICK_MODE", "dom_first", create=True)
+        )
         self.tracker = reviews._load_tracker()
 
     async def test_retry_in_viewed_then_confirm_only_once(self):

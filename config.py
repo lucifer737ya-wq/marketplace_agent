@@ -169,7 +169,10 @@ class Settings(BaseSettings):
     # --- Рекомендации цен: чистая прибыль к себестоимости (ROI) от 30% до 100% ---
     PRICE_MIN_ROI: float = Field(default=0.30, description="Минимальная чистая прибыль к себестоимости в рекомендации цены")
     PRICE_MAX_ROI: float = Field(default=1.00, description="Максимальная чистая прибыль к себестоимости в рекомендации цены")
-    OZON_REVIEWS_CLICK_MODE: str = Field(default="auto", description="dom | auto (DOM, затем калиброванные координаты) ")
+    OZON_REVIEWS_CLICK_MODE: str = Field(
+        default="auto",
+        description="auto | coords (координаты-ОБЛАСТИ основные, DOM — дополнение) | dom_first (сначала DOM, координаты резерв) | dom (только DOM)",
+    )
     OZON_REVIEWS_SEND_KEY: str = Field(default="Enter", description="Клавиша отправки, если кнопки/самолётика нет")
     OZON_REVIEWS_STEP_PAUSE_MS: int = Field(default=350, description="Пауза между этапами ответа на отзыв, мс")
     OZON_REVIEWS_REPLY_RULE: str = Field(default="text_or_media", description="text_or_media | text | media")
