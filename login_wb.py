@@ -12,8 +12,15 @@ QUERY = "%D0%B3%D0%B5%D0%BB%D1%8C%20%D0%B4%D0%BB%D1%8F%20%D0%BD%D0%BE%D0%B3%D1%8
 
 async def main() -> None:
     prepare_runtime_dirs()
-    print(f"[Login] Профиль: {LISTING_PROFILE_DIR}")
-    print("Откроется Chrome (выключите VPN): пройдите проверку на WB и Ozon, дождитесь выдачи, закройте окно.")
+    from services.common.direct_guard import foreign_exit_message
+
+    print(f"[Login] Профиль: {LISTING_PROFILE_DIR}_<браузер>")
+    problem = await foreign_exit_message()
+    if problem:
+        print("\n[!] " + problem + "\n")
+        print("VPN выключать не требуется — настройте direct-правила и запустите login_wb.bat снова.")
+        return
+    print("Откроется Chrome (выход с РФ-IP): пройдите проверку на WB и Ozon, дождитесь выдачи, закройте окно.")
     async with _playwright_factory()() as p:
         context = await _launch(p)
         page = context.pages[0] if context.pages else await context.new_page()

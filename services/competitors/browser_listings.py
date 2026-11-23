@@ -441,16 +441,39 @@ def _playwright_factory():
         return async_playwright
 
 
+def _profile_dir_for(channel: str):
+    """Отдельный профиль на каждый браузер.
+
+    Один каталог нельзя открывать то Chrome (новая версия), то встроенным Chromium 130: старый
+    движок падает на профиле нового (`Settings version is not 1` → `Target page, context or browser
+    has been closed`), что и видно в журнале. Раздельные профили лечат это и не теряют токен антибота.
+    """
+    return LISTING_PROFILE_DIR if not channel else LISTING_PROFILE_DIR.with_name(
+        f"{LISTING_PROFILE_DIR.name}_{channel}"
+    )
+
+
+def _quarantine_profile(path) -> None:
+    import time
+
+    try:
+        if path.exists():
+            path.rename(path.with_name(f"{path.name}_broken_{int(time.time())}"))
+    except OSError as exc:  # профиль занят живым процессом — лучше не трогать
+        logger.warning("[Listings] профиль %s не перенесён: %s", path, exc)
+
+
 async def _launch(p):
     """Запуск с установленным Chrome/Edge (канал), затем встроенный Chromium как резерв."""
-    LISTING_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
     channel = str(getattr(settings, "LISTINGS_BROWSER_CHANNEL", "chrome") or "").strip()
     headless = bool(getattr(settings, "LISTINGS_BROWSER_HEADLESS", True))
     channels = [c for c in (channel, "msedge" if channel == "chrome" else "") if c] + [""]
     last_exc: Exception | None = None
     for ch in channels:
+        profile_dir = _profile_dir_for(ch)
+        profile_dir.mkdir(parents=True, exist_ok=True)
         kwargs = dict(
-            user_data_dir=str(LISTING_PROFILE_DIR),
+            user_data_dir=str(profile_dir),
             headless=headless,
             args=BROWSER_ARGS,
             env=_direct_env(),
@@ -465,7 +488,18 @@ async def _launch(p):
             context = await p.chromium.launch_persistent_context(**kwargs)
         except Exception as exc:  # noqa: BLE001 — пробуем следующий канал
             last_exc = exc
-            continue
+            text = str(exc)
+            if "Settings version" in text or "has been closed" in text:
+                # Повреждённый/несовместимый профиль: переносим в сторону и пробуем один раз заново.
+                _quarantine_profile(profile_dir)
+                profile_dir.mkdir(parents=True, exist_ok=True)
+                try:
+                    context = await p.chromium.launch_persistent_context(**kwargs)
+                except Exception as exc2:  # noqa: BLE001
+                    last_exc = exc2
+                    continue
+            else:
+                continue
         try:
             await context.add_init_script(STEALTH_INIT_SCRIPT)
         except Exception:  # noqa: BLE001
@@ -481,6 +515,28 @@ async def _close(context) -> None:
         await asyncio.wait_for(context.close(), timeout=15)
     except Exception:  # noqa: BLE001 — закрытие не должно ронять парсер
         pass
+
+
+async def _vpn_wall_on_page(page) -> bool:
+    from services.common.direct_guard import looks_like_vpn_wall
+
+    try:
+        text = await page.evaluate("() => (document.body && document.body.innerText || '').slice(0, 4000)")
+    except Exception:  # noqa: BLE001
+        return False
+    return looks_like_vpn_wall(text)
+
+
+async def _route_problem() -> Optional[str]:
+    """Если выход в сеть не из РФ (VPN в TUN-режиме) — не открываем пустое окно «отключите VPN»."""
+    if str(getattr(settings, "LISTINGS_SKIP_ROUTE_CHECK", "false")).lower() in ("1", "true", "yes"):
+        return None
+    from services.common.direct_guard import foreign_exit_message
+
+    try:
+        return await foreign_exit_message()
+    except Exception:  # noqa: BLE001 — проверка маршрута не должна ломать парсер
+        return None
 
 
 async def wb_search_via_browser(
@@ -523,6 +579,10 @@ async def _wb_search_uncached(
         if isinstance(products, dict) and isinstance(products.get("products"), list):
             captured.append(products["products"])
 
+    wall = await _route_problem()
+    if wall:
+        return [], f"WB: браузер не открывался — {wall}"
+
     context = None
     try:
         async with async_playwright() as p:
@@ -542,6 +602,10 @@ async def _wb_search_uncached(
                 await page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
             except Exception as exc:  # noqa: BLE001
                 return [], f"WB: страница поиска не открылась ({exc})"
+            if await _vpn_wall_on_page(page):
+                from services.common.direct_guard import direct_rules_hint
+
+                return [], "WB показал страницу «отключите VPN». " + direct_rules_hint()
             # После JVO1 нужно дать странице время выполнить свой поиск.
             for _ in range(int(FIRST_RESULT_TIMEOUT_MS / 500)):
                 if captured:
@@ -645,6 +709,10 @@ async def _ozon_search_uncached(
     except Exception as exc:  # noqa: BLE001
         raise _BrowserUnavailable(f"Playwright недоступен: {exc}") from exc
 
+    wall = await _route_problem()
+    if wall:
+        return [], f"Ozon: браузер не открывался — {wall}"
+
     context = None
     try:
         async with async_playwright() as p:
@@ -661,6 +729,10 @@ async def _ozon_search_uncached(
                 )
             except Exception as exc:  # noqa: BLE001
                 return [], f"Ozon: главная не открылась ({exc})"
+            if await _vpn_wall_on_page(page):
+                from services.common.direct_guard import direct_rules_hint
+
+                return [], "Ozon показал страницу «отключите VPN». " + direct_rules_hint()
             await asyncio.sleep(3.0)  # прогрев антибот-сессии
 
             # Основной путь — JSON entrypoint-api (страницы по ~36 плиток), запрос из контекста

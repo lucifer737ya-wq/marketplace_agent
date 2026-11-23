@@ -48,6 +48,19 @@ def unit_cogs_of(prod: Any) -> float:
     return round(sum(parts.values()), 2)
 
 
+def roi_base_of(prod: Any) -> float:
+    """База для ROI: ЗАКУПОЧНАЯ цена единицы (требование продавца).
+
+    ROI = чистая прибыль (уже после вычета полной себестоимости) / закупочная цена * 100%.
+    Пример: 38 / 61 * 100% = 62,3%. Раньше делили на полную себестоимость (закупка + упаковка +
+    зарплата ≈ 76 ₽), и ROI выходил заниженным (38 / 76 = 50%), а цена по ROI 30–100% — неверной.
+    ``PRICE_ROI_BASE=cogs`` возвращает старое поведение.
+    """
+    if str(getattr(settings, "PRICE_ROI_BASE", "purchase")).strip().lower() == "cogs":
+        return unit_cogs_of(prod)
+    return _nn(getattr(prod, "cost_price", 0.0))
+
+
 def purchase_out_of_range(prod: Any) -> bool:
     """Закупка вне реального диапазона 58–66 ₽ — вероятно, устаревшая цифра «70»."""
     value = _nn(getattr(prod, "cost_price", 0.0))

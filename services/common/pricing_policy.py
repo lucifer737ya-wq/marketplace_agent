@@ -1,7 +1,7 @@
 """Политика рекомендаций цены: чистая прибыль к себестоимости 30–100% + оглядка на конкурентов.
 
 Правила (по требованию продавца):
-* ROI = чистая прибыль / себестоимость единицы; рекомендация лежит в коридоре ``PRICE_MIN_ROI``…``PRICE_MAX_ROI``
+* ROI = чистая прибыль (после вычета себестоимости) / ЗАКУПОЧНАЯ цена * 100% (38/61*100 = 62,3%); рекомендация лежит в коридоре ``PRICE_MIN_ROI``…``PRICE_MAX_ROI``
   (по умолчанию 30%…100%).
 * Если известна цена конкурентов (в пересчёте на цену ЛК) — цена не выше неё (минус ``COMPETITOR_PRICE_UNDERCUT``):
   нельзя ставить 800 ₽, когда у конкурентов 650 ₽.
@@ -26,7 +26,7 @@ COMPETITOR_REF_TTL_SEC = 7 * 24 * 3600
 class PriceRec:
     price: int
     profit: float
-    roi: float            # прибыль / себестоимость
+    roi: float            # прибыль / закупочная цена (база ROI)
     margin: float         # прибыль / цена ЛК
     p_break_even: int     # минимальная цена с прибылью > 0
     p_min_roi: int        # минимальная цена для ROI >= min
@@ -54,18 +54,20 @@ def smallest_price(pf: Callable[[float], float], target: float, lo: int, hi: int
 
 def recommend_price(pf: Callable[[float], float], cogs: float, *, lo: int = 1, hi: int = 6000,
                     competitor_lk: Optional[float] = None,
-                    min_roi: Optional[float] = None, max_roi: Optional[float] = None) -> Optional[PriceRec]:
+                    min_roi: Optional[float] = None, max_roi: Optional[float] = None,
+                    roi_base: Optional[float] = None) -> Optional[PriceRec]:
     """Цена по ROI-коридору и конкурентам; ``None`` — прибыль на этой ветке тарифа недостижима."""
     if not math.isfinite(cogs) or cogs <= 0:
         return None
+    base = roi_base if roi_base and math.isfinite(roi_base) and roi_base > 0 else cogs
     min_roi = settings.PRICE_MIN_ROI if min_roi is None else min_roi
     max_roi = settings.PRICE_MAX_ROI if max_roi is None else max_roi
     max_roi = max(max_roi, min_roi)
     p_be = smallest_price(pf, 0.5, lo, hi)
-    p_min = smallest_price(pf, min_roi * cogs, lo, hi)
+    p_min = smallest_price(pf, min_roi * base, lo, hi)
     if p_be is None or p_min is None:
         return None
-    p_max = smallest_price(pf, max_roi * cogs, lo, hi) or hi
+    p_max = smallest_price(pf, max_roi * base, lo, hi) or hi
     p_max = max(p_max, p_min)
 
     ref = None
@@ -89,7 +91,7 @@ def recommend_price(pf: Callable[[float], float], cogs: float, *, lo: int = 1, h
                    "Опускаться ниже нельзя (убыток): лучше не демпинговать, а менять набор/расходы")
     price = int(min(max(price, lo), hi))
     profit = round(pf(float(price)), 2)
-    return PriceRec(price, profit, round(profit / cogs, 4), round(profit / price, 4) if price else 0.0,
+    return PriceRec(price, profit, round(profit / base, 4), round(profit / price, 4) if price else 0.0,
                     p_be, p_min, p_max, competitor_lk, status, verdict)
 
 

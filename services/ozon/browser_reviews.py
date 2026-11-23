@@ -84,6 +84,130 @@ DIRECT_BROWSER_ARGS = [
 
 MIN_TARGET_DATE = datetime(2026, 11, 13)
 
+# Калиброванные точки для резервного режима «по координатам» (пишет calibrate_review_steps.py).
+REVIEW_POINTS_FILE = LOGS_DIR / "review_click_points.json"
+_log = logging.getLogger("ozon.reviews")
+_DASH_ONLY = re.compile(r"^[\s\-–—−·•.]*$")
+
+
+def _is_dash(text: str) -> bool:
+    """Пусто или только прочерк: у отзыва нет текстовой части."""
+    return bool(_DASH_ONLY.fullmatch((text or "").strip()))
+
+
+def _count(text: str) -> int:
+    """Число в ячейке «Видео»/«Фото» (0, 1, 2 …); не число → 0."""
+    m = re.search(r"\d+", text or "")
+    return int(m[0]) if m else 0
+
+
+def resolve_review_columns(headers: List[str], cell_count: int) -> Dict[str, Optional[int]]:
+    """Индексы столбцов по ТЕКСТУ шапки, а не по номеру.
+
+    Раньше «Отзыв» был зашит как ``cells[3]``. В таблице Ozon первый столбец — это чекбокс + фото +
+    название товара (иногда в нескольких <td>), затем «Статус», затем «Отзыв». Индекс 3 попадал в
+    название товара (синяя ссылка) — бот открывал карточку товара и «наводился» на название.
+    Шапка и строки могут иметь разное число <td>, поэтому индекс считается от ПРАВОГО края.
+    """
+    low = [(h or "").strip().lower() for h in headers]
+    shift = cell_count - len(low)
+
+    def find(*keys: str, exact_start: bool = False) -> Optional[int]:
+        for i, h in enumerate(low):
+            if any((h.startswith(k) if exact_start else k in h) for k in keys):
+                idx = i + shift
+                return idx if 0 <= idx < cell_count else None
+        return None
+
+    status = find("статус", exact_start=True)
+    review = find("отзыв", exact_start=True)
+    if review is None and status is not None and status + 1 < cell_count:
+        review = status + 1  # «Отзыв» стоит сразу за «Статус»
+    return {
+        "review": review,
+        "status": status,
+        "video": find("видео"),
+        "photo": find("фото"),
+        "answers": find("ответ", "коммент", exact_start=True),
+    }
+
+
+def review_row_decision(
+    review_text: str, photo_text: str = "", video_text: str = "", *,
+    same_media_cell: bool = False, rule: Optional[str] = None,
+) -> Tuple[bool, str]:
+    """Нужно ли отвечать на строку: есть текст (не прочерк) ИЛИ Видео/Фото не 0."""
+    rule = str(rule or getattr(settings, "OZON_REVIEWS_REPLY_RULE", "text_or_media")).strip().lower()
+    has_text = bool(_clean_review_text(review_text)) and not _is_dash(review_text)
+    if same_media_cell:
+        photos, videos = sum(int(n) for n in re.findall(r"\d+", photo_text or "")), 0
+    else:
+        photos, videos = _count(photo_text), _count(video_text)
+    has_media = (photos + videos) > 0
+    ok = {"text": has_text, "media": has_media}.get(rule, has_text or has_media)
+    if ok:
+        return True, "текст" if has_text else "фото/видео"
+    return False, "нет текста и медиа (только оценка)"
+
+
+def _load_points() -> Dict[str, Any]:
+    try:
+        data = json.loads(REVIEW_POINTS_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:  # noqa: BLE001 — нет файла/нет прав: калибровки просто нет
+        return {}
+
+
+async def _coord_click(page, name: str) -> bool:
+    """Клик по калиброванной точке (резерв, если элемент не найден по DOM)."""
+    if str(getattr(settings, "OZON_REVIEWS_CLICK_MODE", "auto")).strip().lower() == "dom":
+        return False
+    pt = _load_points().get(name)
+    if not (isinstance(pt, (list, tuple)) and len(pt) == 2):
+        return False
+    try:
+        x, y = int(pt[0]), int(pt[1])
+    except (TypeError, ValueError):
+        return False
+    vp = page.viewport_size or VIEWPORT
+    if not (0 <= x < vp["width"] and 0 <= y < vp["height"]):
+        return False
+    _log.info("Этап «%s»: DOM-элемент не найден, клик по координатам (%s, %s)", name, x, y)
+    await page.mouse.move(x, y, steps=8)
+    await page.mouse.click(x, y)
+    return True
+
+
+async def _pause(page) -> None:
+    try:
+        ms = int(getattr(settings, "OZON_REVIEWS_STEP_PAUSE_MS", 350))
+    except (TypeError, ValueError):
+        ms = 350
+    await page.wait_for_timeout(max(ms, 0))
+
+
+async def _header_texts(page) -> List[str]:
+    """Заголовки таблицы с учётом colspan."""
+    try:
+        return await _header_texts_raw(page)
+    except Exception:  # noqa: BLE001 — нет таблицы/страница перерисована
+        return []
+
+
+async def _header_texts_raw(page) -> List[str]:
+    return await page.evaluate(
+        r"""() => {
+            const t = document.querySelector('table');
+            if (!t) return [];
+            const out = [];
+            t.querySelectorAll('thead th').forEach(th => {
+                const n = Math.max(1, th.colSpan || 1);
+                for (let i = 0; i < n; i++) out.push((th.innerText || '').trim());
+            });
+            return out;
+        }"""
+    )
+
 _RU_MONTH_PREFIXES: Tuple[Tuple[str, int], ...] = (
     ("янв", 1), ("фев", 2), ("мар", 3), ("апр", 4),
     ("мая", 5), ("май", 5), ("июн", 6), ("июл", 7),
@@ -271,10 +395,10 @@ async def _read_text_at_point(page, x: int, y: int, max_len: int = 260) -> str:
         return ""
 
 
-async def _item_date(container, *, table_row: bool) -> str:
+async def _item_date(container, *, table_row: bool, skip_idx: int = 3) -> str:
     """Дата публикации из поля даты, а не дата, упомянутая покупателем."""
     return await container.evaluate(
-        r"""(el, row) => {
+        r"""(el, [row, skip]) => {
             if (row) {
                 const headings = Array.from(el.closest('table')?.querySelectorAll('thead th') || []);
                 const idx = headings.findIndex(h => /^(дата|опубликован)/i.test(h.innerText.trim()));
@@ -290,11 +414,11 @@ async def _item_date(container, *, table_row: bool) -> str:
                 );
                 return label?.nextElementSibling?.innerText || '';
             }
-            const cells = Array.from(el.cells || []).filter((c, i) => i !== 3 &&
+            const cells = Array.from(el.cells || []).filter((c, i) => i !== skip &&
                 /^(?:\d{1,2}[. ](?:\d|[а-я])|20\d\d-|сегодня|вчера)/i.test(c.innerText.trim()));
             return cells.length === 1 ? cells[0].innerText : '';
         }""",
-        table_row,
+        [table_row, skip_idx],
     )
 
 
@@ -588,30 +712,54 @@ async def _has_seller_reply(drawer) -> bool:
     )
 
 
-async def _open_review_card(page, row, ident, row_text):
+async def _assert_still_on_reviews(page, pages_before: int, url_before: str = "") -> None:
+    """Клик не должен открывать товар: новая вкладка или уход со страницы отзывов = ошибка этапа 1."""
+    extra = [p for p in page.context.pages if p is not page][max(pages_before - 1, 0):]
+    if extra:
+        for p in extra:
+            try:
+                await p.close()
+            except PWError:
+                pass
+        raise _SkipReview("Клик открыл страницу товара — попали не в ячейку «Отзыв»; следующий этап не запускается")
+    if "/app/reviews" in url_before and "/app/reviews" not in page.url:
+        try:
+            await page.go_back(timeout=8000)
+        except PWError:
+            pass
+        raise RuntimeError("Клик увёл со страницы отзывов (на товар); обход остановлен")
+
+
+async def _open_review_card(page, row, ident, row_text, review_idx: int = 3):
     token = str(time.monotonic_ns())
 
     # Привязываемся к DOM-узлу ячейки, а не к nth(i) после перерисовки.
     pinned = await row.evaluate(
-        """(r, [id, text, key]) => {
-            const c = r.cells[3];
+        """(r, [id, text, key, idx]) => {
+            const c = r.cells[idx];
             if (!c || r.innerText.trim() !== text ||
                 (r.getAttribute('data-review-id') || r.getAttribute('data-row-key')) !== id)
                 return false;
             c.setAttribute('data-yasoko-cell', key);
             return true;
         }""",
-        [ident, row_text, token],
+        [ident, row_text, token, review_idx],
     )
     if not pinned:
         raise _SkipReview("Строка отзыва изменилась до открытия")
 
     cell = page.locator(f'[data-yasoko-cell="{token}"]')
     await cell.scroll_into_view_if_needed(timeout=3000)
-    child = cell.locator(":is(span,div,a,p):visible").first
+    # Не кликаем по ссылкам (название товара — это <a>): только по тексту самой ячейки «Отзыв».
+    child = cell.locator(":is(span,div,p):visible:not(a *)").first
     has_child = await child.is_visible()
     target = child if has_child else cell
+    pages_before = len(page.context.pages)
+    url_before = page.url
+    _log.info("Этап 1/5: клик по ячейке «Отзыв» (столбец %s)", review_idx)
     await target.click(timeout=3500)
+    await _pause(page)
+    await _assert_still_on_reviews(page, pages_before, url_before)
 
     cards = _cards(page)
     try:
@@ -672,10 +820,13 @@ async def _review_editor(page, drawer, review_id):
         if await fields.count():
             raise _SkipReview("До нажатия «Ответить» уже открыт другой редактор")
         btn = await _opener(page, drawer)
-        if await btn.count() != 1:
+        _log.info("Этап 2/5: нажимаю «Ответить на отзыв»")
+        if await btn.count() == 1:
+            controls = await btn.get_attribute("aria-controls") or ""
+            await btn.click(timeout=4000)
+        elif not await _coord_click(page, "reply"):
             raise _SkipReview("Не найдена одна кнопка «Ответить»")
-        controls = await btn.get_attribute("aria-controls") or ""
-        await btn.click(timeout=4000)
+        await _pause(page)
 
     await fields.first.wait_for(state="visible", timeout=6000)
     if await fields.count() != 1 or await drawer.count() != 1:
@@ -706,7 +857,26 @@ async def _review_editor(page, drawer, review_id):
 
     token = str(time.monotonic_ns())
     await fields.evaluate("(e, key) => e.setAttribute('data-yasoko-editor', key)", token)
-    return page.locator(f'[data-yasoko-editor="{token}"]')
+    field = page.locator(f'[data-yasoko-editor="{token}"]')
+    if not await _focus_editor(page, field):
+        raise _SkipReview("Курсор не встал в поле ответа; текст не вводится")
+    return field
+
+
+async def _focus_editor(page, field) -> bool:
+    """Этап 2 завершён только когда курсор реально в поле ввода ответа."""
+    probe = "e => e === document.activeElement || e.contains(document.activeElement)"
+    for attempt in range(3):
+        if await field.evaluate(probe):
+            return True
+        if attempt == 0:
+            await field.focus(timeout=2500)
+        elif attempt == 1:
+            await field.click(timeout=3000)
+        elif not await _coord_click(page, "input"):
+            break
+        await page.wait_for_timeout(200)
+    return bool(await field.evaluate(probe))
 
 
 async def _editor_text(field) -> str:
@@ -771,12 +941,39 @@ _RECEIPT = r"""([card, field, wanted, after, originalId]) => {
 }"""
 
 
+_SEND_ICON = (
+    'button[aria-label*="тправ" i], button[title*="тправ" i], [role="button"][aria-label*="тправ" i], '
+    'button[aria-label*="send" i], [data-testid*="send" i]'
+)
+_NOT_SEND = re.compile(r"закры|close|прикреп|attach|фото|файл|смайл|emoji|шаблон|отмен", re.I)
+
+
+async def _pick_send_control(field, panel):
+    """Способ отправки: подписанная кнопка → «самолётик» → None (тогда Enter в поле)."""
+    named = panel.get_by_role("button", name=_SEND)
+    count = await named.count()
+    if count > 1:
+        raise _SkipReview("Кнопка отправки неоднозначна; отправки нет")
+    if count == 1:
+        return named, "кнопка «Отправить»"
+    icon = panel.locator(f":is({_SEND_ICON}):visible")
+    if await icon.count() == 1:
+        return icon, "значок-самолётик"
+    near = field.locator("xpath=ancestor::*[.//button][1]").locator("button:visible:not([disabled])")
+    labels = await near.evaluate_all(
+        "els => els.map(e => (e.getAttribute('aria-label') || e.title || e.innerText || '').trim())"
+    )
+    fit = [i for i, text in enumerate(labels) if not _NOT_SEND.search(text)]
+    if len(fit) == 1:
+        return near.nth(fit[0]), "значок рядом с полем"
+    return None, "клавиша Enter"
+
+
 async def _submit_review_reply(page, drawer, field, reply: str) -> bool:
     panel = field.locator(_PANEL_XPATH)
-    send = panel.get_by_role("button", name=_SEND)
-    n = await send.count()
-    if n > 1 or await panel.count() != 1:
-        raise _SkipReview("Кнопка отправки неоднозначна; отправки нет")
+    if await panel.count() != 1:
+        raise _SkipReview("Панель редактора неоднозначна; отправки нет")
+    control, how = await _pick_send_control(field, panel)
     if _norm(await _editor_text(field)) != _norm(reply):
         raise _SkipReview("Текст изменился перед отправкой; отправки нет")
 
@@ -790,10 +987,12 @@ async def _submit_review_reply(page, drawer, field, reply: str) -> bool:
 
             # Только один способ отправки. Не делаем Ctrl+Enter после клика
             # и не кликаем по координатам после неопределённого результата.
-            if n == 1:
-                await send.click(timeout=4000)
+            _log.info("Этап 4/5: отправка ответа — %s", how)
+            if control is not None:
+                await control.click(timeout=4000)
             else:
-                await field.press("Control+Enter", timeout=4000)
+                key = str(getattr(settings, "OZON_REVIEWS_SEND_KEY", "Enter") or "Enter")
+                await field.press(key, timeout=4000)
 
             await page.wait_for_function(
                 _RECEIPT,
@@ -817,6 +1016,11 @@ async def _close_review_drawer(page, *, discard_ours: bool) -> bool:
             "button", name=re.compile(r"^(?:Не сохранять|Выйти без сохранения)$", re.I)
         )
         close = top.get_by_role("button", name=re.compile(r"^(?:Закрыть|Close)$", re.I))
+        if not await close.count():
+            close = top.locator(
+                ':is(button[aria-label*="акрыть" i], button[title*="акрыть" i], '
+                '[data-testid*="close" i]):visible'
+            )
 
         if await discard.count() and not discard_ours:
             return False
@@ -831,6 +1035,8 @@ async def _close_review_drawer(page, *, discard_ours: bool) -> bool:
             await page.keyboard.press("Escape")
         await page.wait_for_timeout(250)
 
+    if await panels.count() and await _coord_click(page, "close"):
+        await page.wait_for_timeout(400)
     return not await panels.count()
 
 
@@ -893,7 +1099,7 @@ async def _review_tab(page, names: list[str]) -> bool:
 
 async def _visit_review(
     page, row, ident, review_id, row_text, stamp, comment, title,
-    tracker, dry_run, records, attempted,
+    tracker, dry_run, records, attempted, review_idx: int = 3,
 ) -> None:
     from services.common.buyer_questions import generate_review_reply
     from services.common.gemini import GeminiUnavailable
@@ -903,7 +1109,7 @@ async def _visit_review(
 
     discard_ours = False
     try:
-        drawer = await _open_review_card(page, row, ident, row_text)
+        drawer = await _open_review_card(page, row, ident, row_text, review_idx)
         shown_id = await drawer.get_attribute("data-review-id")
         if review_id and shown_id and shown_id != review_id:
             raise _SkipReview("ID открытой карточки отличается от ID строки")
@@ -948,6 +1154,7 @@ async def _visit_review(
             return
 
         field = await _review_editor(page, drawer, review_id)
+        _log.info("Этап 3/5: ввод ответа (%s зн.)", len(reply))
         if _norm(await _editor_text(field)):
             raise _SkipReview("В поле уже есть черновик; автоматическая замена отменена")
 
@@ -975,6 +1182,7 @@ async def _visit_review(
                 raise RuntimeError(problem + "; у строки нет стабильного ID, обход остановлен")
             raise _SkipReview(problem)
 
+        _log.info("Этап 5/5: ответ подтверждён, закрываю карточку")
         tracker["replied_count"] += 1
         key = (
             "review:" + ident
@@ -1038,7 +1246,6 @@ async def _scan_reviews(
             failures.append(f"Не найдена вкладка «{title}»")
             continue
 
-        ans_col_idx = await _answers_col_index(page)
         visited, last_page, idle = set(), None, 0
         pages_checked = 0
         page_saw_old_date = False
@@ -1049,6 +1256,7 @@ async def _scan_reviews(
                 failures.append("Обход остановлен по бюджету времени; продолжится в следующем цикле")
                 break
             rows = page.locator("tbody tr")
+            headers = await _header_texts(page)
             opened = False
             for i in range(await rows.count()):
                 row = rows.nth(i)
@@ -1076,16 +1284,33 @@ async def _scan_reviews(
 
                 cells = row.locator("td")
                 cell_count = await cells.count()
-                if cell_count < 4:
+                if cell_count < 3:
                     continue
-                if await _row_has_table_answers(cells, cell_count, ans_col_idx):
+                cols = resolve_review_columns(headers, cell_count)
+                review_idx = cols["review"]
+                if review_idx is None:
+                    raise RuntimeError(
+                        "Не найден столбец «Отзыв» в шапке таблицы; обход остановлен (клик вслепую запрещён)"
+                    )
+                texts = await row.evaluate("r => Array.from(r.cells).map(c => (c.innerText || '').trim())")
+                if await _row_has_table_answers(cells, cell_count, cols["answers"]):
                     continue
-                comment = _clean_review_text(await cells.nth(3).inner_text())
+                photo_i, video_i = cols["photo"], cols["video"]
+                want, why = review_row_decision(
+                    texts[review_idx],
+                    texts[photo_i] if photo_i is not None else "",
+                    texts[video_i] if video_i is not None else "",
+                    same_media_cell=photo_i is not None and photo_i == video_i,
+                )
+                if not want:
+                    _log.debug("Пропуск строки %s: %s", ident or i, why)
+                    continue
+                comment = _clean_review_text(texts[review_idx])
 
                 try:
                     await _visit_review(
                         page, row, ident, review_id, row_text, stamp, comment, title,
-                        tracker, dry_run, records, attempted,
+                        tracker, dry_run, records, attempted, review_idx,
                     )
                 except _SkipReview as exc:
                     failures.append(str(exc))

@@ -657,8 +657,9 @@ async def run_full_competitor_deep_audit(
         lines.append(
             "\n🛠 <b>WB не отдал карточки.</b> Один раз выполните в cmd <code>login_wb.bat</code>: откроется окно Chrome "
             "с тем же профилем, пройдите проверку «я не робот» и закройте окно. Токен антибота сохранится в профиле, "
-            "дальше «Пробив конкурентов» будет получать выдачу WB. Запускайте без VPN, "
-            "в .env: LISTINGS_BROWSER_HEADLESS=false, LISTINGS_BROWSER_CHANNEL=chrome."
+            "дальше «Пробив конкурентов» будет получать выдачу WB. Выключать VPN не нужно: "
+            "добавьте в VPN-клиенте правила Direct для chrome.exe и доменов wildberries.ru / wb.ru / ozon.ru "
+            "(см. TRANSFER_AND_RESTART.md §6.1), в .env: LISTINGS_BROWSER_HEADLESS=false, LISTINGS_BROWSER_CHANNEL=chrome."
         )
 
     # Цены конкурентов нужны аудиту цен: рекомендация не должна быть дороже рынка.

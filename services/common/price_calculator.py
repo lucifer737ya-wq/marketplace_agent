@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional
 
 from config import settings
-from services.common.cogs import ozon_tax_base_ratio, unit_cogs_of
+from services.common.cogs import ozon_tax_base_ratio, roi_base_of, unit_cogs_of
 from services.common.ozon_tariffs import ozon_logistics_cost, set_volume_l
 from services.competitors.economics import spp_from_items
 
@@ -218,7 +218,7 @@ def _pct_ru(value: float) -> str:
 
 
 def _line(label: str, art: str, current: float, cogs: float, rates: Rates, *,
-          tiered: bool, ratio: float, effective: Optional[float] = None) -> str:
+          tiered: bool, ratio: float, effective: Optional[float] = None, roi_base: float = 0.0) -> str:
     """Строка «Цены в ЛК»: фактическая чистая прибыль и её процент от цены, цена «в ноль».
 
     ``effective`` — цена реализации после акций Ozon (marketing_seller_price), если она
@@ -234,8 +234,9 @@ def _line(label: str, art: str, current: float, cogs: float, rates: Rates, *,
     if cur_profit is None:
         now = "чистая прибыль н/д"
     else:
-        pct = cur_profit / real * 100.0
-        now = f"чистая прибыль {cur_profit:+.0f} ₽/шт (<b>{_pct_ru(pct)}</b>)"
+        # ROI = чистая прибыль / ЗАКУПОЧНАЯ цена * 100% (38/61*100 = 62,3%), а не доля от цены ЛК.
+        pct = cur_profit / (roi_base if roi_base > 0 else cogs) * 100.0
+        now = f"чистая прибыль {cur_profit:+.0f} ₽/шт (ROI <b>{_pct_ru(pct)}</b>)"
     price_txt = f"{current:.0f} ₽" if real == current else f"{current:.0f} ₽ (по акции {real:.0f} ₽)"
     warn = ""
     if tiered and limit is not None and current > limit:
@@ -246,7 +247,8 @@ def _line(label: str, art: str, current: float, cogs: float, rates: Rates, *,
     )
 
 
-def build_bundle_lines(cogs_unit: float, rates: Rates, *, max_units: int = 4) -> List[str]:
+def build_bundle_lines(cogs_unit: float, rates: Rates, *, max_units: int = 4,
+                       purchase_unit: float = 0.0) -> List[str]:
     """Наборы из N банок на Ozon: выгодна ли цена ≤300 ₽ или выше порога (с логистикой по формуле).
 
     Отличия от прежней версии (набор 2 шт. «в ноль» 1125 ₽ при реальных ~41%):
@@ -269,10 +271,11 @@ def build_bundle_lines(cogs_unit: float, rates: Rates, *, max_units: int = 4) ->
         sub = Rates(rates.commission_low, rates.commission_high, max(rates.pct_other - rates.ads_pct, 0.0),
                     rates.fixed_per_order + rates.ads_per_order, rates.source, vol)
         cogs = cogs_unit * n
+        roi_base = (purchase_unit if purchase_unit > 0 else cogs_unit) * n
         low_p = profit_at(limit, cogs, sub, high_tier=False, tax_base_ratio=ratio)
         be = solve_price(cogs, sub, 0.0, tiered=True, tax_base_ratio=ratio)
-        lo_t = solve_price(cogs, sub, 0.0, tiered=True, tax_base_ratio=ratio, profit_abs=roi_min * cogs)
-        hi_t = solve_price(cogs, sub, 0.0, tiered=True, tax_base_ratio=ratio, profit_abs=roi_max * cogs)
+        lo_t = solve_price(cogs, sub, 0.0, tiered=True, tax_base_ratio=ratio, profit_abs=roi_min * roi_base)
+        hi_t = solve_price(cogs, sub, 0.0, tiered=True, tax_base_ratio=ratio, profit_abs=roi_max * roi_base)
         verdict = "✅" if low_p > 0 else "❌"
 
         def fmt(adv: Optional[PriceAdvice]) -> str:
@@ -282,7 +285,7 @@ def build_bundle_lines(cogs_unit: float, rates: Rates, *, max_units: int = 4) ->
 
         out.append(
             f"• {n} шт ({vol:g} л): на {limit:.0f} ₽ {verdict} {low_p:+.0f} ₽/набор; "
-            f"в ноль: <b>{fmt(be)}</b>; ROI {roi_min * 100:.0f}%: <b>{fmt(lo_t)}</b>; ROI {roi_max * 100:.0f}%: <b>{fmt(hi_t)}</b>"
+            f"в ноль: <b>{fmt(be)}</b>; ROI {roi_min * 100:.0f}% (к закупке): <b>{fmt(lo_t)}</b>; ROI {roi_max * 100:.0f}%: <b>{fmt(hi_t)}</b>"
         )
     return out
 
@@ -294,11 +297,14 @@ def build_price_lines(
     oz_fin: Optional[Dict[str, Any]],
     wb_fin: Optional[Dict[str, Any]],
 ) -> List[str]:
+    products = list(products)
     costs = {(str(p.marketplace).lower(), str(p.sku).strip()): _cogs(p) for p in products}
+    bases = {(str(p.marketplace).lower(), str(p.sku).strip()): roi_base_of(p) for p in products}
     out: List[str] = []
     missing: List[str] = []
     oz_rates = ozon_rates_from_finance(oz_fin)
     oz_cogs_seen: List[float] = []
+    oz_base_seen: List[float] = []
     out.append("🔵 <b>OZON</b> — " + html.escape(oz_rates.source))
     for item in sorted((i for i in oz_items if isinstance(i, dict)), key=lambda i: str(i.get("sku"))):
         sku = str(item.get("sku") or "").strip()
@@ -307,10 +313,13 @@ def build_price_lines(
             missing.append(f"ozon:{sku}")
             continue
         out.append(_line("OZON", sku, _f(item.get("current_price")), cogs, oz_rates, tiered=True, ratio=ozon_tax_base_ratio(),
-                         effective=_f(item.get("marketing_seller_price")) or None))
+                         effective=_f(item.get("marketing_seller_price")) or None,
+                         roi_base=bases.get(("ozon", sku), 0.0)))
         oz_cogs_seen.append(cogs)
+        oz_base_seen.append(bases.get(("ozon", sku), 0.0))
     if oz_cogs_seen:
-        out.extend(build_bundle_lines(sum(oz_cogs_seen) / len(oz_cogs_seen), oz_rates))
+        out.extend(build_bundle_lines(sum(oz_cogs_seen) / len(oz_cogs_seen), oz_rates,
+                                      purchase_unit=sum(oz_base_seen) / len(oz_base_seen)))
     out.append("")
     out.append("🟣 <b>WILDBERRIES</b> — комиссия по предмету из тарифов WB; налог 6% — с цены покупателя (после СПП)")
     wb_spp = spp_from_items(list(wb_items), float(settings.COMPETITOR_WB_SPP_RATE))
@@ -323,7 +332,8 @@ def build_price_lines(
         cur = _f(item.get("current_price"))
         buyer = _f(item.get("buyer_price"), cur)
         ratio = min(max(buyer / cur, 0.3), 1.5) if cur > 0 and buyer < cur * 0.995 else 1.0 - wb_spp
-        out.append(_line("WB", sku, cur, cogs, wb_rates_from_item(item, wb_fin), tiered=False, ratio=ratio))
+        out.append(_line("WB", sku, cur, cogs, wb_rates_from_item(item, wb_fin), tiered=False, ratio=ratio,
+                         roi_base=bases.get(("wb", sku), 0.0)))
     if missing:
         out.append("")
         out.append(

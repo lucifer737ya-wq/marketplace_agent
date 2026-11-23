@@ -7,7 +7,7 @@ from services.common.orders_report import _mul_rub, _round_rub
 from bot.handlers.callbacks import build_approval_keyboard, build_dual_ozon_approval_keyboard
 from services.common.ad_recommendations import analyze_ozon_campaigns
 from config import settings
-from services.common.cogs import ozon_tax_base_ratio, unit_cogs_of
+from services.common.cogs import ozon_tax_base_ratio, roi_base_of, unit_cogs_of
 from services.common.ozon_tariffs import ozon_logistics_cost
 from services.common.pricing_policy import load_competitor_reference, recommend_price
 from services.competitors.economics import spp_from_items
@@ -55,6 +55,7 @@ def calculate_ozon_unit_profit(
     api_comm_rate_under_300: float = 0.23,
     acquiring_rate: Optional[float] = None,
     usn_rate: Optional[float] = None,
+    roi_base: Optional[float] = None,
 ) -> Dict[str, float]:
     """
     Расчет чистой прибыли на 1 заказ Ozon:
@@ -96,7 +97,7 @@ def calculate_ozon_unit_profit(
         "ad_rub": ad_rub,
         "ad_pct": round(ad_rate * 100, 1),
         "tax_rub": tax_rub,
-        "roi_pct": round(net_profit / cogs * 100, 1) if cogs > 0 else 0.0,
+        "roi_pct": round(net_profit / (roi_base or cogs) * 100, 1) if (roi_base or cogs) > 0 else 0.0,
         "margin_pct": round(net_profit / price * 100, 1) if price > 0 else 0.0,
         "logistics_rub": round(logistics_rub, 2),
         "pvz_rub": round(pvz_dropoff_rub, 2),
@@ -117,6 +118,7 @@ def evaluate_ozon_dual_scenarios(
     ad_rate: float,
     daily_sales: float = 1.0,
     competitor_lk: Optional[float] = None,
+    roi_base: Optional[float] = None,
 ) -> Dict[str, Any]:
     """
     Возвращает полный двойной просчет для Ozon:
@@ -140,12 +142,14 @@ def evaluate_ozon_dual_scenarios(
 
     # Текущая экономика при действующей цене
     cur_m = calculate_ozon_unit_profit(
-        current_price, cogs, actual_delivery_per_order, weighted_pvz, overhead_per_order_rub, ad_rate, weighted_comm
+        current_price, cogs, actual_delivery_per_order, weighted_pvz, overhead_per_order_rub, ad_rate, weighted_comm,
+        roi_base=roi_base,
     )
 
     # Сценарий 1: Максимальный порог до 300 ₽ -> 299 ₽
     m_299 = calculate_ozon_unit_profit(
-        299.0, cogs, actual_delivery_per_order, weighted_pvz, overhead_per_order_rub, ad_rate, weighted_comm
+        299.0, cogs, actual_delivery_per_order, weighted_pvz, overhead_per_order_rub, ad_rate, weighted_comm,
+        roi_base=roi_base,
     )
 
     # Цена выше 300 ₽: коридор чистой прибыли 30–100% к себестоимости + оглядка на цену конкурентов.
@@ -155,12 +159,13 @@ def evaluate_ozon_dual_scenarios(
         )["net_profit"]
 
     limit_int = int(settings.OZON_LOW_PRICE_LIMIT)
-    rec = recommend_price(_pf, cogs, lo=limit_int + 1, hi=6000, competitor_lk=competitor_lk)
+    rec = recommend_price(_pf, cogs, lo=limit_int + 1, hi=6000, competitor_lk=competitor_lk, roi_base=roi_base)
     if rec is None:
         raise ValueError("Прибыльная цена выше 300 ₽ недостижима при текущих удержаниях (комиссия 52% + реклама)")
     best_over300_m = calculate_ozon_unit_profit(
         float(rec.price), cogs, actual_delivery_per_order,
-        weighted_pvz, overhead_per_order_rub, ad_rate, weighted_comm
+        weighted_pvz, overhead_per_order_rub, ad_rate, weighted_comm,
+        roi_base=roi_base,
     )
 
     return {
@@ -185,6 +190,7 @@ def find_optimal_wb_price(
     daily_sales: float = 1.0,
     spp_rate: float = 0.0,
     competitor_buyer_price: Optional[float] = None,
+    roi_base: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Рекомендованная цена WB: ROI 30–100%, налог 6% с цены покупателя (после СПП), не дороже конкурентов."""
     if fbo_stock > 0 and fbs_stock > 0:
@@ -211,7 +217,7 @@ def find_optimal_wb_price(
 
     # Конкуренты на витрине показывают цену покупателя (с СПП); переводим в цену ЛК.
     comp_lk = competitor_buyer_price / buyer_ratio if competitor_buyer_price and buyer_ratio > 0 else None
-    rec = recommend_price(profit_at, cogs, lo=max(int(cogs), 1), hi=6000, competitor_lk=comp_lk)
+    rec = recommend_price(profit_at, cogs, lo=max(int(cogs), 1), hi=6000, competitor_lk=comp_lk, roi_base=roi_base)
     if rec is None:
         raise ValueError("Целевая рентабельность недостижима при текущих удержаниях WB")
     opt_price = float(rec.price)
@@ -228,7 +234,7 @@ def find_optimal_wb_price(
         "recommended_price": opt_price,
         "current_net_profit": cur_net,
         "net_profit": net_profit,
-        "roi_pct": round(net_profit / cogs * 100, 1) if cogs > 0 else 0.0,
+        "roi_pct": round(net_profit / (roi_base or cogs) * 100, 1) if (roi_base or cogs) > 0 else 0.0,
         "margin_pct": round(net_profit / opt_price * 100, 1) if opt_price else 0.0,
         "verdict": rec.verdict,
         "status": rec.status,
@@ -360,6 +366,7 @@ async def run_daily_price_audit(bot, admin_id: int, ozon_api, wb_api) -> None:
                     ad_rate=rates[sku],
                     daily_sales=float(item.get("daily_sales") or 0.0),
                     competitor_lk=_ozon_competitor_lk(item, ref, oz_disc),
+                    roi_base=roi_base_of(p_db),
                 )
             except ValueError as exc:
                 await send_tg_safe(bot, admin_id, f"⚠️ {html.escape(sku)}: {html.escape(str(exc))}")
@@ -398,7 +405,7 @@ async def run_daily_price_audit(bot, admin_id: int, ozon_api, wb_api) -> None:
                 f"• Реклама ({t299['ad_pct']}%): <b>-{t299['ad_rub']:.0f} ₽</b> | Прочие удержания: <b>-{t299['overhead_rub']:.0f} ₽</b>\n"
                 f"• Эквайринг: <b>-{t299['acq_rub']:.1f} ₽</b> | Налог УСН (6%): <b>-{t299['tax_rub']:.0f} ₽</b> | Себест.: <b>-{cogs:.0f} ₽</b>\n"
                 f"👉 <b>Чистая прибыль при 299 ₽: {t299['net_profit']:+.0f} ₽/шт.</b> "
-                f"(ROI к себестоимости {t299['roi_pct']:.0f}%, маржа {t299['margin_pct']:.0f}%)\n\n"
+                f"(ROI к закупке {t299['roi_pct']:.0f}%, маржа {t299['margin_pct']:.0f}%)\n\n"
                 f"2️⃣ <b>Вариант 2: Свыше 300 ₽ — {tover['price']:.0f} ₽ (Комиссия 52%)</b>\n"
                 f"• Вознаграждение Ozon (52%): <b>-{tover['comm_rub']:.0f} ₽</b>\n"
                 f"• Доставка (из отчёта): <b>-{tover['logistics_rub']:.0f} ₽</b> | ПВЗ (FBS): <b>-{tover['pvz_rub']:.0f} ₽</b>\n"
@@ -525,6 +532,7 @@ async def run_daily_price_audit(bot, admin_id: int, ozon_api, wb_api) -> None:
                     daily_sales=float(item.get("daily_sales") or 0.0),
                     spp_rate=wb_spp,
                     competitor_buyer_price=float(wb_comp_buyer) if wb_comp_buyer else None,
+                    roi_base=roi_base_of(p_db),
                 )
             except ValueError as exc:
                 await send_tg_safe(bot, admin_id, f"⚠️ {html.escape(sku)}: {html.escape(str(exc))}")
