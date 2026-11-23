@@ -102,6 +102,20 @@ MIN_TARGET_DATE = datetime(2026, 11, 13)
 
 # Калиброванные точки для резервного режима «по координатам» (пишет calibrate_review_steps.py).
 REVIEW_POINTS_FILE = LOGS_DIR / "review_click_points.json"
+
+# Точки, снятые вручную через calibrate_review_steps.bat (окно 1800x966, 20.11.2026).
+# Используются, если logs/review_click_points.json отсутствует; файл калибровки их переопределяет.
+#   cell  — текст в столбце «Отзыв» (строка №1 таблицы; после ответа она уходит из «Новых»,
+#           и на её место встаёт следующий отзыв);
+#   reply — «Ответить на отзыв»; input — поле ответа; send — самолётик; close — крестик окна.
+DEFAULT_REVIEW_POINTS: Dict[str, Any] = {
+    "cell": [745, 752],
+    "reply": [547, 517],
+    "input": [473, 808],
+    "send": [1317, 805],
+    "close": [1361, 25],
+    "_viewport": [1800, 966],
+}
 _log = logging.getLogger("ozon.reviews")
 _DASH_ONLY = re.compile(r"^[\s\-–—−·•.]*$")
 
@@ -123,7 +137,8 @@ def browser_launch_kwargs(headless: bool, *, with_channel: bool = False) -> Dict
         "env": _get_direct_env(),
     }
     if headless:
-        kwargs["viewport"] = dict(VIEWPORT)
+        # Тот же размер окна, что при калибровке, — координаты попадают в цель без пересчёта.
+        kwargs["viewport"] = _saved_viewport() or dict(VIEWPORT)
     else:
         args += ["--start-maximized", "--window-position=0,0"]
         kwargs["viewport"] = None
@@ -210,11 +225,30 @@ def review_row_decision(
 
 
 def _load_points() -> Dict[str, Any]:
+    """Точки из logs/review_click_points.json; нет файла — встроенные DEFAULT_REVIEW_POINTS."""
     try:
         data = json.loads(REVIEW_POINTS_FILE.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
-    except Exception:  # noqa: BLE001 — нет файла/нет прав: калибровки просто нет
-        return {}
+        if isinstance(data, dict) and data:
+            return data
+    except Exception:  # noqa: BLE001 — нет файла/нет прав: берём встроенные точки
+        pass
+    return {k: list(v) for k, v in DEFAULT_REVIEW_POINTS.items()}
+
+
+def _coords_enabled() -> bool:
+    return str(getattr(settings, "OZON_REVIEWS_CLICK_MODE", "auto")).strip().lower() != "dom"
+
+
+def _saved_viewport() -> Optional[Dict[str, int]]:
+    """Размер окна, в котором снимались точки (чтобы headless-браузер совпал с ним 1:1)."""
+    try:
+        w, h = _load_points().get("_viewport")
+        w, h = int(w), int(h)
+        if 640 <= w <= 3840 and 480 <= h <= 2160:
+            return {"width": w, "height": h}
+    except (TypeError, ValueError):
+        pass
+    return None
 
 
 async def _inner_size(page) -> Tuple[int, int]:
@@ -241,7 +275,7 @@ async def _scale_pt(page, x: int, y: int, base_w: Optional[int] = None, base_h: 
 
 async def _coord_click(page, name: str) -> bool:
     """Клик по калиброванной точке (резерв, если элемент не найден по DOM)."""
-    if str(getattr(settings, "OZON_REVIEWS_CLICK_MODE", "auto")).strip().lower() == "dom":
+    if not _coords_enabled():
         return False
     pt = _load_points().get(name)
     if not (isinstance(pt, (list, tuple)) and len(pt) == 2):
@@ -263,6 +297,93 @@ async def _coord_click(page, name: str) -> bool:
     await page.mouse.move(x, y, steps=8)
     await page.mouse.click(x, y)
     return True
+
+
+async def _coord_row_matches(page, row_text: str) -> bool:
+    """Под точкой «cell» стоит именно та строка таблицы, которую мы собираемся открыть."""
+    pt = _load_points().get("cell")
+    try:
+        x, y = int(pt[0]), int(pt[1])
+        saved = _load_points().get("_viewport") or [VIEWPORT["width"], VIEWPORT["height"]]
+        x, y = await _scale_pt(page, x, y, int(saved[0]), int(saved[1]))
+    except (TypeError, ValueError, IndexError):
+        return False
+    return bool(await page.evaluate(
+        """([x, y, text]) => {
+            const el = document.elementFromPoint(x, y);
+            const tr = el && el.closest('tr');
+            return !!tr && !el.closest('a') && tr.innerText.trim() === text;
+        }""",
+        [x, y, row_text],
+    ))
+
+
+async def _active_editor_text(page) -> Optional[str]:
+    """Текст поля, где сейчас курсор; None — курсор не в поле ввода."""
+    return await page.evaluate(
+        """() => {
+            const a = document.activeElement;
+            if (!a) return null;
+            const ok = a.matches('textarea,input[type=text],input:not([type]),[contenteditable=""],'
+                + '[contenteditable="true"],[contenteditable="plaintext-only"]');
+            return ok ? (a.value ?? a.innerText ?? '') : null;
+        }"""
+    )
+
+
+async def _coord_reply(page, drawer, reply: str, review_id: Optional[str]) -> bool:
+    """Резервный сценарий по калиброванным точкам. Шаги строго друг за другом:
+
+        2. reply  — «Ответить на отзыв» (если поле ещё не открыто)
+        3. input  — клик в поле, вставка текста, проверка, что текст целиком в поле
+        4. send   — самолётик, затем проверка, что ответ появился в карточке
+    Шаг 1 (открытие карточки) уже сделан, шаг 5 (крестик) выполняет finally в _visit_review —
+    он идёт при любом исходе, иначе следующий отзыв не открыть.
+    Повторных кликов по «send» нет: после неясного результата ответ не дублируем.
+    """
+    if not _coords_enabled() or not _load_points().get("send"):
+        raise _SkipReview("Координатный режим отключён или «send» не откалибрована")
+
+    if not await drawer.locator(_EDIT).count():
+        _log.info("Этап 2/5 [координаты]: «Ответить на отзыв»")
+        if not await _coord_click(page, "reply"):
+            raise _SkipReview("Координаты «reply» вне окна; отправки нет")
+        await _pause(page)
+
+    _log.info("Этап 3/5 [координаты]: клик в поле и ввод ответа (%s зн.)", len(reply))
+    if not await _coord_click(page, "input"):
+        raise _SkipReview("Координаты «input» вне окна; отправки нет")
+    await _pause(page)
+    before = await _active_editor_text(page)
+    if before is None:
+        raise _SkipReview("После клика по «input» курсор не в поле ввода; текст не вводится")
+    if _norm(before):
+        raise _SkipReview("В поле уже есть черновик; автоматическая замена отменена")
+    await page.keyboard.insert_text(reply)
+    await page.wait_for_timeout(200)
+    typed = await _active_editor_text(page)
+    if typed is None or _norm(typed) != _norm(reply):
+        # Не оставляем в поле обрезок/чужой текст — стираем и отказываемся от отправки.
+        await page.keyboard.press("Control+A")
+        await page.keyboard.press("Delete")
+        raise _SkipReview("Текст в поле отличается от ответа; отправки нет")
+
+    card = await drawer.element_handle(timeout=3000)
+    try:
+        editor = await page.evaluate_handle("() => document.activeElement")
+        try:
+            original_id = await card.get_attribute("data-review-id") or review_id
+            _log.info("Этап 4/5 [координаты]: отправка — клик по «самолётику»")
+            if not await _coord_click(page, "send"):
+                raise _SkipReview("Координаты «send» вне окна; отправки нет")
+            await page.wait_for_function(
+                _RECEIPT, arg=[card, editor, reply, True, original_id], timeout=8000
+            )
+            return True
+        finally:
+            await editor.dispose()
+    finally:
+        await card.dispose()
 
 
 async def _pause(page) -> None:
@@ -1045,10 +1166,24 @@ async def _open_review_card(page, row, ident, row_text, review_idx: int = 3):
             )
         elif has_child:
             await cell.click(timeout=2500)
+        elif _coords_enabled() and await _coord_row_matches(page, row_text):
+            _log.info("Этап 1/5 [координаты]: клик по точке «cell»")
+            await _coord_click(page, "cell")
+            await _pause(page)
         else:
             raise _SkipReview("Шторка отзыва не открылась")
 
-        await cards.first.wait_for(state="attached", timeout=6000)
+        try:
+            await cards.first.wait_for(state="attached", timeout=6000)
+        except PWTimeout:
+            # Последний шанс: калиброванная точка «cell», но только если под ней наша строка.
+            if (await _overlays(page).count() or not _coords_enabled()
+                    or not await _coord_row_matches(page, row_text)):
+                raise
+            _log.info("Этап 1/5 [координаты]: клик по точке «cell»")
+            await _coord_click(page, "cell")
+            await _pause(page)
+            await cards.first.wait_for(state="attached", timeout=6000)
 
     # Портал часто содержит ещё и вложенный dialog. Выбираем внутреннюю
     # карточку, но не выбираем произвольную из двух независимых карточек.
@@ -1260,6 +1395,8 @@ async def _submit_review_reply(page, drawer, field, reply: str) -> bool:
             if control is not None:
                 await _reveal(control)
                 await control.click(timeout=4000)
+            elif _coords_enabled() and await _coord_click(page, "send"):
+                _log.info("Этап 4/5: «самолётик» нажат по калиброванной точке")
             else:
                 key = str(getattr(settings, "OZON_REVIEWS_SEND_KEY", "Enter") or "Enter")
                 await field.press(key, timeout=4000)
@@ -1305,8 +1442,15 @@ async def _close_review_drawer(page, *, discard_ours: bool) -> bool:
             await page.keyboard.press("Escape")
         await page.wait_for_timeout(250)
 
-    if await panels.count() and await _coord_click(page, "close"):
-        await page.wait_for_timeout(400)
+    # Окно обязано закрыться: пока оно открыто, на другой отзыв не ответить.
+    for _ in range(2):
+        if not await panels.count():
+            break
+        if _coords_enabled() and await _coord_click(page, "close"):
+            await page.wait_for_timeout(500)
+        if await panels.count():
+            await page.keyboard.press("Escape")
+            await page.wait_for_timeout(300)
     return not await panels.count()
 
 
@@ -1390,10 +1534,13 @@ async def _visit_review(
         if await _has_seller_reply(drawer):
             return
 
+        use_coords = False
         if not await drawer.locator(_EDIT).count():
             opener = await _opener(page, drawer)
             if await opener.count() != 1:
-                raise _SkipReview("В карточке нет однозначного поля или кнопки ответа")
+                if not (_coords_enabled() and _load_points().get("reply")):
+                    raise _SkipReview("В карточке нет однозначного поля или кнопки ответа")
+                use_coords = True  # DOM не нашёл «Ответить» — пойдём по калиброванным точкам
 
         body = await drawer.inner_text(timeout=4000)
         sku = _extract_sku(body, row_text)
@@ -1423,25 +1570,40 @@ async def _visit_review(
         if dry_run or await _has_seller_reply(drawer):
             return
 
-        field = await _review_editor(page, drawer, review_id)
-        _log.info("Этап 3/5: ввод ответа (%s зн.)", len(reply))
-        if _norm(await _editor_text(field)):
-            raise _SkipReview("В поле уже есть черновик; автоматическая замена отменена")
+        field = None
+        if not use_coords:
+            try:
+                field = await _review_editor(page, drawer, review_id)
+            except (_SkipReview, PWTimeout) as exc:
+                # До ввода текста ничего не отправлено — безопасно перейти на координаты.
+                if not (_coords_enabled() and _load_points().get("input")):
+                    raise
+                _log.warning("DOM-этап 2 не удался (%s) — иду по координатам", short_error(exc))
+                use_coords = True
+
+        if field is not None:
+            _log.info("Этап 3/5: ввод ответа (%s зн.)", len(reply))
+            if _norm(await _editor_text(field)):
+                raise _SkipReview("В поле уже есть черновик; автоматическая замена отменена")
 
         discard_ours = True
-        try:
-            reply = await _fill_review(page, field, reply)
-        except _SkipReview:
-            raise
-        except RuntimeError as exc:
-            raise _SkipReview(str(exc)) from exc
-        record["reply"] = reply
+        if field is not None:
+            try:
+                reply = await _fill_review(page, field, reply)
+            except _SkipReview:
+                raise
+            except RuntimeError as exc:
+                raise _SkipReview(str(exc)) from exc
+            record["reply"] = reply
 
         if ident:
             attempted.add(ident)
 
         try:
-            confirmed = await _submit_review_reply(page, drawer, field, reply)
+            if field is None:
+                confirmed = await _coord_reply(page, drawer, reply, review_id)
+            else:
+                confirmed = await _submit_review_reply(page, drawer, field, reply)
         except PWError:
             # После ошибки Playwright нельзя полагать, что клик не дошёл до Ozon.
             confirmed = False

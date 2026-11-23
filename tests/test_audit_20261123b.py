@@ -68,7 +68,8 @@ class LaunchOptions(unittest.TestCase):
 
     def test_headless_keeps_calibrated_viewport(self):
         kw = br.browser_launch_kwargs(True)
-        self.assertEqual(kw["viewport"], br.VIEWPORT)
+        # viewport берётся из калибровки (_viewport), по умолчанию 1800x966
+        self.assertEqual(kw["viewport"], br._saved_viewport() or br.VIEWPORT)
 
 
 class ShortError(unittest.TestCase):
