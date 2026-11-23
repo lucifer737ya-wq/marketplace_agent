@@ -121,6 +121,12 @@ def resolve_review_columns(headers: List[str], cell_count: int) -> Dict[str, Opt
 
     status = find("статус", exact_start=True)
     review = find("отзыв", exact_start=True)
+    if review is None:  # «Текст отзыва», «Комментарий покупателя» и т.п.; «Дата отзыва»/«Оценка» не берём
+        for i, h in enumerate(low):
+            if ("отзыв" in h or "комментарий покупателя" in h) and not any(w in h for w in ("дат", "оцен", "рейтинг", "ответ")):
+                idx = i + shift
+                review = idx if 0 <= idx < cell_count else None
+                break
     if review is None and status is not None and status + 1 < cell_count:
         review = status + 1  # «Отзыв» стоит сразу за «Статус»
     return {
@@ -186,27 +192,106 @@ async def _pause(page) -> None:
     await page.wait_for_timeout(max(ms, 0))
 
 
-async def _header_texts(page) -> List[str]:
-    """Заголовки таблицы с учётом colspan."""
+async def _header_texts(page, row=None) -> List[str]:
+    """Заголовки таблицы с учётом colspan (см. _header_texts_raw)."""
     try:
-        return await _header_texts_raw(page)
+        return await _header_texts_raw(page, row)
     except Exception:  # noqa: BLE001 — нет таблицы/страница перерисована
         return []
 
 
-async def _header_texts_raw(page) -> List[str]:
-    return await page.evaluate(
-        r"""() => {
-            const t = document.querySelector('table');
-            if (!t) return [];
-            const out = [];
-            t.querySelectorAll('thead th').forEach(th => {
-                const n = Math.max(1, th.colSpan || 1);
-                for (let i = 0; i < n; i++) out.push((th.innerText || '').trim());
-            });
-            return out;
-        }"""
+_HEADERS_JS = r"""(row) => {
+    const clean = el => (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+    const fromTable = t => {
+        const out = [];
+        let cells = t.querySelectorAll('thead th, thead td');
+        if (!cells.length) {  // шапка без <thead>: первая строка, где есть <th>
+            const tr = Array.from(t.rows || []).find(r => r.querySelector('th'));
+            cells = tr ? tr.querySelectorAll('th, td') : [];
+        }
+        cells.forEach(th => {
+            const n = Math.max(1, th.colSpan || 1);
+            for (let i = 0; i < n; i++) out.push(clean(th));
+        });
+        return out;
+    };
+    const hasText = a => a.some(h => h);
+    // 1) таблица, в которой лежит сама строка (а не первая <table> на странице)
+    const own = row && row.closest ? row.closest('table') : null;
+    let out = own ? fromTable(own) : [];
+    if (hasText(out)) return out;
+    // 2) любая таблица на странице, чья шапка содержит «Отзыв» (шапка Ozon может быть отдельной sticky-таблицей)
+    const tables = Array.from(document.querySelectorAll('table'));
+    for (const t of tables) {
+        const h = fromTable(t);
+        if (h.some(x => /отзыв/i.test(x))) return h;
+    }
+    // 3) ARIA-сетка / div-таблица
+    const aria = Array.from(document.querySelectorAll('[role="columnheader"]')).map(clean);
+    if (hasText(aria)) return aria;
+    return out.length ? out : (tables[0] ? fromTable(tables[0]) : []);
+}"""
+
+
+async def _header_texts_raw(page, row=None) -> List[str]:
+    if row is not None:
+        return await row.evaluate(_HEADERS_JS)
+    return await page.evaluate(f"() => ({_HEADERS_JS})(null)")
+
+
+async def _row_cells_dump(row) -> List[Dict[str, Any]]:
+    """Снимок ячеек строки для диагностики: индекс, текст, есть ли ссылка, геометрия."""
+    return await row.evaluate(
+        r"""r => Array.from(r.cells).map((c, i) => {
+            const b = c.getBoundingClientRect();
+            const a = c.querySelector('a[href]');
+            return {i, text: (c.innerText || '').trim().slice(0, 80), link: !!a,
+                    linkText: a ? (a.innerText || '').trim().slice(0, 40) : '',
+                    x: Math.round(b.left), w: Math.round(b.width)};
+        })"""
     )
+
+
+def _review_points_x() -> int:
+    """X столбца «Отзыв»: из калибровки (точка «cell»), иначе встроенная константа."""
+    pt = _load_points().get("cell")
+    if isinstance(pt, (list, tuple)) and len(pt) == 2:
+        try:
+            return int(pt[0])
+        except (TypeError, ValueError):
+            pass
+    return REV_CLICK_X
+
+
+def review_cell_index_by_x(cells: List[Dict[str, Any]], x: int) -> Optional[int]:
+    """Индекс ячейки, горизонтально накрывающей X, — только если это не «чистая ссылка» (название товара)."""
+    for c in cells:
+        if c["x"] <= x < c["x"] + c["w"]:
+            text = (c.get("text") or "").strip()
+            if c.get("link") and text == (c.get("linkText") or "").strip():
+                return None  # это ячейка-ссылка: попали бы на название товара
+            return int(c["i"])
+    return None
+
+
+async def _dump_review_dom(page, row, headers: List[str], cells: List[Dict[str, Any]]) -> str:
+    """Пишет logs/review_dom_dump.json — его достаточно прислать для точной настройки."""
+    try:
+        data = {
+            "url": page.url,
+            "viewport": page.viewport_size,
+            "headers": headers,
+            "cells": cells,
+            "row_text": (await row.inner_text())[:400],
+            "tables": await page.evaluate("document.querySelectorAll('table').length"),
+            "columnheaders": await page.evaluate("document.querySelectorAll('[role=columnheader]').length"),
+        }
+        path = LOGS_DIR / "review_dom_dump.json"
+        write_json(path, data)
+        return str(path)
+    except Exception:  # noqa: BLE001 — диагностика не должна ломать обход
+        return ""
+
 
 _RU_MONTH_PREFIXES: Tuple[Tuple[str, int], ...] = (
     ("янв", 1), ("фев", 2), ("мар", 3), ("апр", 4),
@@ -1256,7 +1341,7 @@ async def _scan_reviews(
                 failures.append("Обход остановлен по бюджету времени; продолжится в следующем цикле")
                 break
             rows = page.locator("tbody tr")
-            headers = await _header_texts(page)
+            headers = []
             opened = False
             for i in range(await rows.count()):
                 row = rows.nth(i)
@@ -1286,12 +1371,24 @@ async def _scan_reviews(
                 cell_count = await cells.count()
                 if cell_count < 3:
                     continue
+                headers = await _header_texts(page, row)
                 cols = resolve_review_columns(headers, cell_count)
                 review_idx = cols["review"]
                 if review_idx is None:
-                    raise RuntimeError(
-                        "Не найден столбец «Отзыв» в шапке таблицы; обход остановлен (клик вслепую запрещён)"
+                    # Шапку прочитать не удалось: ищем ячейку по горизонтали (X столбца «Отзыв»).
+                    dump = await _row_cells_dump(row)
+                    review_idx = review_cell_index_by_x(dump, _review_points_x())
+                    where = await _dump_review_dom(page, row, headers, dump)
+                    if review_idx is None:
+                        raise RuntimeError(
+                            "Не найден столбец «Отзыв»: шапка=%r, ячеек в строке=%d, X=%d. "
+                            "Диагностика: %s (пришлите этот файл)" % (headers, cell_count, _review_points_x(), where)
+                        )
+                    _log.warning(
+                        "Шапка таблицы не распознана (%r); столбец «Отзыв» выбран по X=%d -> ячейка %d. Дамп: %s",
+                        headers, _review_points_x(), review_idx, where,
                     )
+                    cols = {**cols, "review": review_idx}
                 texts = await row.evaluate("r => Array.from(r.cells).map(c => (c.innerText || '').trim())")
                 if await _row_has_table_answers(cells, cell_count, cols["answers"]):
                     continue
