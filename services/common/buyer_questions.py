@@ -206,8 +206,13 @@ async def generate_buyer_question_answer(question_text: str, sku: Optional[str] 
     raise RuntimeError(last_problem)
 
 
-async def generate_review_reply(review_text: str, rating: Optional[int], sku: Optional[str] = None) -> str:
+async def generate_review_reply(
+    review_text: str, rating: Optional[int], sku: Optional[str] = None, color: Optional[str] = None
+) -> str:
     sku_context = _build_sku_context(sku, "Товар из отзыва")
+    if color:
+        # Цвет/оттенок из карточки отзыва — ИИ может учесть его, но не обязан цитировать.
+        sku_context += f"\nЦВЕТ/ОТТЕНОК ТОВАРА ИЗ ОТЗЫВА (справочно): {color}"
 
     negative = is_negative_review(review_text, rating)
     tech_block = ""

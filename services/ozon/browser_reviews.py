@@ -978,15 +978,16 @@ async def _close_question_drawer(page) -> bool:
 
 
 async def _scroll_main_table_down(page) -> bool:
+    """Один мягкий скролл вниз (без PageDown и повторов — раньше список «дёргался» вверх-вниз)."""
     try:
-        prev_height = await page.evaluate("() => document.body.scrollHeight")
-        await page.mouse.move(500, 500)
-        await page.mouse.wheel(0, 1200)
-        await asyncio.sleep(0.6)
-        await page.keyboard.press("PageDown")
+        if await _js_is_drawer_open(page):
+            return False  # под открытым окном таблицу не крутим
+        before = await page.evaluate("() => [document.body.scrollHeight, window.scrollY]")
+        await page.mouse.move(*(await _scale_pt(page, 500, 500)))
+        await page.mouse.wheel(0, 700)
         await asyncio.sleep(0.8)
-        new_height = await page.evaluate("() => document.body.scrollHeight")
-        return new_height > prev_height
+        after = await page.evaluate("() => [document.body.scrollHeight, window.scrollY]")
+        return after[0] > before[0] or after[1] > before[1]
     except Exception:
         return False
 
@@ -1018,7 +1019,7 @@ async def _extract_rating_accurately(page, drawer_text: str, row_text: str) -> O
         return int(m[1])
 
     raw = await _read_text_at_point(page, REV_STAR_PT[0], REV_STAR_PT[1])
-    m = re.search(r"\b([1-5])\b", raw)
+    m = re.search(r"(?:оценк\w*\D{0,3}|\b)([1-5])\s*(?:★|из\s*5)", raw, re.I) or re.search(r"оценк\w*\D{0,3}([1-5])\b", raw, re.I)
     if m:
         return int(m[1])
 
@@ -1341,7 +1342,7 @@ async def _open_review_card(page, row, ident, row_text, review_idx: int = 3):
 
     cards = _cards(page)
     try:
-        await cards.first.wait_for(state="attached", timeout=6000)
+        await _wait_card(page, cards, 6000)
     except PWTimeout:
         # Если уже появилось какое-либо окно либо строка исчезла из «Новых»,
         # не кликаем повторно по экрану или по соседнему отзыву.
@@ -1376,7 +1377,7 @@ async def _open_review_card(page, row, ident, row_text, review_idx: int = 3):
             raise _SkipReview("Шторка отзыва не открылась")
 
         try:
-            await cards.first.wait_for(state="attached", timeout=6000)
+            await _wait_card(page, cards, 6000)
         except PWTimeout:
             # Последний шанс: калиброванная точка «cell», но только если под ней наша строка.
             if (await _overlays(page).count() or not _coords_enabled()
@@ -1385,7 +1386,7 @@ async def _open_review_card(page, row, ident, row_text, review_idx: int = 3):
             _log.info("Этап 1/5 [координаты]: клик по области «cell»")
             await _coord_click(page, "cell", hint=_row_hint(row_text), strict=True)
             await _pause(page)
-            await cards.first.wait_for(state="attached", timeout=6000)
+            await _wait_card(page, cards, 6000)
 
     # Портал часто содержит ещё и вложенный dialog. Выбираем внутреннюю
     # карточку, но не выбираем произвольную из двух независимых карточек.
@@ -1398,6 +1399,9 @@ async def _open_review_card(page, row, ident, row_text, review_idx: int = 3):
         }""",
         token,
     )
+    if not marked:
+        # Строгий селектор не дал одной карточки — берём видимый портал/диалог (как в «ИСХОД»).
+        marked = await page.evaluate(_MARK_LOOSE_JS, token)
     if not marked:
         raise _SkipReview("Нельзя однозначно выбрать карточку отзыва")
 
@@ -1727,15 +1731,498 @@ async def _review_tab(page, names: list[str]) -> bool:
     return False
 
 
+# =============================================================================
+# ПАТЧ 2026-11-26: сценарий как в рабочем «browser_reviews ИСХОД», но с сохранением координат
+#   1. Фильтр Ozon «Контент»: «С текстом» + «С медиа» (без «Только с оценкой») — не нужно
+#      перебирать пустые строки.
+#   2. Оценка читается по ЦВЕТУ закрашенных звёзд (computed fill/color -> hex) + тексту + таблице.
+#   3. «Ответить на отзыв» -> вставка -> отправка -> закрытие -> следующий отзыв.
+#   4. Окно отзыва гарантированно закрывается перед следующим шагом (не перекрывает вкладки).
+# =============================================================================
+_FILTERS_BTN = re.compile(r"^Фильтры(?:\s*\d+)?$", re.I)
+FILTER_POINT = (355, 425)  # резервная точка кнопки «Фильтры» (из «ИСХОД», система 1440x900)
+_CONTENT_OPTS: Dict[str, bool] = {"С текстом": True, "С медиа": True, "Только с оценкой": False}
+
+_CHECKBOX_STATE_JS = r"""(names) => {
+    const out = {};
+    const nodes = [...document.querySelectorAll('label, [role=checkbox], [role=option], li, div, span')];
+    for (const name of names) {
+        out[name] = null;
+        for (const el of nodes) {
+            if ((el.innerText || '').trim() !== name) continue;
+            const row = el.closest('label') || el.closest('[role=checkbox]') || el.parentElement;
+            if (!row) continue;
+            const inp = row.matches('input[type=checkbox]') ? row : row.querySelector('input[type=checkbox]');
+            if (inp) { out[name] = !!inp.checked; break; }
+            const aria = row.getAttribute('aria-checked') ?? el.getAttribute('aria-checked');
+            if (aria !== null) { out[name] = aria === 'true'; break; }
+        }
+    }
+    return out;
+}"""
+
+_CHECKBOX_CLICK_JS = r"""(name) => {
+    for (const el of document.querySelectorAll('label, [role=checkbox], [role=option], li, div, span')) {
+        if ((el.innerText || '').trim() !== name) continue;
+        const row = el.closest('label') || el.closest('[role=checkbox]') || el.parentElement;
+        if (!row) continue;
+        const r = row.getBoundingClientRect();
+        if (!r.width || !r.height) continue;
+        row.click();
+        return true;
+    }
+    return false;
+}"""
+
+_HIT_BUTTON_JS = r"""([x, y]) => {
+    const el = document.elementFromPoint(x, y);
+    const b = el && el.closest('button, [role=button]');
+    return b ? (b.innerText || '').trim() : '';
+}"""
+
+
+async def _checkbox_states(page) -> Dict[str, Optional[bool]]:
+    try:
+        return await page.evaluate(_CHECKBOX_STATE_JS, list(_CONTENT_OPTS)) or {}
+    except PWError:
+        return {}
+
+
+async def _filters_panel_open(page) -> bool:
+    try:
+        return await page.get_by_text("Контент", exact=True).last.is_visible()
+    except Exception:
+        return False
+
+
+async def _open_filters_panel(page) -> bool:
+    if await _filters_panel_open(page):
+        return True
+    btn = page.get_by_role("button", name=_FILTERS_BTN).first
+    if await btn.count() and await btn.is_visible():
+        await _click_clear(page, btn, label="Фильтры")
+    elif _coords_enabled():
+        # Резерв: клик по калиброванной точке, но только если под ней именно кнопка «Фильтры».
+        x, y = await _scale_pt(page, *FILTER_POINT)
+        try:
+            label = await page.evaluate(_HIT_BUTTON_JS, [x, y])
+        except PWError:
+            label = ""
+        if not _FILTERS_BTN.match(label or ""):
+            return False
+        await page.mouse.click(x, y)
+    else:
+        return False
+    try:
+        await page.get_by_text("Контент", exact=True).last.wait_for(state="visible", timeout=3500)
+    except PWTimeout:
+        return False
+    return True
+
+
+async def _apply_reviews_content_filter(page) -> bool:
+    """Фильтры -> Контент -> галочки «С текстом» + «С медиа» (без «Только с оценкой») -> Применить.
+
+    Возвращает True, если обе нужные галочки стояли на момент нажатия «Применить».
+    Любая ошибка не фатальна: строки «только оценка» всё равно отсеет review_row_decision.
+    """
+    _log.info("Фильтр Ozon: «Контент» -> «С текстом» + «С медиа»")
+    try:
+        if not await _open_filters_panel(page):
+            _log.warning("Панель «Фильтры» не открылась — работаю без фильтра (строки отсеет review_row_decision)")
+            return False
+        probe = page.get_by_text("С текстом", exact=True)
+        if not (await probe.count() and await probe.last.is_visible()):
+            await _click_clear(page, page.get_by_text("Контент", exact=True).last, label="Контент")
+            await page.wait_for_timeout(500)
+        for name, want in _CONTENT_OPTS.items():
+            for _ in range(2):
+                cur = (await _checkbox_states(page)).get(name)
+                if cur is None or cur == want:
+                    break
+                await page.evaluate(_CHECKBOX_CLICK_JS, name)
+                await page.wait_for_timeout(250)
+        states = await _checkbox_states(page)
+        ok = states.get("С текстом") is True and states.get("С медиа") is True
+        apply_btn = page.get_by_role("button", name=re.compile(r"^Применить$", re.I)).last
+        if await apply_btn.count() and await apply_btn.is_visible():
+            await _click_clear(page, apply_btn, label="Применить")
+        await page.wait_for_timeout(2000)
+        if await _filters_panel_open(page):  # панель не закрылась сама
+            await page.keyboard.press("Escape")
+            await page.wait_for_timeout(400)
+        _log.info("Фильтр Ozon %s (галочки: %s)", "применён" if ok else "НЕ подтверждён", states)
+        return ok
+    except Exception as exc:  # noqa: BLE001 — фильтр не обязателен
+        _log.warning("Фильтр Ozon не применён: %s", short_error(exc))
+        return False
+
+
+# ---- оценка по цвету звёзд ---------------------------------------------------------------
+_STAR_COLORS_JS = r"""(root) => {
+    root = root || document.body;
+    const parse = c => {
+        const m = (c || '').match(/rgba?\(\s*(\d+)[ ,]+(\d+)[ ,]+(\d+)(?:[ ,/]+([\d.]+))?/);
+        return m ? [+m[1], +m[2], +m[3], m[4] === undefined ? 1 : +m[4]] : null;
+    };
+    const sat = p => { const mx = Math.max(p[0], p[1], p[2]), mn = Math.min(p[0], p[1], p[2]); return mx ? (mx - mn) / mx : 0; };
+    const hex = p => '#' + p.slice(0, 3).map(v => v.toString(16).padStart(2, '0')).join('');
+    const cls = e => (e.className && e.className.baseVal !== undefined ? e.className.baseVal : (e.className || '')) + ' ' + (e.getAttribute('data-testid') || '');
+    const isIcon = c => {
+        const r = c.getBoundingClientRect();
+        if (!(r.width > 4 && r.width < 48 && r.height > 4 && r.height < 48)) return false;
+        return c.tagName.toLowerCase() === 'svg' || !!c.querySelector('svg') || /star|rating|рейтинг/i.test(cls(c));
+    };
+    const label = root.querySelector('[aria-label*="цен" i], [aria-label*="звезд" i], [aria-label*="star" i], [title*="цен" i]');
+    let ariaStars = null;
+    if (label) {
+        const m = ((label.getAttribute('aria-label') || label.getAttribute('title') || '')).match(/\b([1-5])\b/);
+        if (m) ariaStars = +m[1];
+    }
+    let group = null;
+    for (const p of root.querySelectorAll('*')) {
+        const kids = [...p.children].filter(isIcon);
+        if (kids.length === 5 && p.children.length <= 6) { group = kids; break; }
+    }
+    if (!group) return ariaStars === null ? null : {stars: null, colors: [], aria: ariaStars};
+    const info = group.map(k => {
+        let best = null, bs = -1;
+        for (const n of [k, ...k.querySelectorAll('*')].slice(0, 12)) {
+            const cs = getComputedStyle(n);
+            for (const c of [cs.fill, cs.color, cs.backgroundColor]) {
+                const q = parse(c);
+                if (q && q[3] > 0.05 && !(q[0] > 240 && q[1] > 240 && q[2] > 240)) {
+                    const s = sat(q);
+                    if (s > bs) { bs = s; best = q; }
+                }
+            }
+        }
+        return {hex: best ? hex(best) : null, sat: bs < 0 ? 0 : bs};
+    });
+    return {stars: info.filter(i => i.sat > 0.35).length, colors: info.map(i => i.hex), aria: ariaStars};
+}"""
+
+
+async def _read_star_colors(locator) -> Optional[Dict[str, Any]]:
+    """{'stars': N закрашенных, 'colors': ['#ffa800', ...], 'aria': N|None} либо None."""
+    try:
+        data = await locator.evaluate(_STAR_COLORS_JS)
+    except PWError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _stars_from_colors(data: Optional[Dict[str, Any]]) -> Optional[int]:
+    if not data:
+        return None
+    n = data.get("stars")
+    if isinstance(n, int) and 1 <= n <= 5:
+        return n
+    aria = data.get("aria")
+    return aria if isinstance(aria, int) and 1 <= aria <= 5 else None
+
+
+def _rating_from_text(text: str) -> Optional[int]:
+    for pat in (r"Оценка[:\s\n]*([1-5])\b", r"\b([1-5])\s*(?:из\s*5\b|★)"):
+        m = re.search(pat, text or "", re.I)
+        if m:
+            return int(m[1])
+    return None
+
+
+def vote_rating(text: Optional[int], colors: Optional[int], table: Optional[int]) -> Optional[int]:
+    """Итоговая оценка: большинство из трёх источников; при ничьей приоритет — цвет звёзд, текст, таблица."""
+    values = [(v, w) for v, w in ((colors, 3), (text, 2), (table, 1)) if v]
+    if not values:
+        return None
+    score: Dict[int, int] = {}
+    for v, w in values:
+        score[v] = score.get(v, 0) + (10 + w)  # +10 — голос, +w — приоритет источника при ничьей
+    return max(score, key=lambda k: score[k])
+
+
+async def _detect_rating(page, drawer, body: str, row_text: str, row_stars: Optional[int]) -> Optional[int]:
+    colors = await _read_star_colors(drawer)
+    by_colors = _stars_from_colors(colors)
+    by_text = _rating_from_text(body)
+    if by_text is None:
+        raw = await _read_text_at_point(page, REV_STAR_PT[0], REV_STAR_PT[1])
+        if re.search(r"оценк|★", raw, re.I):  # голая цифра рядом может быть датой/артикулом
+            by_text = _rating_from_text(raw)
+    if by_text is None:
+        by_text = _rating_from_text(row_text)
+    final = vote_rating(by_text, by_colors, row_stars)
+    _log.info(
+        "Оценка: %s★ (цвет звёзд=%s %s, текст=%s, таблица=%s)",
+        final, by_colors, (colors or {}).get("colors"), by_text, row_stars,
+    )
+    if len({v for v in (by_text, by_colors, row_stars) if v}) > 1:
+        _log.warning("Источники оценки расходятся — выбрано большинством/цветом звёзд")
+    return final
+
+
+async def _row_rating(row, headers: List[str], texts: List[str], cell_count: int) -> Optional[int]:
+    """Оценка из строки таблицы: цифра в столбце «Оценка» либо закрашенные звёзды (цвет)."""
+    shift = cell_count - len(headers)
+    for i, h in enumerate(headers):
+        if (h or "").strip().lower().startswith(("оценк", "рейтинг")):
+            idx = i + shift
+            if 0 <= idx < len(texts):
+                m = re.search(r"\b([1-5])\b", texts[idx])
+                if m:
+                    return int(m[1])
+                try:
+                    return _stars_from_colors(await _read_star_colors(row.locator("td").nth(idx)))
+                except PWError:
+                    return None
+    return None
+
+
+def _extract_product_color(*texts: str) -> str:
+    """«Цвет: …» / «Оттенок: …» из карточки отзыва (передаётся ИИ для точного ответа)."""
+    for t in texts:
+        m = re.search(r"(?im)^\s*(?:Цвет(?: товара)?|Оттенок)\s*[:\n]\s*([^\n]{1,60})$", t or "")
+        if m and not _is_dash(m[1]):
+            return m[1].strip()
+    return ""
+
+
+# ---- гарантированное закрытие окна отзыва -----------------------------------------------
+_CLOSE_X_JS = r"""() => {
+    const scope = document.querySelector('#ui-kit-side-page-portal-container') ||
+        [...document.querySelectorAll('div[role="dialog"]')].find(d => d.getBoundingClientRect().width > 100);
+    if (!scope) return false;
+    const sr = scope.getBoundingClientRect();
+    const btns = [...scope.querySelectorAll('button, [role="button"]')].filter(b => {
+        const r = b.getBoundingClientRect();
+        return r.width > 0 && r.height > 0;
+    });
+    let x = btns.find(b => /закры|close/i.test((b.getAttribute('aria-label') || '') + ' ' + (b.title || '') +
+        ' ' + (b.getAttribute('data-testid') || '')));
+    if (!x) {
+        x = btns.filter(b => !(b.innerText || '').trim() && b.getBoundingClientRect().top < sr.top + 130)
+                .sort((a, b) => b.getBoundingClientRect().right - a.getBoundingClientRect().right)[0];
+    }
+    if (!x) return false;
+    x.click();
+    return true;
+}"""
+
+_DISCARD_JS = r"""() => {
+    const dlgs = [...document.querySelectorAll('[role=dialog], [role=alertdialog], [aria-modal=true]')];
+    for (const d of dlgs) {
+        if (!/не\s*сохран|несохран|сохранить изменения|данные будут потеряны|уверены/i.test(d.innerText || '')) continue;
+        for (const b of d.querySelectorAll('button')) {
+            if (/^(не сохранять|выйти без сохранения|выйти|да)$/i.test((b.innerText || '').trim()) && !b.disabled) {
+                b.click();
+                return true;
+            }
+        }
+    }
+    return false;
+}"""
+
+
+async def _not_open(page) -> bool:
+    return not await _js_is_drawer_open(page)
+
+
+async def _force_close_drawer(page) -> bool:
+    """Закрывает окно отзыва независимо от DOM-«чистоты»: подтверждение -> DOM-крестик -> координаты -> Escape.
+
+    Нужна, чтобы окно НЕ оставалось поверх таблицы (иначе клики по вкладкам «Новые/Просмотренные» и
+    следующим строкам перекрыты, а список «дёргается» от повторных попыток).
+    """
+    if not await _js_is_drawer_open(page):
+        return True
+    for _ in range(3):
+        try:
+            await page.evaluate("() => { const a = document.activeElement; if (a && a.blur) a.blur(); }")
+            await page.evaluate(_DISCARD_JS)
+            await page.evaluate(_CLOSE_X_JS)
+        except PWError:
+            pass
+        await page.wait_for_timeout(350)
+        if not await _js_is_drawer_open(page):
+            _log.info("Окно отзыва закрыто (DOM-крестик)")
+            return True
+        try:
+            await _coord_click(page, "close", verify=lambda: _not_open(page), max_tries=2)
+        except PWError:
+            pass
+        if not await _js_is_drawer_open(page):
+            _log.info("Окно отзыва закрыто (координаты крестика)")
+            return True
+        for _k in range(3):
+            await page.keyboard.press("Escape")
+            await page.wait_for_timeout(200)
+            try:
+                await page.evaluate(_DISCARD_JS)
+            except PWError:
+                pass
+            if not await _js_is_drawer_open(page):
+                _log.info("Окно отзыва закрыто (Escape)")
+                return True
+    return not await _js_is_drawer_open(page)
+
+
+async def _wait_card(page, cards, timeout_ms: int) -> None:
+    """Ждём окно отзыва: строгий селектор ИЛИ мягкая проверка «ИСХОД» (_js_is_drawer_open)."""
+    waited = 0
+    while waited <= timeout_ms:
+        if await cards.count() or await _js_is_drawer_open(page):
+            return
+        await page.wait_for_timeout(250)
+        waited += 250
+    raise PWTimeout("Окно отзыва не появилось")
+
+
+_MARK_LOOSE_JS = r"""(key) => {
+    const vis = e => { const r = e.getBoundingClientRect(); const s = getComputedStyle(e);
+        return r.width >= 100 && r.height >= 100 && s.display !== 'none' && s.visibility !== 'hidden'; };
+    const cands = [document.querySelector('#ui-kit-side-page-portal-container'),
+        ...document.querySelectorAll('div[role="dialog"]')].filter(e => e && vis(e));
+    if (!cands.length) return false;
+    cands.sort((a, b) => (b.getBoundingClientRect().width * b.getBoundingClientRect().height) -
+                         (a.getBoundingClientRect().width * a.getBoundingClientRect().height));
+    cands[0].setAttribute('data-yasoko-card', key);
+    return true;
+}"""
+
+
+# ---- ответ: «Ответить на отзыв» -> поле -> вставка -> отправка ------------------------------
+async def _click_reply_dom(page, drawer) -> bool:
+    for scope in (drawer, page.locator(_ROOT)):
+        btn = scope.get_by_role("button", name=_REPLY_NAME)
+        if await btn.count():
+            try:
+                await _reveal(btn.first)
+                await btn.first.click(timeout=4000)
+                return True
+            except PWError:
+                continue
+    try:  # как в «ИСХОД»: JS-клик по точному тексту
+        return bool(await page.evaluate(
+            r"""() => {
+                const root = document.querySelector('#ui-kit-side-page-portal-container') ||
+                    document.querySelector('div[role="dialog"]') || document;
+                for (const b of root.querySelectorAll('button, [role="button"]')) {
+                    const t = (b.innerText || '').trim().toLowerCase();
+                    if (t === 'ответить на отзыв' || t === 'ответить') { b.click(); return true; }
+                }
+                return false;
+            }"""
+        ))
+    except PWError:
+        return False
+
+
+async def _find_editor(page, timeout_ms: int):
+    for scope in (page.locator(f"{_ROOT} {_EDIT}"), page.locator(_EDIT)):
+        try:
+            await scope.last.wait_for(state="visible", timeout=timeout_ms)
+        except PWTimeout:
+            continue
+        token = str(time.monotonic_ns())
+        await scope.last.evaluate("(e, key) => e.setAttribute('data-yasoko-editor', key)", token)
+        return page.locator(f'[data-yasoko-editor="{token}"]')
+    return None
+
+
+async def _open_reply_editor(page, drawer):
+    """Этапы 2-3: нажать «Ответить на отзыв» (Ozon сам ставит курсор) и получить поле ввода."""
+    field = await _find_editor(page, 600)
+    if field is None:
+        _log.info("Этап 2/5: нажимаю «Ответить на отзыв»")
+        coords_ok = _coords_enabled() and bool(_load_points().get("reply"))
+        order = ("coords", "dom") if (_click_mode() == "coords" and coords_ok) else ("dom", "coords")
+        for how in order:
+            if how == "coords":
+                if not coords_ok:
+                    continue
+                try:
+                    clicked = await _coord_click(page, "reply", strict=True)
+                except PWError:
+                    clicked = False
+            else:
+                clicked = await _click_reply_dom(page, drawer)
+            if not clicked:
+                continue
+            await _pause(page)
+            field = await _find_editor(page, 3500)
+            if field is not None:
+                break
+    if field is None:
+        raise _SkipReview("После «Ответить на отзыв» не появилось поле ввода; текст не вводится")
+    if not await _focus_editor(page, field):
+        raise _SkipReview("Курсор не встал в поле ответа; текст не вводится")
+    return field
+
+
+async def _wait_reply_gone(page, field, timeout_ms: int) -> bool:
+    waited = 0
+    while waited <= timeout_ms:
+        try:
+            if not await field.count() or not await field.is_visible():
+                return True
+            if not _norm(await _editor_text(field)):
+                return True
+        except PWError:
+            return True
+        await page.wait_for_timeout(250)
+        waited += 250
+    return False
+
+
+async def _send_reply(page, drawer, field, reply: str) -> bool:
+    """Отправка: кнопка «Отправить» -> Ctrl+Enter -> калиброванная точка «самолётика».
+
+    Следующий способ пробуется ТОЛЬКО если текст всё ещё стоит в поле (дублей нет).
+    """
+    if _norm(await _editor_text(field)) != _norm(reply):
+        raise _SkipReview("Текст изменился перед отправкой; отправки нет")
+    panel = field.locator(_PANEL_XPATH)
+    scope = panel if await panel.count() == 1 else page.locator(_ROOT)
+    btn = scope.get_by_role("button", name=_SEND)
+    coords_ok = _coords_enabled() and bool(_load_points().get("send"))
+    methods = (["coords"] if _click_mode() == "coords" and coords_ok else []) + ["button", "ctrl_enter"]
+    if coords_ok and "coords" not in methods:
+        methods.append("coords")
+    for how in methods:
+        try:
+            if how == "button":
+                if not await btn.count():
+                    continue
+                await _reveal(btn.last)
+                await btn.last.click(timeout=4000)
+            elif how == "ctrl_enter":
+                await field.press("Control+Enter", timeout=3000)
+            elif not await _coord_click(page, "send"):
+                continue
+        except PWError:
+            continue
+        _log.info("Этап 4/5: отправка ответа — %s", how)
+        if await _wait_reply_gone(page, field, 5000):
+            return True
+        try:
+            if _norm(await _editor_text(field)) != _norm(reply):
+                return True  # текст изменился/очищен — отправка прошла
+        except PWError:
+            return True
+    return False
+
+
 async def _visit_review(
     page, row, ident, review_id, row_text, stamp, comment, title,
-    tracker, dry_run, records, attempted, review_idx: int = 3,
+    tracker, dry_run, records, attempted, review_idx: int = 3, row_stars: Optional[int] = None,
 ) -> None:
+    """Один отзыв: открыть -> считать (артикул, оценка по цвету звёзд, текст, цвет товара) ->
+    «Ответить на отзыв» -> сгенерировать -> вставить -> (dry_run: стоп) отправить -> закрыть окно."""
     from services.common.buyer_questions import generate_review_reply
     from services.common.gemini import GeminiUnavailable
 
-    if await _overlays(page).count():
-        raise RuntimeError("Перед открытием отзыва уже видна другая панель; обход остановлен")
+    if await _js_is_drawer_open(page) and not await _force_close_drawer(page):
+        raise RuntimeError("Перед открытием отзыва не удалось закрыть предыдущее окно; обход остановлен")
 
     discard_ours = False
     try:
@@ -1750,33 +2237,22 @@ async def _visit_review(
         if await _has_seller_reply(drawer):
             return
 
-        pts = _load_points()
-        # Координаты — основной способ (режим auto/coords); DOM остаётся дополнением.
-        coords_first = bool(
-            _coords_first() and pts.get("reply") and pts.get("input") and pts.get("send")
-        )
-        use_coords = coords_first
-        dom_tried = False
-        if not await drawer.locator(_EDIT).count():
-            opener = await _opener(page, drawer)
-            if await opener.count() != 1:
-                if not (_coords_enabled() and _load_points().get("reply")):
-                    raise _SkipReview("В карточке нет однозначного поля или кнопки ответа")
-                use_coords = True  # DOM не нашёл «Ответить» — пойдём по калиброванным областям
-
         body = await drawer.inner_text(timeout=4000)
         sku = _extract_sku(body, row_text)
-        stars = await _extract_rating_accurately(page, body, row_text)
+        stars = await _detect_rating(page, drawer, body, row_text, row_stars)
+        if stars is None:
+            raise _SkipReview("Не удалось определить оценку (ни цвет звёзд, ни текст); ответ не отправлен")
         comment = _extract_review_comment(body) or comment
+        color = _extract_product_color(body)
+        _log.info("Артикул: %s | оценка: %s★ | цвет товара: %s | текст: «%s»",
+                  sku or "—", stars, color or "—", (comment or "[фото/видео]")[:80])
 
         for _ in range(2):
             try:
                 reply = _clean_text_for_input(
-                    await generate_review_reply(comment or "Без комментария", stars, sku)
+                    await generate_review_reply(comment or "Без комментария", stars, sku, color=color or None)
                 )
             except GeminiUnavailable:
-                # Gemini лежит целиком: остановить цикл, а не перебирать остальные
-                # отзывы по 3 попытки на каждый (так выбирался весь бюджет).
                 raise
             except RuntimeError as exc:
                 raise _SkipReview(str(exc)) from exc
@@ -1785,76 +2261,40 @@ async def _visit_review(
         else:
             raise _SkipReview("Gemini не вернул законченный ответ; отправки нет")
 
-        record = {"subtab": title, "text": comment, "sku": sku, "stars": stars, "reply": reply}
+        record = {"subtab": title, "text": comment, "sku": sku, "stars": stars, "color": color, "reply": reply}
         records.append(record)
 
-        # В dry_run для отзывов не открываем второй редактор и не меняем черновик.
-        if dry_run or await _has_seller_reply(drawer):
-            return
-
-        field = None
-        if not use_coords:
-            dom_tried = True
-            try:
-                field = await _review_editor(page, drawer, review_id)
-            except (_SkipReview, PWTimeout) as exc:
-                # До ввода текста ничего не отправлено — безопасно перейти на координаты.
-                if not (_coords_enabled() and _load_points().get("input")):
-                    raise
-                _log.warning("DOM-этап 2 не удался (%s) — иду по координатам", short_error(exc))
-                use_coords = True
-
-        if field is not None:
-            _log.info("Этап 3/5: ввод ответа (%s зн.)", len(reply))
-            if _norm(await _editor_text(field)):
-                raise _SkipReview("В поле уже есть черновик; автоматическая замена отменена")
-
+        # 2-3. «Ответить на отзыв» -> поле ввода -> вставка текста
+        field = await _open_reply_editor(page, drawer)
+        if _norm(await _editor_text(field)):
+            raise _SkipReview("В поле уже есть черновик; автоматическая замена отменена")
         discard_ours = True
-        if field is not None:
-            try:
-                reply = await _fill_review(page, field, reply)
-            except _SkipReview:
-                raise
-            except RuntimeError as exc:
-                raise _SkipReview(str(exc)) from exc
-            record["reply"] = reply
+        try:
+            reply = await _fill_review(page, field, reply)
+        except _SkipReview:
+            raise
+        except RuntimeError as exc:
+            raise _SkipReview(str(exc)) from exc
+        record["reply"] = reply
+        _log.info("Этап 3/5: ответ вставлен (%s зн.)", len(reply))
+
+        if dry_run:
+            _log.info("[dry_run] ответ вставлен, не отправляю — закрываю окно без сохранения")
+            return
 
         if ident:
             attempted.add(ident)
-
         try:
-            if field is None:
-                try:
-                    confirmed = await _coord_reply(page, drawer, reply, review_id)
-                except _CoordNotReady as exc:
-                    if dom_tried:
-                        raise
-                    # Текст не вводился и не отправлялся — DOM как дополнение к координатам.
-                    _log.warning("Координаты не довели до поля (%s) — пробую DOM", short_error(exc))
-                    field = await _review_editor(page, drawer, review_id)
-                    if _norm(await _editor_text(field)):
-                        raise _SkipReview("В поле уже есть черновик; автоматическая замена отменена") from exc
-                    try:
-                        reply = await _fill_review(page, field, reply)
-                    except _SkipReview:
-                        raise
-                    except RuntimeError as exc2:
-                        raise _SkipReview(str(exc2)) from exc2
-                    record["reply"] = reply
-                    confirmed = await _submit_review_reply(page, drawer, field, reply)
-            else:
-                confirmed = await _submit_review_reply(page, drawer, field, reply)
+            confirmed = await _send_reply(page, drawer, field, reply)
         except PWError:
-            # После ошибки Playwright нельзя полагать, что клик не дошёл до Ozon.
-            confirmed = False
-
+            confirmed = False  # после ошибки Playwright повторных кликов нет
         if not confirmed:
-            problem = "Публикация не подтверждена полным текстом в карточке; повторного клика нет"
+            problem = "Публикация не подтверждена (поле не очистилось); повторного клика нет"
             if not ident:
                 raise RuntimeError(problem + "; у строки нет стабильного ID, обход остановлен")
             raise _SkipReview(problem)
 
-        _log.info("Этап 5/5: ответ подтверждён, закрываю карточку")
+        _log.info("Этап 5/5: ответ отправлен, закрываю окно")
         tracker["replied_count"] += 1
         key = (
             "review:" + ident
@@ -1866,6 +2306,8 @@ async def _visit_review(
     finally:
         try:
             closed = await _close_review_drawer(page, discard_ours=discard_ours)
+            if not closed or await _js_is_drawer_open(page):
+                closed = await _force_close_drawer(page)
         except PWError as exc:
             raise RuntimeError("Не удалось проверить закрытие шторки; обход остановлен") from exc
         if not closed:
@@ -1901,12 +2343,14 @@ async def _scan_reviews(
     start = tracker["replied_count"]
     budget = min(max_per_run, MAX_DAILY_REPLIES - start)
 
-    try:
-        await _reset_review_filters(page)
-    except PWError as exc:
-        # Сброс фильтров — удобство, а не условие работы: не роняем весь обход.
-        _log.warning("Сброс фильтров отзывов не удался: %s", short_error(exc))
-        await _dismiss_blockers(page, neutralize=True)
+    def _spent() -> int:
+        # Бюджет тратят только ОПУБЛИКОВАННЫЕ ответы (в dry_run — подготовленные), а не неудачные попытки.
+        return len(records) if dry_run else tracker["replied_count"] - start
+
+    # Фильтр «С текстом» + «С медиа» ставим ПОСЛЕ выбора вкладки (ниже); сброс фильтров убран:
+    # раньше он снимал именно эти галочки, и бот перебирал сотни строк «только оценка».
+    if await _js_is_drawer_open(page):
+        await _force_close_drawer(page)
     try:
         all_tab = await _review_tab(page, ["Все отзывы", "Все"])
     except PWError as exc:
@@ -1921,9 +2365,12 @@ async def _scan_reviews(
         ]
 
     max_pages_per_tab = 5
+    consecutive_fail = 0
     for title, names in tabs:
-        if len(records) >= budget or _expired(deadline):
+        if _spent() >= budget or _expired(deadline) or consecutive_fail >= 4:
             break
+        if await _js_is_drawer_open(page):
+            await _force_close_drawer(page)  # окно прошлого отзыва перекрывает вкладки
         if names:
             try:
                 found_tab = await _review_tab(page, names)
@@ -1934,12 +2381,13 @@ async def _scan_reviews(
                 failures.append(f"Не найдена вкладка «{title}»")
                 continue
 
+        await _apply_reviews_content_filter(page)
         visited, last_page, idle = set(), None, 0
         pages_checked = 0
         page_saw_old_date = False
         page_saw_fresh_or_undated = False
 
-        while idle < 2 and len(records) < budget:
+        while idle < 2 and _spent() < budget and consecutive_fail < 4:
             if _expired(deadline):
                 failures.append("Обход остановлен по бюджету времени; продолжится в следующем цикле")
                 break
@@ -2006,19 +2454,30 @@ async def _scan_reviews(
                     _log.debug("Пропуск строки %s: %s", ident or i, why)
                     continue
                 comment = _clean_review_text(texts[review_idx])
+                row_stars = await _row_rating(row, headers, texts, cell_count)
 
+                failed = False
                 try:
                     await _visit_review(
                         page, row, ident, review_id, row_text, stamp, comment, title,
-                        tracker, dry_run, records, attempted, review_idx,
+                        tracker, dry_run, records, attempted, review_idx, row_stars,
                     )
                 except _SkipReview as exc:
+                    failed = True
                     failures.append(str(exc))
                 except PWTimeout:
+                    failed = True
                     failures.append("Истекло ожидание элемента отзыва; ответ не засчитан")
                 except PWError as exc:
+                    failed = True
                     failures.append(f"Карточка отзыва изменилась ({type(exc).__name__}); ответ не засчитан")
 
+                if failed:
+                    consecutive_fail += 1
+                    if consecutive_fail >= 4:
+                        failures.append("4 неудачи подряд — обход остановлен, чтобы не «дёргать» список")
+                else:
+                    consecutive_fail = 0
                 opened = True
                 break  # Открытие отзыва может удалить строку из «Новых».
 
